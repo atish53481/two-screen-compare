@@ -10,8 +10,7 @@ import { diffDom, pairElements } from './engine/dom-diff';
 import { diffCss } from './engine/css-diff';
 import { diffA11y } from './engine/a11y-diff';
 import { diffData } from './engine/data-rules';
-import { diffNetwork, diffRuntime } from './engine/runtime-diff';
-import { toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
+import { diffNetwork, diffRuntime, toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
 import type { FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
 
 /**
@@ -168,7 +167,7 @@ type TargetResolution =
   | { ok: false; classification: 'UNMAPPED_OR_MISSING_FEATURE' | 'REPLAY_FAILURE'; detail: string };
 
 /** Max time for structural extraction plus diffs on one step. */
-const COMPARISON_BUDGET_MS = 15000;
+const comparisonBudgetMs = () => Number(process.env.QA_VISION_COMPARE_BUDGET_MS) || 15000;
 
 export interface SessionOptions {
   projectName?: string;
@@ -1505,7 +1504,10 @@ class QAComparisonEngine {
 
       // 1b) Structural comparisons (DOM, CSS, layout, a11y, data, network, console) under a time budget
       const budgetStart = Date.now();
+      const budgetMs = comparisonBudgetMs();
       let budgetExceeded = false;
+      let structuralFailure = '';
+      let timer: NodeJS.Timeout | undefined;
       try {
         const extractArg = {
           scopeSelector: cap.scopeSelector,
@@ -1516,7 +1518,7 @@ class QAComparisonEngine {
           attrAllowlist: [...ATTR_ALLOWLIST],
         };
         const timeout = <T,>(p: Promise<T>) =>
-          Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('budget')), COMPARISON_BUDGET_MS))]);
+          Promise.race([p, new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('budget')), budgetMs); })]);
         const [devSnap, prodSnap]: PageSnapshot[] = await timeout(
           Promise.all([session.devPage.evaluate(extractPageSnapshot, extractArg), session.prodPage.evaluate(extractPageSnapshot, extractArg)])
         );
@@ -1529,7 +1531,7 @@ class QAComparisonEngine {
           ...diffNetwork(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
           ...diffRuntime(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
         ];
-        if (Date.now() - budgetStart > COMPARISON_BUDGET_MS) budgetExceeded = true;
+        if (Date.now() - budgetStart > budgetMs) budgetExceeded = true;
         else {
           for (const d of drafts) {
             if (session.ignore.active) {
@@ -1550,14 +1552,20 @@ class QAComparisonEngine {
         }
       } catch (e: any) {
         if (e?.message === 'budget') budgetExceeded = true;
-        else throw e;
+        else structuralFailure = String(e?.message || e).split(String.fromCharCode(10))[0];
+      } finally {
+        if (timer) clearTimeout(timer);
       }
-      if (budgetExceeded) {
+      if (budgetExceeded || structuralFailure) {
         session.netLog.dev.splice(0);
         session.netLog.prod.splice(0);
         session.runtimeLog.dev.splice(0);
         session.runtimeLog.prod.splice(0);
-        this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${COMPARISON_BUDGET_MS} ms): keeping text and visual findings only`, 'Captured', 'Error');
+        if (budgetExceeded) {
+          this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${budgetMs} ms): keeping text and visual findings only`, 'Captured', 'Error');
+        } else {
+          this.log(sessionId, `Structural comparison failed after ${stepLabel}: ${structuralFailure}; keeping text and visual findings only`, 'Captured', 'Error');
+        }
       }
 
       // 2) Visual summary

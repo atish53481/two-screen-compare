@@ -52,7 +52,6 @@ const css_diff_1 = require("./engine/css-diff");
 const a11y_diff_1 = require("./engine/a11y-diff");
 const data_rules_1 = require("./engine/data-rules");
 const runtime_diff_1 = require("./engine/runtime-diff");
-const runtime_diff_2 = require("./engine/runtime-diff");
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
@@ -178,7 +177,7 @@ function compileIgnoreRules(rules) {
     };
 }
 /** Max time for structural extraction plus diffs on one step. */
-const COMPARISON_BUDGET_MS = 15000;
+const comparisonBudgetMs = () => Number(process.env.QA_VISION_COMPARE_BUDGET_MS) || 15000;
 function getEngineGlobals() {
     const g = globalThis;
     if (!g.__qaVisionEngine) {
@@ -210,8 +209,8 @@ class QAComparisonEngine {
     /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
     attachCollectors(session, side, page) {
         // Look logs up at event time: consumers may replace the arrays.
-        const net = { push: (e) => (0, runtime_diff_2.pushCapped)(session.netLog[side], e) };
-        const rt = { push: (e) => (0, runtime_diff_2.pushCapped)(session.runtimeLog[side], e) };
+        const net = { push: (e) => (0, runtime_diff_1.pushCapped)(session.netLog[side], e) };
+        const rt = { push: (e) => (0, runtime_diff_1.pushCapped)(session.runtimeLog[side], e) };
         page.on('response', async (res) => {
             try {
                 const req = res.request();
@@ -231,7 +230,7 @@ class QAComparisonEngine {
                         }
                     }
                 }
-                net.push((0, runtime_diff_2.toNetworkEntry)({
+                net.push((0, runtime_diff_1.toNetworkEntry)({
                     method: req.method(), url: res.url(), status: res.status(),
                     resourceType: req.resourceType(), contentType, json,
                 }));
@@ -243,12 +242,12 @@ class QAComparisonEngine {
         page.on('requestfailed', (req) => {
             try {
                 const failure = req.failure()?.errorText || 'failed';
-                net.push((0, runtime_diff_2.toNetworkEntry)({
+                net.push((0, runtime_diff_1.toNetworkEntry)({
                     method: req.method(), url: req.url(), status: null,
                     resourceType: req.resourceType(), failure,
                 }));
                 if (failure !== 'net::ERR_BLOCKED_BY_CLIENT') {
-                    rt.push({ kind: 'request-failed', text: (0, runtime_diff_2.toRuntimeText)(`${req.method()} ${req.url()} ${failure}`) });
+                    rt.push({ kind: 'request-failed', text: (0, runtime_diff_1.toRuntimeText)(`${req.method()} ${req.url()} ${failure}`) });
                 }
             }
             catch {
@@ -258,7 +257,7 @@ class QAComparisonEngine {
         page.on('console', (msg) => {
             try {
                 if (msg.type() === 'error')
-                    rt.push({ kind: 'console-error', text: (0, runtime_diff_2.toRuntimeText)(msg.text()) });
+                    rt.push({ kind: 'console-error', text: (0, runtime_diff_1.toRuntimeText)(msg.text()) });
             }
             catch {
                 /* ignore */
@@ -266,7 +265,7 @@ class QAComparisonEngine {
         });
         page.on('pageerror', (err) => {
             try {
-                rt.push({ kind: 'page-error', text: (0, runtime_diff_2.toRuntimeText)(err?.message || String(err)) });
+                rt.push({ kind: 'page-error', text: (0, runtime_diff_1.toRuntimeText)(err?.message || String(err)) });
             }
             catch {
                 /* ignore */
@@ -1326,7 +1325,10 @@ class QAComparisonEngine {
             }
             // 1b) Structural comparisons (DOM, CSS, layout, a11y, data, network, console) under a time budget
             const budgetStart = Date.now();
+            const budgetMs = comparisonBudgetMs();
             let budgetExceeded = false;
+            let structuralFailure = '';
+            let timer;
             try {
                 const extractArg = {
                     scopeSelector: cap.scopeSelector,
@@ -1336,7 +1338,7 @@ class QAComparisonEngine {
                     styleProps: [...extract_1.STYLE_PROPS],
                     attrAllowlist: [...extract_1.ATTR_ALLOWLIST],
                 };
-                const timeout = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('budget')), COMPARISON_BUDGET_MS))]);
+                const timeout = (p) => Promise.race([p, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('budget')), budgetMs); })]);
                 const [devSnap, prodSnap] = await timeout(Promise.all([session.devPage.evaluate(extract_1.extractPageSnapshot, extractArg), session.prodPage.evaluate(extract_1.extractPageSnapshot, extractArg)]));
                 const { pairs } = (0, dom_diff_1.pairElements)(devSnap.elements, prodSnap.elements);
                 const drafts = [
@@ -1347,7 +1349,7 @@ class QAComparisonEngine {
                     ...(0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
                     ...(0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
                 ];
-                if (Date.now() - budgetStart > COMPARISON_BUDGET_MS)
+                if (Date.now() - budgetStart > budgetMs)
                     budgetExceeded = true;
                 else {
                     for (const d of drafts) {
@@ -1373,14 +1375,23 @@ class QAComparisonEngine {
                 if (e?.message === 'budget')
                     budgetExceeded = true;
                 else
-                    throw e;
+                    structuralFailure = String(e?.message || e).split(String.fromCharCode(10))[0];
             }
-            if (budgetExceeded) {
+            finally {
+                if (timer)
+                    clearTimeout(timer);
+            }
+            if (budgetExceeded || structuralFailure) {
                 session.netLog.dev.splice(0);
                 session.netLog.prod.splice(0);
                 session.runtimeLog.dev.splice(0);
                 session.runtimeLog.prod.splice(0);
-                this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${COMPARISON_BUDGET_MS} ms): keeping text and visual findings only`, 'Captured', 'Error');
+                if (budgetExceeded) {
+                    this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${budgetMs} ms): keeping text and visual findings only`, 'Captured', 'Error');
+                }
+                else {
+                    this.log(sessionId, `Structural comparison failed after ${stepLabel}: ${structuralFailure}; keeping text and visual findings only`, 'Captured', 'Error');
+                }
             }
             // 2) Visual summary
             if (ratio > cap.visualDiffRatio && textDiffs.length === 0) {

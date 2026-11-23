@@ -33,4 +33,43 @@ runSuite('Comparisons', async ({ check }) => {
   }
   check('no finding for class differences', !m.some((x) => x.property === 'class'));
   check('compare log carries per-type counts', s.logs.some((l) => /Compared after .*\d+ new \(Text \d+, DOM \d+, CSS \d+, Layout \d+, A11y \d+, Data \d+, Network \d+, Console \d+\)/.test(l.action)));
+
+  await engine.closeSession(id);
+
+  // (a) ignore rules apply to structural findings
+  const b = await engine.createSession(DEV_URL, PROD_URL, {
+    projectName: 'comparisons-ignore',
+    safetyAllowlist: ['login-submit'],
+    ignoreRules: ['text:add test user'],
+  });
+  const B = engine.getSession(b);
+  await waitForLoginForm(B);
+  await B.devPage.locator('[data-testid="login-email"]').pressSequentially(SAMPLE_EMAIL, { delay: 5 });
+  await B.devPage.locator('[data-testid="login-password"]').pressSequentially(SAMPLE_PASSWORD, { delay: 5 });
+  await B.devPage.click('[data-testid="login-submit"]');
+  await idle(B);
+  await B.devPage.waitForSelector('[data-testid="btn-continue-dashboard"]', { timeout: 8000 });
+  await B.devPage.click('[data-testid="btn-continue-dashboard"]');
+  await idle(B);
+  const addUser = (x) => /btn-add-user/.test(`${x.devSelector} ${x.prodSelector}`) && (x.type === 'CSS' || x.type === 'Layout' || x.type === 'DOM');
+  check('ignore rule suppresses structural findings for btn-add-user', !B.mismatches.some(addUser));
+  check('structural suppression is logged', B.logs.some((l) => /suppressed by ignore rules/.test(l.action)));
+  check('other structural findings still reported under ignore rules', B.mismatches.some((x) => x.type === 'Network'));
+  await engine.closeSession(b);
+
+  // (b) budget exceeded: text/visual kept, logs drained in place
+  process.env.QA_VISION_COMPARE_BUDGET_MS = '1';
+  const c = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'comparisons-budget' });
+  const C = engine.getSession(c);
+  await waitForLoginForm(C);
+  await idle(C);
+  const refs = [C.netLog.dev, C.netLog.prod, C.runtimeLog.dev, C.runtimeLog.prod];
+  C.netLog.dev.push({ method: 'GET', path: '/x', status: 200, keys: [] });
+  await C.devPage.click('h1');
+  await idle(C);
+  check('budget exceeded is logged', C.logs.some((l) => /Comparison budget exceeded/.test(l.action)));
+  check('text findings still recorded when budget exceeded', C.mismatches.some((x) => x.type === 'Text'));
+  check('no structural findings when budget exceeded', !C.mismatches.some((x) => ['DOM', 'CSS', 'Layout', 'Accessibility', 'Network', 'Console'].includes(x.type)));
+  check('logs drained in place', refs[0] === C.netLog.dev && refs[1] === C.netLog.prod && refs[2] === C.runtimeLog.dev && refs[3] === C.runtimeLog.prod && refs.every((r) => r.length === 0));
+  delete process.env.QA_VISION_COMPARE_BUDGET_MS;
 });
