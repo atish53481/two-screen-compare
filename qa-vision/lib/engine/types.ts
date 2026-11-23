@@ -140,3 +140,21 @@ export interface PageSnapshot {
   tables: TableSnapshot[];
   truncated: boolean;
 }
+
+export interface NetworkEntry {
+  method: string;
+  /** Origin stripped; query reduced to sorted keys "?a&b". */
+  path: string;
+  status: number | null;
+  resourceType: string;
+  contentType: string;
+  /** Sorted JSON key paths, depth <= 2 (json responses <= 256 KB); never values. */
+  schema: string[] | null;
+  failure: string | null;
+}
+
+export interface RuntimeEvent {
+  kind: 'console-error' | 'page-error' | 'request-failed';
+  /** <= 300 chars, sensitive values redacted. */
+  text: string;
+}

@@ -47,6 +47,7 @@ const pixelmatch_1 = __importDefault(require("pixelmatch"));
 const pngjs_1 = require("pngjs");
 const findings_1 = require("./engine/findings");
 const extract_1 = require("./engine/extract");
+const runtime_diff_1 = require("./engine/runtime-diff");
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
@@ -199,6 +200,71 @@ class QAComparisonEngine {
     setSocketIO(io) {
         getEngineGlobals().io = io;
     }
+    /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
+    attachCollectors(session, side, page) {
+        const net = session.netLog[side];
+        const rt = session.runtimeLog[side];
+        page.on('response', async (res) => {
+            try {
+                const req = res.request();
+                const headers = res.headers();
+                const contentType = headers['content-type'] || '';
+                let json;
+                if (/json/i.test(contentType)) {
+                    const len = Number(headers['content-length'] || 0);
+                    if (!len || len <= 256 * 1024) {
+                        try {
+                            const body = await res.body();
+                            if (body.length <= 256 * 1024)
+                                json = JSON.parse(body.toString('utf8'));
+                        }
+                        catch {
+                            /* schema stays null */
+                        }
+                    }
+                }
+                (0, runtime_diff_1.pushCapped)(net, (0, runtime_diff_1.toNetworkEntry)({
+                    method: req.method(), url: res.url(), status: res.status(),
+                    resourceType: req.resourceType(), contentType, json,
+                }));
+            }
+            catch {
+                /* ignore */
+            }
+        });
+        page.on('requestfailed', (req) => {
+            try {
+                const failure = req.failure()?.errorText || 'failed';
+                (0, runtime_diff_1.pushCapped)(net, (0, runtime_diff_1.toNetworkEntry)({
+                    method: req.method(), url: req.url(), status: null,
+                    resourceType: req.resourceType(), failure,
+                }));
+                if (failure !== 'net::ERR_BLOCKED_BY_CLIENT') {
+                    (0, runtime_diff_1.pushCapped)(rt, { kind: 'request-failed', text: (0, runtime_diff_1.toRuntimeText)(`${req.method()} ${req.url()} ${failure}`) });
+                }
+            }
+            catch {
+                /* ignore */
+            }
+        });
+        page.on('console', (msg) => {
+            try {
+                if (msg.type() === 'error')
+                    (0, runtime_diff_1.pushCapped)(rt, { kind: 'console-error', text: (0, runtime_diff_1.toRuntimeText)(msg.text()) });
+            }
+            catch {
+                /* ignore */
+            }
+        });
+        page.on('pageerror', (err) => {
+            try {
+                (0, runtime_diff_1.pushCapped)(rt, { kind: 'page-error', text: (0, runtime_diff_1.toRuntimeText)(err?.message || String(err)) });
+            }
+            catch {
+                /* ignore */
+            }
+        });
+    }
     async createSession(devUrl, prodUrl, opts = {}) {
         const projectName = opts.projectName || 'QA Vision Session';
         let safetyPolicy = opts.safetyPolicy || 'read-only';
@@ -294,7 +360,11 @@ class QAComparisonEngine {
             recorderReady: false,
             startedAt: new Date().toISOString(),
             evidenceDir,
+            netLog: { dev: [], prod: [] },
+            runtimeLog: { dev: [], prod: [] },
         };
+        this.attachCollectors(session, 'dev', devPage);
+        this.attachCollectors(session, 'prod', prodPage);
         this.sessions.set(sessionId, session);
         // Surface closed windows instead of silently failing every later action
         for (const [label, browser] of [['DEV', devBrowser], ['PROD', prodBrowser]]) {
