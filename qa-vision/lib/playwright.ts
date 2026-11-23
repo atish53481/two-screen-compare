@@ -109,7 +109,7 @@ type CompiledIgnoreRules = {
   active: boolean;
 };
 
-function compileIgnoreRules(rules: string[]): CompiledIgnoreRules {
+export function compileIgnoreRules(rules: string[]): CompiledIgnoreRules {
   const replacers: Array<(s: string) => string> = [];
   const exclusions: string[] = [];
   const idRe = (s: string) =>

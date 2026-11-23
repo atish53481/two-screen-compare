@@ -39,6 +39,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.comparisonEngine = void 0;
 exports.validateTargetUrl = validateTargetUrl;
 exports.mapDevUrlToProd = mapDevUrlToProd;
+exports.compileIgnoreRules = compileIgnoreRules;
 const playwright_1 = require("playwright");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));

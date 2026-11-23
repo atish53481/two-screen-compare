@@ -12,6 +12,12 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Generated CommonJS engine copy (built from lib/playwright.ts) and Node CJS tooling
+    "playwright.js",
+    "lib/playwright.cjs",
+    "scripts/**",
+    "tests/**",
+    "server.js",
   ]),
 ]);
 
