@@ -1386,6 +1386,8 @@ class QAComparisonEngine {
   /** Wait until a page has a parsed document and its UI has had a moment to settle. */
   private async waitForSettled(page: Page, settleMs: number) {
     await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    // Let in-flight API calls finish so network logs are drained consistently on both sides (non-fatal)
+    await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(settleMs);
   }
 
@@ -1523,13 +1525,15 @@ class QAComparisonEngine {
           Promise.all([session.devPage.evaluate(extractPageSnapshot, extractArg), session.prodPage.evaluate(extractPageSnapshot, extractArg)])
         );
         const { pairs } = pairElements(devSnap.elements, prodSnap.elements);
+        // DEV runs ahead of PROD while actions are still queued: keep the logs for the comparison that follows
+        const deferLogs = session.pendingActions > 0;
         const drafts: FindingDraft[] = [
           ...diffDom(devSnap.elements, prodSnap.elements),
           ...diffCss(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
           ...diffA11y(pairs),
           ...diffData(pairs, devSnap.tables, prodSnap.tables, session.dataRules),
-          ...diffNetwork(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
-          ...diffRuntime(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
+          ...(deferLogs ? [] : diffNetwork(session.netLog.dev.splice(0), session.netLog.prod.splice(0))),
+          ...(deferLogs ? [] : diffRuntime(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0))),
         ];
         if (Date.now() - budgetStart > budgetMs) budgetExceeded = true;
         else {

@@ -1223,6 +1223,8 @@ class QAComparisonEngine {
     /** Wait until a page has a parsed document and its UI has had a moment to settle. */
     async waitForSettled(page, settleMs) {
         await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
+        // Let in-flight API calls finish so network logs are drained consistently on both sides (non-fatal)
+        await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => { });
         await page.waitForTimeout(settleMs);
     }
     /**
@@ -1341,13 +1343,15 @@ class QAComparisonEngine {
                 const timeout = (p) => Promise.race([p, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('budget')), budgetMs); })]);
                 const [devSnap, prodSnap] = await timeout(Promise.all([session.devPage.evaluate(extract_1.extractPageSnapshot, extractArg), session.prodPage.evaluate(extract_1.extractPageSnapshot, extractArg)]));
                 const { pairs } = (0, dom_diff_1.pairElements)(devSnap.elements, prodSnap.elements);
+                // DEV runs ahead of PROD while actions are still queued: keep the logs for the comparison that follows
+                const deferLogs = session.pendingActions > 0;
                 const drafts = [
                     ...(0, dom_diff_1.diffDom)(devSnap.elements, prodSnap.elements),
                     ...(0, css_diff_1.diffCss)(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
                     ...(0, a11y_diff_1.diffA11y)(pairs),
                     ...(0, data_rules_1.diffData)(pairs, devSnap.tables, prodSnap.tables, session.dataRules),
-                    ...(0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
-                    ...(0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
+                    ...(deferLogs ? [] : (0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0))),
+                    ...(deferLogs ? [] : (0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0))),
                 ];
                 if (Date.now() - budgetStart > budgetMs)
                     budgetExceeded = true;

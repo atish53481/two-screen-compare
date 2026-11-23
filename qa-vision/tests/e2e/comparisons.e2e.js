@@ -9,6 +9,7 @@ runSuite('Comparisons', async ({ check }) => {
   });
   const s = engine.getSession(id);
   await waitForLoginForm(s);
+  await idle(s); // let the initial comparison finish before driving
   await s.devPage.locator('[data-testid="login-email"]').pressSequentially(SAMPLE_EMAIL, { delay: 5 });
   await s.devPage.locator('[data-testid="login-password"]').pressSequentially(SAMPLE_PASSWORD, { delay: 5 });
   await s.devPage.click('[data-testid="login-submit"]');
@@ -59,17 +60,37 @@ runSuite('Comparisons', async ({ check }) => {
 
   // (b) budget exceeded: text/visual kept, logs drained in place
   process.env.QA_VISION_COMPARE_BUDGET_MS = '1';
-  const c = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'comparisons-budget' });
-  const C = engine.getSession(c);
-  await waitForLoginForm(C);
-  await idle(C);
-  const refs = [C.netLog.dev, C.netLog.prod, C.runtimeLog.dev, C.runtimeLog.prod];
-  C.netLog.dev.push({ method: 'GET', path: '/x', status: 200, keys: [] });
-  await C.devPage.click('h1');
-  await idle(C);
-  check('budget exceeded is logged', C.logs.some((l) => /Comparison budget exceeded/.test(l.action)));
-  check('text findings still recorded when budget exceeded', C.mismatches.some((x) => x.type === 'Text'));
-  check('no structural findings when budget exceeded', !C.mismatches.some((x) => ['DOM', 'CSS', 'Layout', 'Accessibility', 'Network', 'Console'].includes(x.type)));
-  check('logs drained in place', refs[0] === C.netLog.dev && refs[1] === C.netLog.prod && refs[2] === C.runtimeLog.dev && refs[3] === C.runtimeLog.prod && refs.every((r) => r.length === 0));
-  delete process.env.QA_VISION_COMPARE_BUDGET_MS;
+  try {
+    const c = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'comparisons-budget' });
+    const C = engine.getSession(c);
+    await waitForLoginForm(C);
+    await idle(C);
+    const refs = [C.netLog.dev, C.netLog.prod, C.runtimeLog.dev, C.runtimeLog.prod];
+    C.netLog.dev.push({ method: 'GET', path: '/x', status: 200, keys: [] });
+    await C.devPage.click('h1');
+    await idle(C);
+    check('budget exceeded is logged', C.logs.some((l) => /Comparison budget exceeded/.test(l.action)));
+    check('text findings still recorded when budget exceeded', C.mismatches.some((x) => x.type === 'Text'));
+    check('no structural findings when budget exceeded', !C.mismatches.some((x) => ['DOM', 'CSS', 'Layout', 'Accessibility', 'Network', 'Console'].includes(x.type)));
+    check('logs drained in place', refs[0] === C.netLog.dev && refs[1] === C.netLog.prod && refs[2] === C.runtimeLog.dev && refs[3] === C.runtimeLog.prod && refs.every((r) => r.length === 0));
+  } finally {
+    delete process.env.QA_VISION_COMPARE_BUDGET_MS;
+  }
+
+  // (c) non-budget structural failure: text/visual findings and the summary line survive
+  const d = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'comparisons-failure' });
+  const D = engine.getSession(d);
+  await waitForLoginForm(D);
+  await idle(D);
+  const realEval = D.devPage.evaluate.bind(D.devPage);
+  D.devPage.evaluate = (fn, ...rest) => (fn && fn.name === 'extractPageSnapshot' ? Promise.reject(new Error('boom extraction')) : realEval(fn, ...rest));
+  const logsBefore = D.logs.length;
+  await D.devPage.click('h1');
+  await idle(D);
+  D.devPage.evaluate = realEval;
+  const after = D.logs.slice(0, D.logs.length - logsBefore); // logs are newest-first
+  check('structural failure is logged', after.some((l) => /Structural comparison failed.*boom extraction/.test(l.action)));
+  check('Compared line still produced after structural failure', after.some((l) => /^Compared after/.test(l.action)));
+  check('text findings kept after structural failure', D.mismatches.some((x) => x.type === 'Text'));
+  check('no "Comparison failed" after structural failure', !after.some((l) => /^Comparison failed/.test(l.action)));
 });
