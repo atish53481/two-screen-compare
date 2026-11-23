@@ -705,6 +705,10 @@ class QAComparisonEngine {
   }, true);
   document.addEventListener('mouseleave', cancelHover, true);
 
+  // A click still waiting out its delay must not be lost when the page unloads.
+  window.addEventListener('pagehide', flushClicks, true);
+  window.addEventListener('beforeunload', flushClicks, true);
+
   // Keyboard: navigation / control keys and anything with a modifier. Plain typing stays 'fill'.
   const namedKeys = /^(Enter|Escape|Tab|Arrow(Up|Down|Left|Right)|PageUp|PageDown|Home|End)$/;
   const modifierOnly = /^(Control|Shift|Alt|Meta|AltGraph|CapsLock)$/;
@@ -713,6 +717,10 @@ class QAComparisonEngine {
     if (modifierOnly.test(e.key) || e.isComposing) return;
     const hasModifier = e.ctrlKey || e.altKey || e.metaKey;
     if (!namedKeys.test(e.key) && !hasModifier) return;
+    // AltGr / Alt combinations that produce a typed character are typing, not shortcuts.
+    const printable = e.key.length === 1;
+    if (e.getModifierState && e.getModifierState('AltGraph')) return;
+    if (printable && e.altKey && !e.metaKey) return;
 
     const active = document.activeElement;
     const tag = active && active.tagName ? active.tagName.toLowerCase() : '';
@@ -722,6 +730,8 @@ class QAComparisonEngine {
     flushFill();
     flushClicks();
     const info = describe(active && active !== document.body && active !== document.documentElement ? active : null);
+    // Never record what is typed into a sensitive field: only named keys are kept there.
+    if (info.isSensitive && !namedKeys.test(e.key)) return;
     const isFormEnter = e.key === 'Enter' && !!active && !!active.form && tag !== 'textarea';
     emit({
       type: 'key',
@@ -731,7 +741,7 @@ class QAComparisonEngine {
       alt: e.altKey,
       shift: e.shiftKey,
       meta: e.metaKey,
-      isSubmit: isFormEnter || !!info.isSubmit,
+      isSubmit: isFormEnter || (!!info.isSubmit && (e.key === 'Enter' || e.key === ' ')),
       isMutation: isFormEnter,
     });
   }, true);
@@ -965,6 +975,9 @@ class QAComparisonEngine {
                         .join('+');
                     const focusable = action.tag && !/^(body|html)$/.test(action.tag);
                     const target = focusable ? await this.resolveProdTarget(prodPage, action) : null;
+                    if (target && !target.ok) {
+                        return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
+                    }
                     if (target && target.ok) {
                         await target.locator.press(combo, { timeout: 5000 });
                         this.log(sessionId, `Pressed ${combo} on ${label} (matched by ${target.strategy})`, 'Success', 'Success');

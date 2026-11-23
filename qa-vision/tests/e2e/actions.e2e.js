@@ -7,6 +7,38 @@ runSuite('Actions (dblclick / hover / keyboard)', async ({ check }) => {
   const { devPage: dev, prodPage: prod } = s;
   await waitForLoginForm(s);
 
+  // AltGr-style characters typed into a password field must not leak through key events
+  await dev.focus('[data-testid="login-password"]');
+  await dev.evaluate(() => {
+    const el = document.querySelector('[data-testid="login-password"]');
+    for (const ch of ['€', 'ß']) {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: ch, ctrlKey: true, altKey: true, bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: ch, altKey: true, bubbles: true }));
+    }
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'q', ctrlKey: true, bubbles: true }));
+  });
+  await idle(s);
+  await sleep(300);
+  const leakDump = JSON.stringify({ logs: s.logs, mismatches: s.mismatches });
+  check('AltGr/Alt characters in password field not recorded or logged', !leakDump.includes('€') && !leakDump.includes('ß') && !/Pressed Control+q/.test(leakDump));
+  await dev.evaluate(() => (document.querySelector('[data-testid="login-password"]').value = ''));
+
+  // A key pressed on a real DEV element with no PROD equivalent is reported, not pressed on the page
+  await dev.evaluate(() => {
+    const i = document.createElement('input');
+    i.id = 'qa-devonly-in';
+    i.name = 'qa-devonly-in';
+    document.body.prepend(i);
+  });
+  await dev.focus('#qa-devonly-in');
+  await dev.keyboard.press('ArrowDown');
+  await idle(s);
+  check(
+    'key on element missing from PROD recorded as replay failure',
+    s.mismatches.some((m) => m.replayStatus === 'FAILED' && /^key /.test(m.devValue || ''))
+  );
+  await dev.evaluate(() => document.getElementById('qa-devonly-in').remove());
+
   // Enter inside a form is a submit: blocked on PROD in read-only mode
   const addForm = () => {
     const f = document.createElement('form');
