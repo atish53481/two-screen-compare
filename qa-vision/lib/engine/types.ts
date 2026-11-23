@@ -101,3 +101,38 @@ export interface ApiCheck {
 export interface DbCheck {
   name: string;
 }
+
+/** One DOM element captured by in-page extraction (see extract.ts). */
+export interface ElementSnapshot {
+  key: string;
+  selector: string;
+  path: string;
+  tag: string;
+  testId: string;
+  elementId: string;
+  role: string;
+  name: string;
+  text: string;
+  visible: boolean;
+  enabled: boolean;
+  box: { x: number; y: number; w: number; h: number };
+  styles: Record<string, string>;
+  attrs: Record<string, string>;
+  a11y: { label: string; alt: string | null; ariaHidden: boolean; tabIndex: number; focusable: boolean };
+  order: number;
+}
+
+export interface TableSnapshot {
+  key: string;
+  selector: string;
+  headers: string[];
+  rows: string[][];
+  rowCount: number;
+}
+
+export interface PageSnapshot {
+  url: string;
+  elements: ElementSnapshot[];
+  tables: TableSnapshot[];
+  truncated: boolean;
+}

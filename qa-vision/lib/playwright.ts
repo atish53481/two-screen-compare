@@ -5,6 +5,7 @@ import * as path from 'path';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import { fingerprint, classifyFinding, normalizeCaptureSettings } from './engine/findings';
+import { SENSITIVE_FIELD_RE } from './engine/extract';
 import type { CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck } from './engine/types';
 
 /**
@@ -23,7 +24,6 @@ const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const ALLOWLIST_PERMIT_WINDOW_MS = 5000;
 const DESTRUCTIVE_ACTION_RE =
   /\b(delete|remove|destroy|purge|drop|terminate|deactivate|unsubscribe|refund|purchase|buy now|pay|pay now|checkout|place order|submit order|transfer|wire|cancel (?:subscription|order|account|plan)|reset (?:password|account|data))\b/i;
-const SENSITIVE_FIELD_RE = /pass|pwd|secret|token|otp|cvv|cvc|card.?num|cc-|ssn|pin\b/i;
 
 const BLOCKED_HOSTS = new Set([
   '169.254.169.254',

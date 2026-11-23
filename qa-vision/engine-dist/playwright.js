@@ -46,12 +46,12 @@ const path = __importStar(require("path"));
 const pixelmatch_1 = __importDefault(require("pixelmatch"));
 const pngjs_1 = require("pngjs");
 const findings_1 = require("./engine/findings");
+const extract_1 = require("./engine/extract");
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
 const ALLOWLIST_PERMIT_WINDOW_MS = 5000;
 const DESTRUCTIVE_ACTION_RE = /\b(delete|remove|destroy|purge|drop|terminate|deactivate|unsubscribe|refund|purchase|buy now|pay|pay now|checkout|place order|submit order|transfer|wire|cancel (?:subscription|order|account|plan)|reset (?:password|account|data))\b/i;
-const SENSITIVE_FIELD_RE = /pass|pwd|secret|token|otp|cvv|cvc|card.?num|cc-|ssn|pin\b/i;
 const BLOCKED_HOSTS = new Set([
     '169.254.169.254',
     'metadata.google.internal',
@@ -499,7 +499,7 @@ class QAComparisonEngine {
       labelText: labelFor(el),
       href: tag === 'a' ? (el.getAttribute('href') || '') : '',
       isSubmit: isSubmit,
-      isSensitive: type === 'password' || ${SENSITIVE_FIELD_RE.toString()}.test(sensitiveHay),
+      isSensitive: type === 'password' || ${extract_1.SENSITIVE_FIELD_RE.toString()}.test(sensitiveHay),
       text: tag === 'input' || tag === 'textarea' || tag === 'select'
         ? ''
         : (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').substring(0, 60),
@@ -1007,7 +1007,7 @@ class QAComparisonEngine {
                 }
             });
             return results.slice(0, 200);
-        }, SENSITIVE_FIELD_RE.source);
+        }, extract_1.SENSITIVE_FIELD_RE.source);
     }
     diffPageContent(devItems, prodItems) {
         const diffs = [];
