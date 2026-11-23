@@ -442,7 +442,8 @@ class QAComparisonEngine {
         }
         const page = side === 'DEV' ? session.devPage : session.prodPage;
         const timeout = cfg.timeoutMs ?? 15000;
-        session.suppressCapture = true;
+        // Only DEV has a recorder; PROD login must not drop real user actions made in the DEV window
+        session.suppressCapture = side === 'DEV';
         try {
             if (cfg.loginPath) {
                 const target = new URL(cfg.loginPath, side === 'DEV' ? session.devUrl : session.prodUrl).toString();
@@ -541,8 +542,12 @@ class QAComparisonEngine {
         // Callable from page JS on every document (survives SPA route changes)
         await devPage.exposeFunction('__qaVisionOnAction', async (action) => {
             const current = this.sessions.get(sessionId);
-            if (!current || !current.isRunning || current.isPaused || current.stopRequested || current.suppressCapture)
+            if (!current || !current.isRunning || current.isPaused || current.stopRequested)
                 return;
+            if (current.suppressCapture) {
+                this.log(sessionId, 'Action in DEV window ignored while auto-login was running', 'Info', 'Info');
+                return;
+            }
             // Do not await: the DEV page must not block on PROD replay. Order is kept by the queue.
             void this.enqueueAction(sessionId, action);
         });

@@ -1,10 +1,14 @@
 ﻿import { NextRequest, NextResponse } from 'next/server';
 import comparisonEngine, { validateTargetUrl } from '@/lib/playwright';
 import { profileManager } from '@/lib/profile-manager';
-import { getDataDir, resolveProfileCredentials } from '@/lib/engine/secrets';
+import { getDataDir, resolveSessionLogin } from '@/lib/engine/secrets';
 
 export async function POST(request: NextRequest) {
   try {
+    // Reject cross-site "simple" form posts (text/plain etc.): only real JSON requests are accepted
+    if (!(request.headers.get('content-type') || '').toLowerCase().startsWith('application/json')) {
+      return NextResponse.json({ success: false, error: 'Content-Type must be application/json' }, { status: 415 });
+    }
     const body = await request.json();
     const {
       action,
@@ -53,14 +57,12 @@ export async function POST(request: NextRequest) {
           if (!profile) {
             return NextResponse.json({ success: false, error: 'Profile not found' }, { status: 404 });
           }
-          if (profile.login && profile.login.strategy === 'form') {
-            login = profile.login;
-            const dataDir = getDataDir();
-            loginCredentials = {
-              dev: resolveProfileCredentials(profile, 'A', dataDir),
-              prod: resolveProfileCredentials(profile, 'B', dataDir),
-            };
+          const resolved = resolveSessionLogin(profile, devUrl, prodUrl, getDataDir());
+          if (!resolved.ok) {
+            return NextResponse.json({ success: false, error: resolved.error }, { status: 400 });
           }
+          login = resolved.login;
+          loginCredentials = resolved.loginCredentials;
         }
 
         const newSessionId = await comparisonEngine.startSessionWithRecorder(

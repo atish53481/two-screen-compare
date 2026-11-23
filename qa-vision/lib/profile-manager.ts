@@ -2,7 +2,7 @@ import 'server-only';
 import fs from 'fs';
 import path from 'path';
 import { ComparisonProfile, ProfileCredentialsInput } from './types';
-import { getDataDir, storeProfileSecrets, deleteSecretFile } from './engine/secrets';
+import { getDataDir, storeProfileSecrets, safeStoreProfileSecrets, deleteSecretFile } from './engine/secrets';
 
 const dataDir = () => getDataDir();
 const profilesFile = () => path.join(dataDir(), 'profiles.json');
@@ -36,7 +36,9 @@ export class ProfileManager {
         const hasPlain = [(p as any).credentialsA, (p as any).credentialsB].some((c) => c && 'password' in c);
         if (!hasPlain) return p;
         migrated = true;
-        return storeProfileSecrets(p, dataDir());
+        const r = safeStoreProfileSecrets(p, dataDir());
+        if (r.error) console.error(`Profile "${p.id}": could not encrypt legacy password (${r.error}); it was removed from profiles.json`);
+        return r.profile;
       });
       if (migrated) this.saveProfiles();
     } else {
@@ -86,14 +88,7 @@ export class ProfileManager {
     const now = new Date().toISOString();
     // Encrypt any plaintext password (form input only) before it can reach profiles.json
     const id = profile.id || 'profile_' + Date.now();
-    const existing = this.getProfile(id);
     const withId: any = { ...profile, id };
-    for (const f of ['credentialsA', 'credentialsB'] as const) {
-      // Editing without re-entering the password keeps the stored secret
-      if (withId[f] && !withId[f].password && !withId[f].secretRef && existing?.[f]?.secretRef) {
-        withId[f] = { ...withId[f], secretRef: existing[f]!.secretRef };
-      }
-    }
     profile = storeProfileSecrets(withId, dataDir());
 
     if (profile.id && this.getProfile(profile.id)) {

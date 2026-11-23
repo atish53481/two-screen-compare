@@ -65,3 +65,65 @@ test('storeProfileSecrets encrypts plaintext and strips it; resolveProfileCreden
   assert.match(bad.error, /cannot be decrypted/);
   assert.deepEqual(S.resolveProfileCredentials(out, 'B', dir, env), { creds: null });
 });
+
+// ---- fix round 1 ----
+const goodEnv = () => ({ QA_VISION_SECRET_KEY: key().toString('base64') });
+
+test('malformed IV or tag raises SecretError', () => {
+  const [v, iv, tag, ct] = S.encryptSecret('x', key()).split(':');
+  assert.throws(() => S.decryptSecret([v, Buffer.alloc(4).toString('base64'), tag, ct].join(':'), key()), S.SecretError);
+  assert.throws(() => S.decryptSecret([v, iv, Buffer.alloc(4).toString('base64'), ct].join(':'), key()), S.SecretError);
+});
+
+test('foreign client-supplied secretRef is ignored', () => {
+  const dir = tmp();
+  const env = goodEnv();
+  const other = S.storeProfileSecrets({ id: 'OTHER', credentialsB: { username: 'o', password: 'other-pw' } }, dir, env);
+  assert.equal(other.credentialsB.secretRef, 'profile:OTHER:B');
+  const mine = S.storeProfileSecrets({ id: 'mine', credentialsA: { username: 'u', secretRef: 'profile:OTHER:B' } }, dir, env);
+  assert.equal(mine.credentialsA.secretRef, undefined);
+  assert.equal(S.resolveProfileCredentials(mine, 'A', dir, env).creds, null);
+  // own existing ref is kept when the secret exists
+  S.storeProfileSecrets({ id: 'mine', credentialsA: { username: 'u', password: 'pw' } }, dir, env);
+  const again = S.storeProfileSecrets({ id: 'mine', credentialsA: { username: 'u', secretRef: 'profile:OTHER:B' } }, dir, env);
+  assert.equal(again.credentialsA.secretRef, 'profile:mine:A');
+});
+
+test('malformed key: safeStoreProfileSecrets never throws and never keeps plaintext', () => {
+  const dir = tmp();
+  const bad = { QA_VISION_SECRET_KEY: 'AAAA' };
+  const r = S.safeStoreProfileSecrets({ id: 'p', credentialsA: { username: 'u', password: 'leaky-pw' } }, dir, bad);
+  assert.ok(!JSON.stringify(r.profile).includes('leaky-pw'));
+  assert.equal(r.profile.credentialsA.username, 'u');
+  assert.match(r.error, /QA_VISION_SECRET_KEY/);
+  assert.ok(!r.error.includes('leaky-pw'));
+  assert.ok(!fs.existsSync(path.join(dir, 'secrets.json')));
+});
+
+test('resolveSessionLogin fails closed on origin mismatch and never returns creds', () => {
+  const dir = tmp();
+  const env = goodEnv();
+  const profile = S.storeProfileSecrets(
+    {
+      id: 'x',
+      urlA: 'http://localhost:3002',
+      urlB: 'http://localhost:3003',
+      login: { strategy: 'form', loginPath: '/', usernameSelector: 'a', passwordSelector: 'b', submitSelector: 'c' },
+      credentialsA: { username: 'u', password: 'pw-a' },
+      credentialsB: { username: 'u', password: 'pw-b' },
+    },
+    dir,
+    env
+  );
+  const bad = S.resolveSessionLogin(profile, 'http://attacker.example', 'http://localhost:3003/', dir, env);
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /origin/i);
+  assert.ok(!JSON.stringify(bad).includes('pw-a'));
+  const bad2 = S.resolveSessionLogin(profile, 'http://localhost:3002', 'http://localhost:9999', dir, env);
+  assert.equal(bad2.ok, false);
+  const good = S.resolveSessionLogin(profile, 'http://localhost:3002/x', 'http://localhost:3003', dir, env);
+  assert.equal(good.ok, true);
+  assert.equal(good.loginCredentials.dev.creds.password, 'pw-a');
+  const noLogin = S.resolveSessionLogin({ ...profile, login: undefined }, 'http://attacker', 'http://attacker', dir, env);
+  assert.deepEqual(noLogin, { ok: true });
+});

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { profileManager } from '../../../lib/profile-manager';
-import type { ComparisonProfile } from '../../../lib/types';
+import { SecretError } from '../../../lib/engine/secrets';
 
 export async function GET() {
   try {
@@ -32,6 +32,9 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ success: false, error: 'Invalid action' }, { status: 400 });
   } catch (error) {
+    if (error instanceof SecretError) {
+      return NextResponse.json({ success: false, error: error.message }, { status: 400 });
+    }
     return NextResponse.json({ success: false, error: 'Server error' }, { status: 500 });
   }
 }

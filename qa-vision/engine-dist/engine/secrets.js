@@ -12,6 +12,8 @@ exports.putSecretFile = putSecretFile;
 exports.getSecretFile = getSecretFile;
 exports.deleteSecretFile = deleteSecretFile;
 exports.storeProfileSecrets = storeProfileSecrets;
+exports.safeStoreProfileSecrets = safeStoreProfileSecrets;
+exports.resolveSessionLogin = resolveSessionLogin;
 exports.resolveProfileCredentials = resolveProfileCredentials;
 // Encrypted secret store: AES-256-GCM blobs; keys from env or a local key file.
 // Blobs live in <dataDir>/secrets.json (ref -> blob). Never plaintext.
@@ -61,8 +63,12 @@ function decryptSecret(blob, key) {
         const [v, iv, tag, ct] = String(blob).split(':');
         if (v !== 'v1' || !iv || !tag || ct === undefined)
             throw new Error('format');
-        const d = crypto_1.default.createDecipheriv('aes-256-gcm', key, Buffer.from(iv, 'base64'));
-        d.setAuthTag(Buffer.from(tag, 'base64'));
+        const ivBuf = Buffer.from(iv, 'base64');
+        const tagBuf = Buffer.from(tag, 'base64');
+        if (ivBuf.length !== 12 || tagBuf.length !== 16)
+            throw new Error('length');
+        const d = crypto_1.default.createDecipheriv('aes-256-gcm', key, ivBuf, { authTagLength: 16 });
+        d.setAuthTag(tagBuf);
         return Buffer.concat([d.update(Buffer.from(ct, 'base64')), d.final()]).toString('utf8');
     }
     catch {
@@ -101,7 +107,9 @@ function deleteSecretFile(dataDir, ref) {
 }
 /**
  * Move any plaintext credentials{A,B}.password into the encrypted store and return a profile
- * without them (username + secretRef only). Input is not mutated.
+ * without them (username + secretRef only). Input is not mutated. Any client-supplied secretRef
+ * is ignored: the ref is always derived as profile:<id>:<side> and kept only if that blob exists.
+ * Throws SecretError when the key is unusable.
  */
 function storeProfileSecrets(profile, dataDir, env = process.env) {
     const out = { ...profile };
@@ -110,10 +118,13 @@ function storeProfileSecrets(profile, dataDir, env = process.env) {
         const c = profile[field];
         if (!c)
             continue;
-        const { password, ...rest } = c;
+        const { password, secretRef: _ignored, ...rest } = c;
+        const ref = `profile:${profile.id}:${side}`;
         if (typeof password === 'string' && password.length > 0) {
-            const ref = `profile:${profile.id}:${side}`;
             putSecretFile(dataDir, ref, encryptSecret(password, loadKey(env, dataDir)));
+            out[field] = { ...rest, secretRef: ref };
+        }
+        else if (getSecretFile(dataDir, ref)) {
             out[field] = { ...rest, secretRef: ref };
         }
         else {
@@ -121,6 +132,53 @@ function storeProfileSecrets(profile, dataDir, env = process.env) {
         }
     }
     return out;
+}
+/** Like storeProfileSecrets but never throws: on failure plaintext is stripped (never kept) and `error` is set. */
+function safeStoreProfileSecrets(profile, dataDir, env = process.env) {
+    try {
+        return { profile: storeProfileSecrets(profile, dataDir, env) };
+    }
+    catch (e) {
+        const out = { ...profile };
+        for (const f of ['credentialsA', 'credentialsB']) {
+            if (out[f]) {
+                const { password: _p, secretRef: _r, ...rest } = out[f];
+                out[f] = rest;
+            }
+        }
+        return { profile: out, error: e instanceof SecretError ? e.message : 'Could not store secret' };
+    }
+}
+const originOf = (u) => {
+    try {
+        return new URL(u).origin;
+    }
+    catch {
+        return null;
+    }
+};
+/**
+ * Server-side: decide whether a profile's stored credentials may be used for a session. Credentials are
+ * only released when the session's DEV/PROD origins equal the profile's urlA/urlB origins (fail closed).
+ */
+function resolveSessionLogin(profile, devUrl, prodUrl, dataDir, env = process.env) {
+    if (!profile.login || profile.login.strategy !== 'form')
+        return { ok: true };
+    const pairs = [[devUrl, profile.urlA], [prodUrl, profile.urlB]];
+    for (const [given, expected] of pairs) {
+        const o = originOf(given);
+        if (!o || o !== originOf(expected)) {
+            return { ok: false, error: 'Session URLs do not match the profile origins — refusing to use stored credentials' };
+        }
+    }
+    return {
+        ok: true,
+        login: profile.login,
+        loginCredentials: {
+            dev: resolveProfileCredentials(profile, 'A', dataDir, env),
+            prod: resolveProfileCredentials(profile, 'B', dataDir, env),
+        },
+    };
 }
 /** Server-side only: decrypt a profile side's credentials. Failures come back as `error`, never throw. */
 function resolveProfileCredentials(profile, side, dataDir, env = process.env) {
