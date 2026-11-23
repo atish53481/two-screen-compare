@@ -91,8 +91,12 @@ export interface LoginConfig {
   strategy: 'manual' | 'form';
 }
 export interface DataRule {
+  /** Element key (e.g. "tid:stat-active-users") or "table:<key>:<header|*>"; the table key may contain ':' (split on the last colon). */
   target: string;
-  mode: string;
+  mode: 'exact' | 'numeric' | 'tolerance' | 'percent' | 'date' | 'case-insensitive' | 'null-equals-empty' | 'ignore';
+  tolerance?: number;
+  /** Default 'equal'. */
+  expect?: 'equal' | 'different';
 }
 export interface ApiCheck {
   name: string;
