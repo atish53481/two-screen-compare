@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
+import { fingerprint, classifyFinding } from './engine/findings';
 
 /**
  * Safety policies for the PROD (mirror) environment:
@@ -189,6 +190,8 @@ export interface ComparisonSession {
   uncomparedSteps: string[];
   /** Fingerprint → finding, for de-duplicating repeated differences. */
   findingIndex: Map<string, any>;
+  /** Fingerprints the user marked as expected differences. */
+  expected: Set<string>;
   outOfSync: boolean;
   stopRequested?: boolean;
   recorderReady: boolean;
@@ -361,6 +364,7 @@ class QAComparisonEngine {
       stepCounter: 0,
       uncomparedSteps: [],
       findingIndex: new Map(),
+      expected: new Set(),
       outOfSync: false,
       recorderReady: false,
       startedAt: new Date().toISOString(),
@@ -1154,7 +1158,6 @@ class QAComparisonEngine {
     prodValue: string;
     severity: string;
     description: string;
-    aiAnalysis: string;
   }> {
     const diffs: Array<{
       component: string;
@@ -1163,7 +1166,6 @@ class QAComparisonEngine {
       prodValue: string;
       severity: string;
       description: string;
-      aiAnalysis: string;
     }> = [];
 
     const normalizeKey = (item: { testId: string; key: string; tag: string; text: string }) => {
@@ -1243,8 +1245,7 @@ class QAComparisonEngine {
         devValue: dText || '(missing on DEV)',
         prodValue: pText || '(missing on PROD)',
         severity,
-        description: `Exact text differs for "${component}".`,
-        aiAnalysis: `DEV shows exactly: "${dText || '(none)'}". PROD shows exactly: "${pText || '(none)'}".`,
+        description: `Exact text differs for "${component}". DEV shows exactly: "${dText || '(none)'}". PROD shows exactly: "${pText || '(none)'}".`,
       });
     }
 
@@ -1273,8 +1274,7 @@ class QAComparisonEngine {
           devValue: d,
           prodValue: related,
           severity: 'high',
-          description: 'Exact on-screen copy differs between environments.',
-          aiAnalysis: `DEV text: "${d}". PROD text: "${related}".`,
+          description: `Exact on-screen copy differs between environments. DEV text: "${d}". PROD text: "${related}".`,
         });
       }
     }
@@ -1579,18 +1579,6 @@ class QAComparisonEngine {
     this.io?.emit('log', { sessionId, log: entry });
   }
 
-  /** Identity of a finding: same page + same kind + same element + same values. */
-  private fingerprint(page: string, m: any): string {
-    const base = [page, m.type, m.classification || '', m.component];
-    if (m.type === 'Visual') {
-      // pixel ratio jitters between captures; bucket to whole percent
-      base.push(String(Math.round((Number(m.diffPercent) || 0) * 100)));
-    } else {
-      base.push(String(m.devValue ?? ''), String(m.prodValue ?? ''), m.type === 'Interaction' || m.type === 'Safety' ? String(m.description ?? '') : '');
-    }
-    return base.join('␟');
-  }
-
   /**
    * Record a finding. A finding identical to one already reported is not added again;
    * the existing one gets its occurrence count, last-seen time and step list updated.
@@ -1608,7 +1596,7 @@ class QAComparisonEngine {
     }
 
     const now = new Date().toISOString();
-    const fp = this.fingerprint(page, mismatch);
+    const fp = fingerprint(page, mismatch);
     const existing = session.findingIndex.get(fp);
     if (existing) {
       existing.occurrences = (existing.occurrences || 1) + 1;
@@ -1628,6 +1616,8 @@ class QAComparisonEngine {
       occurrences: 1,
       page,
       ...mismatch,
+      fingerprint: fp,
+      ...classifyFinding(mismatch, session.expected, fp),
     };
 
     session.findingIndex.set(fp, fullMismatch);
