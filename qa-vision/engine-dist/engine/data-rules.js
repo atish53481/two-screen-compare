@@ -49,8 +49,8 @@ function evaluate(dev, prod, rule) {
             return { match: dev.toLowerCase() === prod.toLowerCase(), detail: 'case-insensitive compare' };
         case 'null-equals-empty': {
             const norm = (v) => {
-                const x = v.trim().toLowerCase();
-                return EMPTY_TOKENS.has(x) ? '' : x;
+                const x = v.trim();
+                return EMPTY_TOKENS.has(x.toLowerCase()) ? '' : x;
             };
             return { match: norm(dev) === norm(prod), detail: 'null/empty treated as equal' };
         }

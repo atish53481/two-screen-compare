@@ -45,8 +45,8 @@ function evaluate(dev: string, prod: string, rule: DataRule): { match: boolean; 
       return { match: dev.toLowerCase() === prod.toLowerCase(), detail: 'case-insensitive compare' };
     case 'null-equals-empty': {
       const norm = (v: string) => {
-        const x = v.trim().toLowerCase();
-        return EMPTY_TOKENS.has(x) ? '' : x;
+        const x = v.trim();
+        return EMPTY_TOKENS.has(x.toLowerCase()) ? '' : x;
       };
       return { match: norm(dev) === norm(prod), detail: 'null/empty treated as equal' };
     }

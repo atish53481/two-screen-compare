@@ -92,3 +92,9 @@ test('table cells use per-header rule, locate column by header, cap at 20', () =
   const capped = diffData([], [tbl('k', ['A'], many)], [tbl('k', ['A'], manyP)], [{ target: 'table:k:*', mode: 'exact' }]);
   assert.equal(capped.length, 20);
 });
+
+test('null-equals-empty is case-sensitive for non-empty values', () => {
+  const r = rule('null-equals-empty');
+  assert.equal(compareValues('Active', 'active', r).match, false);
+  assert.equal(compareValues('NULL', '', r).match, true);
+});
