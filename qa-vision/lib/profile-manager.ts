@@ -1,9 +1,11 @@
 import 'server-only';
 import fs from 'fs';
 import path from 'path';
-import { ComparisonProfile } from './types';
+import { ComparisonProfile, ProfileCredentialsInput } from './types';
+import { getDataDir, storeProfileSecrets, deleteSecretFile } from './engine/secrets';
 
-const PROFILES_FILE = path.join(process.cwd(), 'data', 'profiles.json');
+const dataDir = () => getDataDir();
+const profilesFile = () => path.join(dataDir(), 'profiles.json');
 
 export class ProfileManager {
   private profiles: ComparisonProfile[] = [];
@@ -14,7 +16,7 @@ export class ProfileManager {
   }
 
   private ensureDataDir() {
-    const dir = path.dirname(PROFILES_FILE);
+    const dir = dataDir();
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
@@ -22,12 +24,21 @@ export class ProfileManager {
 
   private loadProfiles() {
     this.ensureDataDir();
-    if (fs.existsSync(PROFILES_FILE)) {
+    if (fs.existsSync(profilesFile())) {
       try {
-        this.profiles = JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf-8'));
+        this.profiles = JSON.parse(fs.readFileSync(profilesFile(), 'utf-8'));
       } catch (e) {
         this.profiles = [];
       }
+      // Migrate any legacy plaintext passwords into the encrypted store
+      let migrated = false;
+      this.profiles = this.profiles.map((p) => {
+        const hasPlain = [(p as any).credentialsA, (p as any).credentialsB].some((c) => c && 'password' in c);
+        if (!hasPlain) return p;
+        migrated = true;
+        return storeProfileSecrets(p, dataDir());
+      });
+      if (migrated) this.saveProfiles();
     } else {
       // Create default profile
       this.profiles = [{
@@ -49,7 +60,7 @@ export class ProfileManager {
 
   private saveProfiles() {
     this.ensureDataDir();
-    fs.writeFileSync(PROFILES_FILE, JSON.stringify(this.profiles, null, 2));
+    fs.writeFileSync(profilesFile(), JSON.stringify(this.profiles, null, 2));
   }
 
   getAllProfiles(): ComparisonProfile[] {
@@ -65,9 +76,26 @@ export class ProfileManager {
     return this.getProfile(this.currentProfileId) || this.profiles[0] || null;
   }
 
-  saveProfile(profile: Omit<ComparisonProfile, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }): ComparisonProfile {
+  saveProfile(
+    profile: Omit<ComparisonProfile, 'id' | 'createdAt' | 'updatedAt' | 'credentialsA' | 'credentialsB'> & {
+      id?: string;
+      credentialsA?: ProfileCredentialsInput;
+      credentialsB?: ProfileCredentialsInput;
+    }
+  ): ComparisonProfile {
     const now = new Date().toISOString();
-    
+    // Encrypt any plaintext password (form input only) before it can reach profiles.json
+    const id = profile.id || 'profile_' + Date.now();
+    const existing = this.getProfile(id);
+    const withId: any = { ...profile, id };
+    for (const f of ['credentialsA', 'credentialsB'] as const) {
+      // Editing without re-entering the password keeps the stored secret
+      if (withId[f] && !withId[f].password && !withId[f].secretRef && existing?.[f]?.secretRef) {
+        withId[f] = { ...withId[f], secretRef: existing[f]!.secretRef };
+      }
+    }
+    profile = storeProfileSecrets(withId, dataDir());
+
     if (profile.id && this.getProfile(profile.id)) {
       // Update existing
       const index = this.profiles.findIndex(p => p.id === profile.id);
@@ -102,6 +130,8 @@ export class ProfileManager {
     const index = this.profiles.findIndex(p => p.id === id);
     if (index === -1) return false;
     this.profiles.splice(index, 1);
+    deleteSecretFile(dataDir(), `profile:${id}:A`);
+    deleteSecretFile(dataDir(), `profile:${id}:B`);
     this.saveProfiles();
     return true;
   }

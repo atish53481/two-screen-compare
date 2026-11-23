@@ -169,6 +169,11 @@ type TargetResolution =
 /** Max time for structural extraction plus diffs on one step. */
 const comparisonBudgetMs = () => Number(process.env.QA_VISION_COMPARE_BUDGET_MS) || 15000;
 
+export interface LoginCredentialResult {
+  creds: { username: string; password: string } | null;
+  error?: string;
+}
+
 export interface SessionOptions {
   projectName?: string;
   safetyPolicy?: SafetyPolicy;
@@ -177,6 +182,11 @@ export interface SessionOptions {
   capture?: Partial<CaptureSettings>;
   profileId?: string;
   login?: LoginConfig;
+  /**
+   * SERVER-ONLY decrypted credentials for auto-login (dev = side A, prod = side B).
+   * Never serialized, sent to the client or logged. `error` explains why creds are unavailable.
+   */
+  loginCredentials?: { dev?: LoginCredentialResult | null; prod?: LoginCredentialResult | null };
   dataRules?: DataRule[];
   apiChecks?: ApiCheck[];
   dbChecks?: DbCheck[];
@@ -203,6 +213,8 @@ export interface ComparisonSession {
   safetyAllowlist: string[];
   /** Epoch ms until which PROD writes are permitted (set by an allowlisted action). */
   permitMutationsUntil: number;
+  /** True while the engine drives the DEV page itself (auto-login): recorder events are dropped. */
+  suppressCapture: boolean;
   ignoreRules: string[];
   ignore: CompiledIgnoreRules;
   dataRules: DataRule[];
@@ -450,6 +462,7 @@ class QAComparisonEngine {
         .map((s) => String(s).trim().toLowerCase())
         .filter(Boolean),
       permitMutationsUntil: 0,
+      suppressCapture: false,
       ignoreRules: (ignoreRules || []).map((r) => String(r).trim()).filter(Boolean),
       ignore: compileIgnoreRules(ignoreRules || []),
       dataRules: opts.dataRules || [],
@@ -497,6 +510,13 @@ class QAComparisonEngine {
     await this.injectRecorderScript(devPage);
     session.recorderReady = true;
 
+    if (opts.login && opts.login.strategy === 'form') {
+      for (const side of ['DEV', 'PROD'] as const) {
+        const r = side === 'DEV' ? opts.loginCredentials?.dev : opts.loginCredentials?.prod;
+        await this.performLogin(sessionId, side, r?.creds ?? null, opts.login, r?.error);
+      }
+    }
+
     this.log(sessionId, 'Session initialized', 'Success', 'Success');
     this.log(
       sessionId,
@@ -533,6 +553,65 @@ class QAComparisonEngine {
     console.log(`   Project → ${projectName}`);
 
     return sessionId;
+  }
+
+  /**
+   * Profile auto-login (form strategy). Drives the page directly: DEV recorder events are
+   * suppressed so nothing is recorded, and PROD gets a short mutation window for the login POST
+   * (audited by the network guard log). The password is never logged.
+   */
+  private async performLogin(
+    sessionId: string,
+    side: 'DEV' | 'PROD',
+    creds: { username: string; password: string } | null,
+    cfg: LoginConfig,
+    unavailableReason?: string
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (!creds) {
+      this.log(
+        sessionId,
+        `Auto-login unavailable on ${side}: ${unavailableReason || 'no stored credentials'} — log in manually in the window`,
+        'Info',
+        'Info'
+      );
+      return false;
+    }
+    const page = side === 'DEV' ? session.devPage : session.prodPage;
+    const timeout = cfg.timeoutMs ?? 15000;
+    session.suppressCapture = true;
+    try {
+      if (cfg.loginPath) {
+        const target = new URL(cfg.loginPath, side === 'DEV' ? session.devUrl : session.prodUrl).toString();
+        if (page.url() !== target) await page.goto(target, { waitUntil: 'domcontentloaded', timeout });
+      }
+      // Let client-side frameworks hydrate so typed values are not lost
+      await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 5000) }).catch(() => {});
+      await page.locator(cfg.usernameSelector).first().fill(creds.username, { timeout });
+      await page.locator(cfg.passwordSelector).first().fill(creds.password, { timeout });
+      if (side === 'PROD') {
+        session.permitMutationsUntil = Date.now() + 5000;
+        this.log(sessionId, 'PROD login submitted (profile login flow)', 'n/a', 'Info');
+      }
+      await page.locator(cfg.submitSelector).first().click({ timeout });
+      if (cfg.successSelector) {
+        await page.locator(cfg.successSelector).first().waitFor({ state: 'visible', timeout });
+      } else {
+        await page.locator(cfg.passwordSelector).first().waitFor({ state: 'hidden', timeout });
+      }
+      this.log(sessionId, `Logged in on ${side} as ${creds.username}`, 'Info', 'Info');
+      return true;
+    } catch (error: any) {
+      const reason = String(error?.message || error).split(String.fromCharCode(10))[0].split(creds.password).join('***');
+      this.log(sessionId, `Login on ${side} failed: ${reason}`, 'Info', 'Error');
+      return false;
+    } finally {
+      if (side === 'PROD') session.permitMutationsUntil = 0;
+      // Let any debounced recorder flush (fill timer 120ms) fire while still suppressed
+      if (side === 'DEV') await new Promise((r) => setTimeout(r, 400));
+      session.suppressCapture = false;
+    }
   }
 
   /**
@@ -608,7 +687,7 @@ class QAComparisonEngine {
     // Callable from page JS on every document (survives SPA route changes)
     await devPage.exposeFunction('__qaVisionOnAction', async (action: CapturedAction) => {
       const current = this.sessions.get(sessionId);
-      if (!current || !current.isRunning || current.isPaused || current.stopRequested) return;
+      if (!current || !current.isRunning || current.isPaused || current.stopRequested || current.suppressCapture) return;
       // Do not await: the DEV page must not block on PROD replay. Order is kept by the queue.
       void this.enqueueAction(sessionId, action);
     });

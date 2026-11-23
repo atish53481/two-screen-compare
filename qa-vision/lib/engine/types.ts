@@ -86,10 +86,17 @@ export interface CaptureSettings {
   layoutTolerancePx: number;
 }
 
-// Placeholders: defined fully in later tasks (login, data rules, API and DB checks).
 export interface LoginConfig {
   strategy: 'manual' | 'form';
+  loginPath: string;
+  usernameSelector: string;
+  passwordSelector: string;
+  submitSelector: string;
+  successSelector?: string;
+  /** Default 15000. */
+  timeoutMs?: number;
 }
+// Placeholders: defined fully in later tasks (data rules, API and DB checks).
 export interface DataRule {
   /** Element key (e.g. "tid:stat-active-users") or "table:<key>:<header|*>"; the table key may contain ':' (split on the last colon). */
   target: string;

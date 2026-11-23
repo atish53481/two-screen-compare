@@ -1,3 +1,13 @@
+import type { LoginConfig } from './engine/types';
+
+export interface ProfileCredentials {
+  username: string;
+  secretRef?: string;
+}
+
+/** Accepted on save only; encrypted and stripped before persisting. */
+export type ProfileCredentialsInput = ProfileCredentials & { password?: string };
+
 export interface ComparisonProfile {
   id: string;
   name: string;
@@ -5,14 +15,10 @@ export interface ComparisonProfile {
   labelB: string;        // e.g. "PROD" or "Production"
   urlA: string;
   urlB: string;
-  credentialsA?: {
-    username: string;
-    password: string;
-  };
-  credentialsB?: {
-    username: string;
-    password: string;
-  };
+  /** Passwords are never stored here: they are encrypted into the secret store, referenced by secretRef. */
+  credentialsA?: ProfileCredentials;
+  credentialsB?: ProfileCredentials;
+  login?: LoginConfig;
   safetyPolicy: 'read-only' | 'allow-safe' | 'full';
   /**
    * Actions/requests allowed on PROD despite the safety policy.

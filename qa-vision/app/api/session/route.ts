@@ -1,5 +1,7 @@
 ﻿import { NextRequest, NextResponse } from 'next/server';
 import comparisonEngine, { validateTargetUrl } from '@/lib/playwright';
+import { profileManager } from '@/lib/profile-manager';
+import { getDataDir, resolveProfileCredentials } from '@/lib/engine/secrets';
 
 export async function POST(request: NextRequest) {
   try {
@@ -16,6 +18,7 @@ export async function POST(request: NextRequest) {
       ignoreRules,
       capture,
       paused,
+      profileId,
     } = body;
 
     switch (action) {
@@ -42,6 +45,24 @@ export async function POST(request: NextRequest) {
           ? safetyAllowlist.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 50)
           : [];
 
+        // Secrets are resolved server-side only; they never reach the client or the logs
+        let login;
+        let loginCredentials;
+        if (typeof profileId === 'string' && profileId) {
+          const profile = profileManager.getProfile(profileId);
+          if (!profile) {
+            return NextResponse.json({ success: false, error: 'Profile not found' }, { status: 404 });
+          }
+          if (profile.login && profile.login.strategy === 'form') {
+            login = profile.login;
+            const dataDir = getDataDir();
+            loginCredentials = {
+              dev: resolveProfileCredentials(profile, 'A', dataDir),
+              prod: resolveProfileCredentials(profile, 'B', dataDir),
+            };
+          }
+        }
+
         const newSessionId = await comparisonEngine.startSessionWithRecorder(
           devUrl,
           prodUrl,
@@ -53,6 +74,9 @@ export async function POST(request: NextRequest) {
               ? ignoreRules.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 100)
               : [],
             capture: capture && typeof capture === 'object' ? capture : undefined,
+            profileId: typeof profileId === 'string' ? profileId : undefined,
+            login,
+            loginCredentials,
           }
         );
 
