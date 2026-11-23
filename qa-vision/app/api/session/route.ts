@@ -14,6 +14,7 @@ export async function POST(request: NextRequest) {
       safetyPolicy,
       safetyAllowlist,
       ignoreRules,
+      capture,
       paused,
     } = body;
 
@@ -44,12 +45,15 @@ export async function POST(request: NextRequest) {
         const newSessionId = await comparisonEngine.startSessionWithRecorder(
           devUrl,
           prodUrl,
-          projectName || 'QA Vision Session',
-          policy,
-          allowlist,
-          Array.isArray(ignoreRules)
-            ? ignoreRules.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 100)
-            : []
+          {
+            projectName: projectName || 'QA Vision Session',
+            safetyPolicy: policy,
+            safetyAllowlist: allowlist,
+            ignoreRules: Array.isArray(ignoreRules)
+              ? ignoreRules.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 100)
+              : [],
+            capture: capture && typeof capture === 'object' ? capture : undefined,
+          }
         );
 
         return NextResponse.json({

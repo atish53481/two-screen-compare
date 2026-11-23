@@ -19,7 +19,7 @@ const replayedSteps = (logs) => logs.map((l) => (l.action.match(/^\[(step-\d+)\]
 
 runSuite('Synchronization & findings', async ({ check }) => {
   // ---------- Session A: no ignore rules ----------
-  const a = await engine.createSession(DEV_URL, PROD_URL, 'sync-A');
+  const a = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-A' });
   const A = engine.getSession(a);
   await waitForLoginForm(A);
   await idle(A);
@@ -78,7 +78,7 @@ runSuite('Synchronization & findings', async ({ check }) => {
   check('Stop is logged in the archived run', snap.logs.some((l) => l.action === 'Session stopped by user'));
 
   // ---------- Session B: ignore rules ----------
-  const b = await engine.createSession(DEV_URL, PROD_URL, 'sync-B', 'read-only', [], ['numbers', 'text:environment']);
+  const b = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-B', ignoreRules: ['numbers', 'text:environment'] });
   const B = engine.getSession(b);
   await waitForLoginForm(B);
   await idle(B);

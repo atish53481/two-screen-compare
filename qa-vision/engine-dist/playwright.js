@@ -199,7 +199,12 @@ class QAComparisonEngine {
     setSocketIO(io) {
         getEngineGlobals().io = io;
     }
-    async createSession(devUrl, prodUrl, projectName = 'QA Vision Session', safetyPolicy = 'read-only', safetyAllowlist = [], ignoreRules = []) {
+    async createSession(devUrl, prodUrl, opts = {}) {
+        const projectName = opts.projectName || 'QA Vision Session';
+        let safetyPolicy = opts.safetyPolicy || 'read-only';
+        const safetyAllowlist = opts.safetyAllowlist || [];
+        const ignoreRules = opts.ignoreRules || [];
+        const capture = (0, findings_1.normalizeCaptureSettings)(opts.capture);
         const devCheck = validateTargetUrl(devUrl);
         if (!devCheck.ok)
             throw new Error(`DEV URL rejected: ${devCheck.error}`);
@@ -219,18 +224,18 @@ class QAComparisonEngine {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                `--window-size=1280,900`,
+                `--window-size=${capture.viewport.width},${capture.viewport.height + 100}`,
             ],
             timeout: 60000,
         };
         const devBrowser = await playwright_1.chromium.launch(launchOptions);
         const prodBrowser = await playwright_1.chromium.launch(launchOptions);
         const devContext = await devBrowser.newContext({
-            viewport: { width: 1280, height: 800 },
+            viewport: { ...capture.viewport },
             userAgent: 'QA-Vision-DEV',
         });
         const prodContext = await prodBrowser.newContext({
-            viewport: { width: 1280, height: 800 },
+            viewport: { ...capture.viewport },
             userAgent: 'QA-Vision-PROD',
         });
         const devPage = await devContext.newPage();
@@ -258,6 +263,7 @@ class QAComparisonEngine {
         });
         const session = {
             id: sessionId,
+            capture,
             projectName,
             devBrowser,
             prodBrowser,
@@ -1137,9 +1143,9 @@ class QAComparisonEngine {
         }).slice(0, 40);
     }
     /** Wait until a page has a parsed document and its UI has had a moment to settle. */
-    async waitForSettled(page) {
+    async waitForSettled(page, settleMs) {
         await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-        await page.waitForTimeout(350);
+        await page.waitForTimeout(settleMs);
     }
     /**
      * Capture and compare DEV vs PROD. `steps` lists every step this comparison covers
@@ -1151,7 +1157,7 @@ class QAComparisonEngine {
             return;
         const stepLabel = steps.length > 3 ? `${steps[0]}…${steps[steps.length - 1]} (${steps.length} steps)` : steps.join(', ');
         try {
-            await Promise.all([this.waitForSettled(session.devPage), this.waitForSettled(session.prodPage)]);
+            await Promise.all([this.waitForSettled(session.devPage, session.capture.settleMs), this.waitForSettled(session.prodPage, session.capture.settleMs)]);
             // Out-of-sync detection: PROD should be on the page equivalent to DEV's
             const expectedProd = mapDevUrlToProd(session.devPage.url(), session.devUrl, session.prodUrl);
             const normalizeUrl = (u) => (u || '').replace(/\/+$/, '').replace(/#.*$/, '');
@@ -1166,10 +1172,37 @@ class QAComparisonEngine {
                     this.log(sessionId, `Back in sync after ${stepLabel}`, 'Synced', 'Synced');
                 this.setSyncState(sessionId, false, 'in sync');
             }
+            const cap = session.capture;
+            if (cap.scopeSelector) {
+                const [devHas, prodHas] = await Promise.all([
+                    session.devPage.locator(cap.scopeSelector).count().catch(() => 0),
+                    session.prodPage.locator(cap.scopeSelector).count().catch(() => 0),
+                ]);
+                if (!devHas || !prodHas) {
+                    const missing = [!devHas ? 'DEV' : '', !prodHas ? 'PROD' : ''].filter(Boolean).join(' and ');
+                    this.recordMismatch(sessionId, {
+                        component: `Comparison scope ${cap.scopeSelector}`,
+                        type: 'Navigation',
+                        devValue: devHas ? 'scope element present' : 'scope element missing',
+                        prodValue: prodHas ? 'scope element present' : 'scope element missing',
+                        severity: 'medium',
+                        classification: 'NOT_COMPARABLE',
+                        description: `Scope selector "${cap.scopeSelector}" was not found on ${missing}; this step could not be compared.`,
+                    });
+                    this.log(sessionId, `Compared after ${stepLabel}: scope "${cap.scopeSelector}" missing on ${missing} - NOT_COMPARABLE`, 'Captured', 'Differences');
+                    return;
+                }
+            }
+            const shoot = (page) => {
+                const shotOpts = { type: 'png', mask: cap.maskSelectors.map((m) => page.locator(m)) };
+                return cap.scopeSelector
+                    ? page.locator(cap.scopeSelector).first().screenshot(shotOpts)
+                    : page.screenshot({ ...shotOpts, fullPage: cap.fullPage });
+            };
             const stamp = Date.now();
             const [devScreenshot, prodScreenshot, devContent, prodContent] = await Promise.all([
-                session.devPage.screenshot({ type: 'png', fullPage: false }),
-                session.prodPage.screenshot({ type: 'png', fullPage: false }),
+                shoot(session.devPage),
+                shoot(session.prodPage),
                 this.extractPageContent(session.devPage),
                 this.extractPageContent(session.prodPage),
             ]);
@@ -1177,7 +1210,7 @@ class QAComparisonEngine {
             const prodPath = path.join(session.evidenceDir, `prod-${stamp}.png`);
             fs.writeFileSync(devPath, devScreenshot);
             fs.writeFileSync(prodPath, prodScreenshot);
-            const { ratio, diffPath, sideBySidePath } = await this.compareScreenshots(devScreenshot, prodScreenshot, path.join(session.evidenceDir, `diff-${stamp}.png`), path.join(session.evidenceDir, `side-by-side-${stamp}.png`));
+            const { ratio, diffPath, sideBySidePath } = await this.compareScreenshots(devScreenshot, prodScreenshot, path.join(session.evidenceDir, `diff-${stamp}.png`), path.join(session.evidenceDir, `side-by-side-${stamp}.png`), cap.pixelThreshold);
             const evidence = {
                 devScreenshotPath: devPath,
                 prodScreenshotPath: prodPath,
@@ -1208,7 +1241,7 @@ class QAComparisonEngine {
             for (const td of textDiffs)
                 tally(this.recordMismatch(sessionId, { ...td, ...evidence }));
             // 2) Visual summary
-            if (ratio > 0.02 && textDiffs.length === 0) {
+            if (ratio > cap.visualDiffRatio && textDiffs.length === 0) {
                 tally(this.recordMismatch(sessionId, {
                     component: 'Viewport appearance',
                     type: 'Visual',
@@ -1238,7 +1271,7 @@ class QAComparisonEngine {
             this.log(sessionId, `Comparison failed after ${stepLabel}: ${String(e?.message || e).split('\n')[0]}`, 'Error', 'Error');
         }
     }
-    async compareScreenshots(buf1, buf2, preferredDiffPath, sideBySidePath) {
+    async compareScreenshots(buf1, buf2, preferredDiffPath, sideBySidePath, pixelThreshold = 0.1) {
         const img1 = pngjs_1.PNG.sync.read(buf1);
         const img2 = pngjs_1.PNG.sync.read(buf2);
         if (img1.width !== img2.width || img1.height !== img2.height) {
@@ -1248,7 +1281,7 @@ class QAComparisonEngine {
         }
         const diff = new pngjs_1.PNG({ width: img1.width, height: img1.height });
         const numDiffPixels = (0, pixelmatch_1.default)(img1.data, img2.data, diff.data, img1.width, img1.height, {
-            threshold: 0.1,
+            threshold: pixelThreshold,
             includeAA: true,
             diffColor: [255, 0, 0],
             alpha: 0.6,
@@ -1505,8 +1538,8 @@ class QAComparisonEngine {
         }
         return this.lastSnapshot;
     }
-    async startSessionWithRecorder(devUrl, prodUrl, projectName = 'QA Vision Session', safetyPolicy = 'read-only', safetyAllowlist = [], ignoreRules = []) {
-        return this.createSession(devUrl, prodUrl, projectName, safetyPolicy, safetyAllowlist, ignoreRules);
+    async startSessionWithRecorder(devUrl, prodUrl, opts = {}) {
+        return this.createSession(devUrl, prodUrl, opts);
     }
 }
 exports.comparisonEngine = new QAComparisonEngine();

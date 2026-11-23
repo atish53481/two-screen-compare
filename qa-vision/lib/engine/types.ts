@@ -71,3 +71,33 @@ export interface Finding extends FindingDraft {
   diffScreenshotPath?: string;
   diffPercent?: number;
 }
+
+export interface CaptureSettings {
+  viewport: { width: number; height: number };
+  /** pixelmatch per-pixel threshold, 0..1 */
+  pixelThreshold: number;
+  /** fraction of differing pixels that becomes a visual finding */
+  visualDiffRatio: number;
+  fullPage: boolean;
+  maskSelectors: string[];
+  /** '' = whole page */
+  scopeSelector: string;
+  settleMs: number;
+  layoutTolerancePx: number;
+}
+
+// Placeholders: defined fully in later tasks (login, data rules, API and DB checks).
+export interface LoginConfig {
+  strategy: 'manual' | 'form';
+}
+export interface DataRule {
+  target: string;
+  mode: string;
+}
+export interface ApiCheck {
+  name: string;
+  path: string;
+}
+export interface DbCheck {
+  name: string;
+}
