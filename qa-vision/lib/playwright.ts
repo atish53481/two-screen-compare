@@ -214,6 +214,7 @@ export interface ComparisonSession {
   startedAt: string;
   evidenceDir: string;
   /** Network/API entries seen since the last comparison (capped at 500 each). */
+  /** Consumers drain these with splice(0), never by reassigning. */
   netLog: { dev: NetworkEntry[]; prod: NetworkEntry[] };
   /** Console errors / page errors / failed requests since the last comparison. */
   runtimeLog: { dev: RuntimeEvent[]; prod: RuntimeEvent[] };
@@ -292,8 +293,9 @@ class QAComparisonEngine {
 
   /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
   private attachCollectors(session: ComparisonSession, side: 'dev' | 'prod', page: Page) {
-    const net = session.netLog[side];
-    const rt = session.runtimeLog[side];
+    // Look logs up at event time: consumers may replace the arrays.
+    const net = { push: (e: NetworkEntry) => pushCapped(session.netLog[side], e) };
+    const rt = { push: (e: RuntimeEvent) => pushCapped(session.runtimeLog[side], e) };
     page.on('response', async (res) => {
       try {
         const req = res.request();
@@ -311,7 +313,7 @@ class QAComparisonEngine {
             }
           }
         }
-        pushCapped(net, toNetworkEntry({
+        net.push(toNetworkEntry({
           method: req.method(), url: res.url(), status: res.status(),
           resourceType: req.resourceType(), contentType, json,
         }));
@@ -322,12 +324,12 @@ class QAComparisonEngine {
     page.on('requestfailed', (req) => {
       try {
         const failure = req.failure()?.errorText || 'failed';
-        pushCapped(net, toNetworkEntry({
+        net.push(toNetworkEntry({
           method: req.method(), url: req.url(), status: null,
           resourceType: req.resourceType(), failure,
         }));
         if (failure !== 'net::ERR_BLOCKED_BY_CLIENT') {
-          pushCapped(rt, { kind: 'request-failed', text: toRuntimeText(`${req.method()} ${req.url()} ${failure}`) });
+          rt.push({ kind: 'request-failed', text: toRuntimeText(`${req.method()} ${req.url()} ${failure}`) });
         }
       } catch {
         /* ignore */
@@ -335,14 +337,14 @@ class QAComparisonEngine {
     });
     page.on('console', (msg) => {
       try {
-        if (msg.type() === 'error') pushCapped(rt, { kind: 'console-error', text: toRuntimeText(msg.text()) });
+        if (msg.type() === 'error') rt.push({ kind: 'console-error', text: toRuntimeText(msg.text()) });
       } catch {
         /* ignore */
       }
     });
     page.on('pageerror', (err) => {
       try {
-        pushCapped(rt, { kind: 'page-error', text: toRuntimeText(err?.message || String(err)) });
+        rt.push({ kind: 'page-error', text: toRuntimeText(err?.message || String(err)) });
       } catch {
         /* ignore */
       }

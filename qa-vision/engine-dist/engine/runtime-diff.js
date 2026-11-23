@@ -10,6 +10,7 @@ exports.diffNetwork = diffNetwork;
 exports.diffRuntime = diffRuntime;
 const extract_1 = require("./extract");
 exports.LOG_CAP = 500;
+const EXTRA_SENSITIVE_RE = /^(authorization|cookie|set-cookie|api-?key|x-api-key|session|sid)$/i;
 const BLOCKED = 'net::ERR_BLOCKED_BY_CLIENT';
 const COUNTED = new Set(['xhr', 'fetch', 'document']);
 function toNetworkPath(url) {
@@ -64,7 +65,8 @@ function toRuntimeText(text) {
         const i = m.search(/[?#]/);
         return i >= 0 ? m.slice(0, i) : m;
     });
-    t = t.replace(/([\w.-]+)\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&]+)/g, (m, k, sep) => extract_1.SENSITIVE_FIELD_RE.test(k) ? `${k}${sep}[redacted]` : m);
+    t = t.replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, '$1 [redacted]');
+    t = t.replace(/([\w.-]+)["']?\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&}]+)/g, (m, k, sep) => extract_1.SENSITIVE_FIELD_RE.test(k) || EXTRA_SENSITIVE_RE.test(k) ? `${k}${sep}[redacted]` : m);
     return t.slice(0, 300);
 }
 function pushCapped(arr, item, cap = exports.LOG_CAP) {

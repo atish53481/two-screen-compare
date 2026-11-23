@@ -68,3 +68,15 @@ test('pushCapped drops oldest beyond 500', () => {
   assert.equal(a.length, 500);
   assert.equal(a[0], 5);
 });
+
+test('runtime text redacts JSON-quoted, bearer and header secrets', () => {
+  for (const [input, secret] of [
+    ['payload {"password":"hunter2"} bad', 'hunter2'],
+    ['got "token":"abc123" here', 'abc123'],
+    ['Authorization: Bearer xyz789', 'xyz789'],
+    ['hdr Basic dXNlcjpwdw== sent', 'dXNlcjpwdw'],
+    ['Cookie: sid=s3cr3tcookie', 's3cr3tcookie'],
+    ['x-api-key=k1k2k3', 'k1k2k3'],
+    ['{"session":"sess-777"}', 'sess-777'],
+  ]) assert.ok(!toRuntimeText(input).includes(secret), input + ' -> ' + toRuntimeText(input));
+});

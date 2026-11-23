@@ -2,6 +2,7 @@ import { SENSITIVE_FIELD_RE } from './extract';
 import type { FindingDraft, NetworkEntry, RuntimeEvent } from './types';
 
 export const LOG_CAP = 500;
+const EXTRA_SENSITIVE_RE = /^(authorization|cookie|set-cookie|api-?key|x-api-key|session|sid)$/i;
 const BLOCKED = 'net::ERR_BLOCKED_BY_CLIENT';
 const COUNTED = new Set(['xhr', 'fetch', 'document']);
 
@@ -67,8 +68,9 @@ export function toRuntimeText(text: string): string {
     const i = m.search(/[?#]/);
     return i >= 0 ? m.slice(0, i) : m;
   });
-  t = t.replace(/([\w.-]+)\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&]+)/g, (m, k, sep) =>
-    SENSITIVE_FIELD_RE.test(k) ? `${k}${sep}[redacted]` : m);
+  t = t.replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, '$1 [redacted]');
+  t = t.replace(/([\w.-]+)["']?\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&}]+)/g, (m, k, sep) =>
+    SENSITIVE_FIELD_RE.test(k) || EXTRA_SENSITIVE_RE.test(k) ? `${k}${sep}[redacted]` : m);
   return t.slice(0, 300);
 }
 
