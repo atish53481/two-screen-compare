@@ -1,0 +1,36 @@
+// Per-step comparisons: DOM, CSS/layout, a11y, data rules, network and console.
+const { engine, DEV_URL, PROD_URL, SAMPLE_EMAIL, SAMPLE_PASSWORD, idle, waitForLoginForm, runSuite } = require('./helpers');
+
+runSuite('Comparisons', async ({ check }) => {
+  const id = await engine.createSession(DEV_URL, PROD_URL, {
+    projectName: 'comparisons-e2e',
+    safetyAllowlist: ['login-submit'],
+    dataRules: [{ target: 'table:tid:orders:*', mode: 'exact' }],
+  });
+  const s = engine.getSession(id);
+  await waitForLoginForm(s);
+  await s.devPage.locator('[data-testid="login-email"]').pressSequentially(SAMPLE_EMAIL, { delay: 5 });
+  await s.devPage.locator('[data-testid="login-password"]').pressSequentially(SAMPLE_PASSWORD, { delay: 5 });
+  await s.devPage.click('[data-testid="login-submit"]');
+  await idle(s);
+  await s.devPage.waitForSelector('[data-testid="btn-continue-dashboard"]', { timeout: 8000 });
+  await s.devPage.click('[data-testid="btn-continue-dashboard"]');
+  await idle(s);
+
+  const m = s.mismatches;
+  const find = (pred) => m.find(pred);
+  const has = (re, v) => re.test(String(v || ''));
+  const found = {
+    'CSS/Layout on btn-add-user': find((x) => (x.type === 'CSS' || x.type === 'Layout') && has(/btn-add-user/, `${x.devSelector} ${x.prodSelector} ${x.component}`)),
+    'Accessibility alt': find((x) => x.type === 'Accessibility' && x.property === 'alt'),
+    'Network /api/stats growth': find((x) => x.type === 'Network' && has(/\/api\/stats/, `${x.component} ${x.description}`) && has(/growth/, `${x.devValue} ${x.prodValue} ${x.description}`)),
+    'Console Legacy chart': find((x) => x.type === 'Console' && has(/Legacy chart/, `${x.devValue} ${x.prodValue} ${x.description}`)),
+    'Data row count orders': find((x) => x.type === 'Data' && has(/orders/, x.component) && has(/row/i, `${x.property} ${x.description}`)),
+    'DOM enabled on btn-add-user': find((x) => x.type === 'DOM' && x.property === 'enabled' && has(/btn-add-user/, `${x.devSelector} ${x.prodSelector} ${x.component}`)),
+  };
+  for (const [name, f] of Object.entries(found)) {
+    check(`finding: ${name}`, !!f && f.classification === 'POTENTIAL_DEFECT', f ? f.classification : 'missing');
+  }
+  check('no finding for class differences', !m.some((x) => x.property === 'class'));
+  check('compare log carries per-type counts', s.logs.some((l) => /Compared after .*\d+ new \(Text \d+, DOM \d+, CSS \d+, Layout \d+, A11y \d+, Data \d+, Network \d+, Console \d+\)/.test(l.action)));
+});

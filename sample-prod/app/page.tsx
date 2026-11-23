@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 export default function ProdApp() {
   const [email, setEmail] = useState('');
@@ -9,6 +9,12 @@ export default function ProdApp() {
   const [showModal, setShowModal] = useState(false);
   const [users] = useState(1248); // Different from DEV
   const [revenue] = useState(1248000);
+
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    fetch('/api/stats').catch(() => {});
+    console.error('Legacy chart failed to load'); // deliberate fixture difference
+  }, [isLoggedIn]);
 
   const handleLogin = () => {
     if (email === 'test@acme.com' && password === 'password123') {
@@ -36,7 +42,8 @@ export default function ProdApp() {
           </div>
           <div className="flex gap-6 text-sm">
             <div className="text-center">
-              <div className="text-3xl font-mono text-blue-400">{users.toLocaleString()}</div>
+              {/* deliberate fixture difference: 1,250 (DEV) vs 1,248 (PROD) */}
+              <div data-testid="stat-active-users" className="text-3xl font-mono text-blue-400">{users.toLocaleString()}</div>
               <div className="text-xs uppercase tracking-widest text-blue-500">Active Users</div>
             </div>
             <div className="text-center">
@@ -93,6 +100,18 @@ export default function ProdApp() {
           </div>
         ) : (
           <div className="space-y-8">
+            {/* deliberate fixture difference: logo has alt text on PROD only */}
+            <img data-testid="logo" alt="Acme" width={48} height={48} src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48'%3E%3Crect width='48' height='48' fill='%23888'/%3E%3C/svg%3E" />
+            {/* deliberate fixture difference: 2 order rows on PROD (DEV 3, PROD 2) */}
+            <table data-testid="orders" className="text-sm text-zinc-300">
+              <thead>
+                <tr><th>Order</th><th>Customer</th><th>Total</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>1001</td><td>Acme Co</td><td>$120</td></tr>
+                <tr><td>1002</td><td>Globex</td><td>$340</td></tr>
+              </tbody>
+            </table>
             <div className="bg-zinc-900 rounded-3xl p-10">
               <div className="flex items-center gap-4 mb-8">
                 <div className="w-12 h-12 bg-blue-500 rounded-2xl flex items-center justify-center text-2xl">🏢</div>
@@ -118,7 +137,8 @@ export default function ProdApp() {
                   type="button"
                   data-testid="btn-add-user"
                   onClick={() => alert('User registration is disabled in PRODUCTION for safety')}
-                  className="bg-zinc-800 hover:bg-zinc-700 p-8 rounded-3xl text-left transition-all border border-blue-900 hover:border-blue-500 group opacity-75"
+                  className="bg-zinc-800 hover:bg-zinc-700 p-8 rounded-3xl text-left transition-all border border-blue-900 hover:border-blue-500 group opacity-75 px-4"
+                  disabled // deliberate fixture difference: PROD button disabled, px-4 vs DEV px-6
                 >
                   <div className="text-blue-400 text-sm mb-2 group-hover:underline">ADD USER (DISABLED)</div>
                   <div className="text-2xl font-semibold">Production Safety Mode</div>

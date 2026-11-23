@@ -47,7 +47,12 @@ const pixelmatch_1 = __importDefault(require("pixelmatch"));
 const pngjs_1 = require("pngjs");
 const findings_1 = require("./engine/findings");
 const extract_1 = require("./engine/extract");
+const dom_diff_1 = require("./engine/dom-diff");
+const css_diff_1 = require("./engine/css-diff");
+const a11y_diff_1 = require("./engine/a11y-diff");
+const data_rules_1 = require("./engine/data-rules");
 const runtime_diff_1 = require("./engine/runtime-diff");
+const runtime_diff_2 = require("./engine/runtime-diff");
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
@@ -172,6 +177,8 @@ function compileIgnoreRules(rules) {
         },
     };
 }
+/** Max time for structural extraction plus diffs on one step. */
+const COMPARISON_BUDGET_MS = 15000;
 function getEngineGlobals() {
     const g = globalThis;
     if (!g.__qaVisionEngine) {
@@ -203,8 +210,8 @@ class QAComparisonEngine {
     /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
     attachCollectors(session, side, page) {
         // Look logs up at event time: consumers may replace the arrays.
-        const net = { push: (e) => (0, runtime_diff_1.pushCapped)(session.netLog[side], e) };
-        const rt = { push: (e) => (0, runtime_diff_1.pushCapped)(session.runtimeLog[side], e) };
+        const net = { push: (e) => (0, runtime_diff_2.pushCapped)(session.netLog[side], e) };
+        const rt = { push: (e) => (0, runtime_diff_2.pushCapped)(session.runtimeLog[side], e) };
         page.on('response', async (res) => {
             try {
                 const req = res.request();
@@ -224,7 +231,7 @@ class QAComparisonEngine {
                         }
                     }
                 }
-                net.push((0, runtime_diff_1.toNetworkEntry)({
+                net.push((0, runtime_diff_2.toNetworkEntry)({
                     method: req.method(), url: res.url(), status: res.status(),
                     resourceType: req.resourceType(), contentType, json,
                 }));
@@ -236,12 +243,12 @@ class QAComparisonEngine {
         page.on('requestfailed', (req) => {
             try {
                 const failure = req.failure()?.errorText || 'failed';
-                net.push((0, runtime_diff_1.toNetworkEntry)({
+                net.push((0, runtime_diff_2.toNetworkEntry)({
                     method: req.method(), url: req.url(), status: null,
                     resourceType: req.resourceType(), failure,
                 }));
                 if (failure !== 'net::ERR_BLOCKED_BY_CLIENT') {
-                    rt.push({ kind: 'request-failed', text: (0, runtime_diff_1.toRuntimeText)(`${req.method()} ${req.url()} ${failure}`) });
+                    rt.push({ kind: 'request-failed', text: (0, runtime_diff_2.toRuntimeText)(`${req.method()} ${req.url()} ${failure}`) });
                 }
             }
             catch {
@@ -251,7 +258,7 @@ class QAComparisonEngine {
         page.on('console', (msg) => {
             try {
                 if (msg.type() === 'error')
-                    rt.push({ kind: 'console-error', text: (0, runtime_diff_1.toRuntimeText)(msg.text()) });
+                    rt.push({ kind: 'console-error', text: (0, runtime_diff_2.toRuntimeText)(msg.text()) });
             }
             catch {
                 /* ignore */
@@ -259,7 +266,7 @@ class QAComparisonEngine {
         });
         page.on('pageerror', (err) => {
             try {
-                rt.push({ kind: 'page-error', text: (0, runtime_diff_1.toRuntimeText)(err?.message || String(err)) });
+                rt.push({ kind: 'page-error', text: (0, runtime_diff_2.toRuntimeText)(err?.message || String(err)) });
             }
             catch {
                 /* ignore */
@@ -351,6 +358,7 @@ class QAComparisonEngine {
             permitMutationsUntil: 0,
             ignoreRules: (ignoreRules || []).map((r) => String(r).trim()).filter(Boolean),
             ignore: compileIgnoreRules(ignoreRules || []),
+            dataRules: opts.dataRules || [],
             actionQueue: Promise.resolve(),
             pendingActions: 0,
             stepCounter: 0,
@@ -1309,8 +1317,71 @@ class QAComparisonEngine {
             let added = 0;
             let repeated = 0;
             const tally = (isNew) => (isNew ? added++ : repeated++);
-            for (const td of textDiffs)
-                tally(this.recordMismatch(sessionId, { ...td, ...evidence }));
+            const counts = { Text: 0, DOM: 0, CSS: 0, Layout: 0, Accessibility: 0, Data: 0, Network: 0, Console: 0 };
+            for (const td of textDiffs) {
+                const isNew = this.recordMismatch(sessionId, { ...td, ...evidence });
+                tally(isNew);
+                if (isNew)
+                    counts.Text++;
+            }
+            // 1b) Structural comparisons (DOM, CSS, layout, a11y, data, network, console) under a time budget
+            const budgetStart = Date.now();
+            let budgetExceeded = false;
+            try {
+                const extractArg = {
+                    scopeSelector: cap.scopeSelector,
+                    maxElements: 400,
+                    maxRows: 50,
+                    sensitiveSource: extract_1.SENSITIVE_FIELD_RE.source,
+                    styleProps: [...extract_1.STYLE_PROPS],
+                    attrAllowlist: [...extract_1.ATTR_ALLOWLIST],
+                };
+                const timeout = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('budget')), COMPARISON_BUDGET_MS))]);
+                const [devSnap, prodSnap] = await timeout(Promise.all([session.devPage.evaluate(extract_1.extractPageSnapshot, extractArg), session.prodPage.evaluate(extract_1.extractPageSnapshot, extractArg)]));
+                const { pairs } = (0, dom_diff_1.pairElements)(devSnap.elements, prodSnap.elements);
+                const drafts = [
+                    ...(0, dom_diff_1.diffDom)(devSnap.elements, prodSnap.elements),
+                    ...(0, css_diff_1.diffCss)(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
+                    ...(0, a11y_diff_1.diffA11y)(pairs),
+                    ...(0, data_rules_1.diffData)(pairs, devSnap.tables, prodSnap.tables, session.dataRules),
+                    ...(0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
+                    ...(0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
+                ];
+                if (Date.now() - budgetStart > COMPARISON_BUDGET_MS)
+                    budgetExceeded = true;
+                else {
+                    for (const d of drafts) {
+                        if (session.ignore.active) {
+                            const excludedBy = session.ignore.exclude(d);
+                            if (excludedBy) {
+                                suppressed.push(`${d.component} (${excludedBy})`);
+                                continue;
+                            }
+                            if (session.ignore.normalize(d.devValue) === session.ignore.normalize(d.prodValue)) {
+                                suppressed.push(`${d.component} (normalized)`);
+                                continue;
+                            }
+                        }
+                        const isNew = this.recordMismatch(sessionId, { ...d, ...evidence });
+                        tally(isNew);
+                        if (isNew)
+                            counts[d.type] = (counts[d.type] || 0) + 1;
+                    }
+                }
+            }
+            catch (e) {
+                if (e?.message === 'budget')
+                    budgetExceeded = true;
+                else
+                    throw e;
+            }
+            if (budgetExceeded) {
+                session.netLog.dev.splice(0);
+                session.netLog.prod.splice(0);
+                session.runtimeLog.dev.splice(0);
+                session.runtimeLog.prod.splice(0);
+                this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${COMPARISON_BUDGET_MS} ms): keeping text and visual findings only`, 'Captured', 'Error');
+            }
             // 2) Visual summary
             if (ratio > cap.visualDiffRatio && textDiffs.length === 0) {
                 tally(this.recordMismatch(sessionId, {
@@ -1334,7 +1405,7 @@ class QAComparisonEngine {
                     ...evidence,
                 }));
             }
-            this.log(sessionId, `Compared after ${stepLabel}: ${added} new difference(s), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
+            this.log(sessionId, `Compared after ${stepLabel}: ${added} new (Text ${counts.Text}, DOM ${counts.DOM}, CSS ${counts.CSS}, Layout ${counts.Layout}, A11y ${counts.Accessibility}, Data ${counts.Data}, Network ${counts.Network}, Console ${counts.Console}), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
                 (suppressed.length ? `; ${suppressed.length} suppressed by ignore rules: ${suppressed.slice(0, 5).join(', ')}${suppressed.length > 5 ? '…' : ''}` : ''), 'Captured', added > 0 ? 'Differences' : 'Captured');
         }
         catch (e) {

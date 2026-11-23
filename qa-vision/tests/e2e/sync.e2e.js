@@ -52,7 +52,7 @@ runSuite('Synchronization & findings', async ({ check }) => {
     await A.devPage.click('h1');
     await idle(A);
   }
-  const fps = A.mismatches.map((m) => [m.page, m.type, m.component, m.devValue, m.prodValue].join('|'));
+  const fps = A.mismatches.map((m) => [m.page, m.type, m.component, m.property, m.devValue, m.prodValue].join('|'));
   const dupes = fps.length - new Set(fps).size;
   const repeated = A.mismatches.find((m) => (m.occurrences || 1) > 1);
   check('no duplicate findings after repeated actions', dupes === 0, `findings ${before} -> ${A.mismatches.length}`);

@@ -5,9 +5,14 @@ import * as path from 'path';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
 import { fingerprint, classifyFinding, normalizeCaptureSettings } from './engine/findings';
-import { SENSITIVE_FIELD_RE } from './engine/extract';
+import { SENSITIVE_FIELD_RE, STYLE_PROPS, ATTR_ALLOWLIST, extractPageSnapshot } from './engine/extract';
+import { diffDom, pairElements } from './engine/dom-diff';
+import { diffCss } from './engine/css-diff';
+import { diffA11y } from './engine/a11y-diff';
+import { diffData } from './engine/data-rules';
+import { diffNetwork, diffRuntime } from './engine/runtime-diff';
 import { toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
-import type { CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
+import type { FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
 
 /**
  * Safety policies for the PROD (mirror) environment:
@@ -162,6 +167,9 @@ type TargetResolution =
   | { ok: true; locator: Locator; strategy: string }
   | { ok: false; classification: 'UNMAPPED_OR_MISSING_FEATURE' | 'REPLAY_FAILURE'; detail: string };
 
+/** Max time for structural extraction plus diffs on one step. */
+const COMPARISON_BUDGET_MS = 15000;
+
 export interface SessionOptions {
   projectName?: string;
   safetyPolicy?: SafetyPolicy;
@@ -198,6 +206,7 @@ export interface ComparisonSession {
   permitMutationsUntil: number;
   ignoreRules: string[];
   ignore: CompiledIgnoreRules;
+  dataRules: DataRule[];
   /** Ordered action queue: actions replay one at a time, in capture order. */
   actionQueue: Promise<void>;
   pendingActions: number;
@@ -439,6 +448,7 @@ class QAComparisonEngine {
       permitMutationsUntil: 0,
       ignoreRules: (ignoreRules || []).map((r) => String(r).trim()).filter(Boolean),
       ignore: compileIgnoreRules(ignoreRules || []),
+      dataRules: opts.dataRules || [],
       actionQueue: Promise.resolve(),
       pendingActions: 0,
       stepCounter: 0,
@@ -1485,8 +1495,70 @@ class QAComparisonEngine {
       let added = 0;
       let repeated = 0;
       const tally = (isNew: boolean) => (isNew ? added++ : repeated++);
+      const counts: Record<string, number> = { Text: 0, DOM: 0, CSS: 0, Layout: 0, Accessibility: 0, Data: 0, Network: 0, Console: 0 };
 
-      for (const td of textDiffs) tally(this.recordMismatch(sessionId, { ...td, ...evidence }));
+      for (const td of textDiffs) {
+        const isNew = this.recordMismatch(sessionId, { ...td, ...evidence });
+        tally(isNew);
+        if (isNew) counts.Text++;
+      }
+
+      // 1b) Structural comparisons (DOM, CSS, layout, a11y, data, network, console) under a time budget
+      const budgetStart = Date.now();
+      let budgetExceeded = false;
+      try {
+        const extractArg = {
+          scopeSelector: cap.scopeSelector,
+          maxElements: 400,
+          maxRows: 50,
+          sensitiveSource: SENSITIVE_FIELD_RE.source,
+          styleProps: [...STYLE_PROPS],
+          attrAllowlist: [...ATTR_ALLOWLIST],
+        };
+        const timeout = <T,>(p: Promise<T>) =>
+          Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('budget')), COMPARISON_BUDGET_MS))]);
+        const [devSnap, prodSnap]: PageSnapshot[] = await timeout(
+          Promise.all([session.devPage.evaluate(extractPageSnapshot, extractArg), session.prodPage.evaluate(extractPageSnapshot, extractArg)])
+        );
+        const { pairs } = pairElements(devSnap.elements, prodSnap.elements);
+        const drafts: FindingDraft[] = [
+          ...diffDom(devSnap.elements, prodSnap.elements),
+          ...diffCss(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
+          ...diffA11y(pairs),
+          ...diffData(pairs, devSnap.tables, prodSnap.tables, session.dataRules),
+          ...diffNetwork(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
+          ...diffRuntime(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
+        ];
+        if (Date.now() - budgetStart > COMPARISON_BUDGET_MS) budgetExceeded = true;
+        else {
+          for (const d of drafts) {
+            if (session.ignore.active) {
+              const excludedBy = session.ignore.exclude(d);
+              if (excludedBy) {
+                suppressed.push(`${d.component} (${excludedBy})`);
+                continue;
+              }
+              if (session.ignore.normalize(d.devValue) === session.ignore.normalize(d.prodValue)) {
+                suppressed.push(`${d.component} (normalized)`);
+                continue;
+              }
+            }
+            const isNew = this.recordMismatch(sessionId, { ...d, ...evidence });
+            tally(isNew);
+            if (isNew) counts[d.type] = (counts[d.type] || 0) + 1;
+          }
+        }
+      } catch (e: any) {
+        if (e?.message === 'budget') budgetExceeded = true;
+        else throw e;
+      }
+      if (budgetExceeded) {
+        session.netLog.dev.splice(0);
+        session.netLog.prod.splice(0);
+        session.runtimeLog.dev.splice(0);
+        session.runtimeLog.prod.splice(0);
+        this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${COMPARISON_BUDGET_MS} ms): keeping text and visual findings only`, 'Captured', 'Error');
+      }
 
       // 2) Visual summary
       if (ratio > cap.visualDiffRatio && textDiffs.length === 0) {
@@ -1517,7 +1589,7 @@ class QAComparisonEngine {
 
       this.log(
         sessionId,
-        `Compared after ${stepLabel}: ${added} new difference(s), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
+        `Compared after ${stepLabel}: ${added} new (Text ${counts.Text}, DOM ${counts.DOM}, CSS ${counts.CSS}, Layout ${counts.Layout}, A11y ${counts.Accessibility}, Data ${counts.Data}, Network ${counts.Network}, Console ${counts.Console}), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
           (suppressed.length ? `; ${suppressed.length} suppressed by ignore rules: ${suppressed.slice(0, 5).join(', ')}${suppressed.length > 5 ? '…' : ''}` : ''),
         'Captured',
         added > 0 ? 'Differences' : 'Captured'
