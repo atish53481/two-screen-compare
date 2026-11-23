@@ -7,6 +7,8 @@ export default function DevApp() {
   const [password, setPassword] = useState('');
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [showModal, setShowModal] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [showTip, setShowTip] = useState(false);
   const [users, setUsers] = useState(1250);
   const [revenue] = useState(1248000);
 
@@ -14,6 +16,14 @@ export default function DevApp() {
     if (!isLoggedIn) return;
     fetch('/api/stats').catch(() => {});
   }, [isLoggedIn]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowModal(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const handleLogin = () => {
     if (email === 'test@acme.com' && password === 'password123') {
@@ -111,6 +121,23 @@ export default function DevApp() {
                 <tr><td>1003</td><td>Initech</td><td>$99</td></tr>
               </tbody>
             </table>
+            <div data-testid="row-dbl" onDoubleClick={() => setShowDetails(true)} className="text-sm text-zinc-300 cursor-pointer select-none">
+              Order 1001 (double-click for details)
+            </div>
+            {showDetails && <div data-testid="row-details" className="text-sm text-zinc-400">Details for order 1001</div>}
+            <div className="relative inline-block">
+              <button
+                type="button"
+                data-testid="help-hover"
+                aria-describedby="help-tip"
+                onMouseEnter={() => setShowTip(true)}
+                onMouseLeave={() => setShowTip(false)}
+                className="text-zinc-400 text-sm underline"
+              >
+                Help
+              </button>
+              {showTip && <div id="help-tip" role="tooltip" data-testid="help-tooltip" className="text-xs text-zinc-300">Contact support any time</div>}
+            </div>
             <div className="bg-zinc-900 rounded-3xl p-10">
               <div className="flex items-center gap-4 mb-8">
                 <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center text-2xl">🚀</div>
@@ -160,7 +187,7 @@ export default function DevApp() {
         )}
 
         {showModal && (
-          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
+          <div data-testid="modal" className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
             <div className="bg-zinc-900 rounded-3xl p-10 max-w-md text-center border border-emerald-500">
               <div className="text-6xl mb-6">🎉</div>
               <h3 className="text-3xl font-bold mb-4 text-emerald-400">Welcome to DEV</h3>

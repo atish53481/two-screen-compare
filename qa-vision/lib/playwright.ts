@@ -260,6 +260,11 @@ type CapturedAction = {
   isSubmit?: boolean;
   isSensitive?: boolean;
   isMutation?: boolean;
+  key?: string;
+  ctrl?: boolean;
+  alt?: boolean;
+  shift?: boolean;
+  meta?: boolean;
 };
 
 type EngineGlobals = {
@@ -725,8 +730,37 @@ class QAComparisonEngine {
     if (pendingFill) {
       const p = pendingFill;
       pendingFill = null;
+      flushClicks();
       emit(p.action);
     }
+  }
+
+  // Plain clicks are held briefly so a following dblclick can cancel them (otherwise the
+  // two click events of a double-click would be replayed as extra single clicks on PROD).
+  const clickDelayMs = 250;
+  let pendingClicks = []; // { target, timer, action }
+
+  function flushClicks() {
+    const list = pendingClicks;
+    pendingClicks = [];
+    list.forEach((p) => {
+      clearTimeout(p.timer);
+      emit(p.action);
+    });
+  }
+
+  function clickTarget(e) {
+    return e.target && e.target.closest
+      ? (e.target.closest('button, a, input, select, textarea, [role="button"], [data-testid], label') || e.target)
+      : e.target;
+  }
+
+  // Native controls that navigate or submit are emitted immediately (a delayed emit could be
+  // lost to an unload); everything else, or anything marked as having a dblclick handler, waits.
+  function shouldDelayClick(el) {
+    if (!el || !el.matches) return false;
+    if (el.ondblclick || el.hasAttribute('data-qa-dblclick')) return true;
+    return !el.matches('button, a, input, select, textarea, summary, label, [role="button"]');
   }
 
   document.addEventListener('click', (e) => {
@@ -735,15 +769,99 @@ class QAComparisonEngine {
     if (now - lastActionTime < debounceMs) return;
     lastActionTime = now;
 
-    const target = e.target && e.target.closest
-      ? (e.target.closest('button, a, input, select, textarea, [role="button"], [data-testid], label') || e.target)
-      : e.target;
+    const target = clickTarget(e);
+    cancelHover();
 
-    const info = describe(target);
+    const action = { type: 'click', ...describe(target), isMutation: true };
+    flushClicks();
+    if (!shouldDelayClick(target)) {
+      emit(action);
+      return;
+    }
+    const entry = { target: target, action: action, timer: null };
+    entry.timer = setTimeout(() => {
+      pendingClicks = pendingClicks.filter((p) => p !== entry);
+      emit(action);
+    }, clickDelayMs);
+    pendingClicks.push(entry);
+  }, true);
+
+  document.addEventListener('dblclick', (e) => {
+    flushFill();
+    const target = clickTarget(e);
+    // Drop the single clicks that belong to this double-click.
+    pendingClicks = pendingClicks.filter((p) => {
+      if (p.target !== target) return true;
+      clearTimeout(p.timer);
+      return false;
+    });
+    flushClicks();
+    lastActionTime = Date.now();
+    emit({ type: 'dblclick', ...describe(target), isMutation: true });
+  }, true);
+
+  // Hover: emitted after a dwell on an interactive / titled element, at most once per element per 2 s.
+  const hoverDwellMs = 600;
+  const hoverRepeatMs = 2000;
+  const lastHover = new WeakMap();
+  let hoverEl = null;
+  let hoverTimer = null;
+
+  function cancelHover() {
+    if (hoverTimer) clearTimeout(hoverTimer);
+    hoverTimer = null;
+    hoverEl = null;
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const el = e.target && e.target.closest
+      ? e.target.closest('button, a, input, select, textarea, [role="button"], [title], [aria-describedby]')
+      : null;
+    if (el === hoverEl) return;
+    cancelHover();
+    if (!el) return;
+    hoverEl = el;
+    hoverTimer = setTimeout(() => {
+      hoverTimer = null;
+      if (!el.isConnected) return;
+      const last = lastHover.get(el) || 0;
+      if (Date.now() - last < hoverRepeatMs) return;
+      lastHover.set(el, Date.now());
+      flushFill();
+      flushClicks();
+      emit({ type: 'hover', ...describe(el), isMutation: false });
+    }, hoverDwellMs);
+  }, true);
+  document.addEventListener('mouseleave', cancelHover, true);
+
+  // Keyboard: navigation / control keys and anything with a modifier. Plain typing stays 'fill'.
+  const namedKeys = /^(Enter|Escape|Tab|Arrow(Up|Down|Left|Right)|PageUp|PageDown|Home|End)$/;
+  const modifierOnly = /^(Control|Shift|Alt|Meta|AltGraph|CapsLock)$/;
+
+  document.addEventListener('keydown', (e) => {
+    if (modifierOnly.test(e.key) || e.isComposing) return;
+    const hasModifier = e.ctrlKey || e.altKey || e.metaKey;
+    if (!namedKeys.test(e.key) && !hasModifier) return;
+
+    const active = document.activeElement;
+    const tag = active && active.tagName ? active.tagName.toLowerCase() : '';
+    // Enter on a button or link already produces a click event, which is recorded on its own.
+    if (e.key === 'Enter' && !hasModifier && (tag === 'button' || tag === 'a' || tag === 'summary')) return;
+
+    flushFill();
+    flushClicks();
+    const info = describe(active && active !== document.body && active !== document.documentElement ? active : null);
+    const isFormEnter = e.key === 'Enter' && !!active && !!active.form && tag !== 'textarea';
     emit({
-      type: 'click',
+      type: 'key',
       ...info,
-      isMutation: true,
+      key: e.key,
+      ctrl: e.ctrlKey,
+      alt: e.altKey,
+      shift: e.shiftKey,
+      meta: e.metaKey,
+      isSubmit: isFormEnter || !!info.isSubmit,
+      isMutation: isFormEnter,
     });
   }, true);
 
@@ -964,6 +1082,39 @@ class QAComparisonEngine {
           this.log(sessionId, `Clicked ${label} (matched by ${target.strategy})`, 'Success', 'Success');
           break;
         }
+        case 'dblclick': {
+          const target = await this.resolveProdTarget(prodPage, action);
+          if (!target.ok) return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
+          await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          await target.locator.dblclick({ timeout: 5000 });
+          this.log(sessionId, `Double-clicked ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          break;
+        }
+        case 'hover': {
+          const target = await this.resolveProdTarget(prodPage, action);
+          if (!target.ok) return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
+          await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          await target.locator.hover({ timeout: 5000 });
+          this.log(sessionId, `Hovered ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          break;
+        }
+        case 'key': {
+          const key = action.key || '';
+          if (!key) break;
+          const combo = [action.ctrl && 'Control', action.alt && 'Alt', action.meta && 'Meta', action.shift && 'Shift', key]
+            .filter(Boolean)
+            .join('+');
+          const focusable = action.tag && !/^(body|html)$/.test(action.tag);
+          const target = focusable ? await this.resolveProdTarget(prodPage, action) : null;
+          if (target && target.ok) {
+            await target.locator.press(combo, { timeout: 5000 });
+            this.log(sessionId, `Pressed ${combo} on ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          } else {
+            await prodPage.keyboard.press(combo);
+            this.log(sessionId, `Pressed ${combo} (page keyboard)`, 'Success', 'Success');
+          }
+          break;
+        }
         case 'fill':
         case 'input': {
           const target = await this.resolveProdTarget(prodPage, action);
@@ -1045,7 +1196,9 @@ class QAComparisonEngine {
     action: CapturedAction
   ): { allow: boolean; reason: string; allowlisted: boolean } {
     if (session.safetyPolicy === 'full') return { allow: true, reason: 'full policy', allowlisted: false };
-    if (action.type !== 'click') {
+    // A double-click is two clicks; Enter in a form submits it. Hover and other keys never mutate.
+    const mutating = action.type === 'click' || action.type === 'dblclick' || (action.type === 'key' && !!action.isSubmit);
+    if (!mutating) {
       // Typing, scrolling and in-base navigation (GET) do not mutate server state;
       // any request they trigger still goes through the network guard.
       return { allow: true, reason: 'non-mutating', allowlisted: false };
