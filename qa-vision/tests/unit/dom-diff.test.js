@@ -72,3 +72,8 @@ test('duplicate keys pair by order', () => {
   assert.equal(r.devOnly[0], dev[1]);
   assert.equal(r.prodOnly.length, 0);
 });
+test('disabled change yields one finding', () => {
+  const f = diffDom([el('b', { tag: 'button', attrs: {}, enabled: true })], [el('b', { tag: 'button', attrs: { disabled: '' }, enabled: false })]);
+  assert.equal(f.length, 1);
+  assert.equal(f[0].property, 'enabled');
+});

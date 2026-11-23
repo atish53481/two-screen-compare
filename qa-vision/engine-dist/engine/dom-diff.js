@@ -119,6 +119,8 @@ function diffDom(dev, prod) {
         for (const name of [...names].sort()) {
             if (name === 'class')
                 continue;
+            if (d.enabled !== p.enabled && (name === 'disabled' || name === 'aria-disabled'))
+                continue;
             const dv = d.attrs[name];
             const pv = p.attrs[name];
             if (dv === pv)

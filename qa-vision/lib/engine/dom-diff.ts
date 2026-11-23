@@ -116,6 +116,7 @@ export function diffDom(dev: ElementSnapshot[], prod: ElementSnapshot[]): Findin
     const names = new Set([...Object.keys(d.attrs), ...Object.keys(p.attrs)]);
     for (const name of [...names].sort()) {
       if (name === 'class') continue;
+      if (d.enabled !== p.enabled && (name === 'disabled' || name === 'aria-disabled')) continue;
       const dv = d.attrs[name];
       const pv = p.attrs[name];
       if (dv === pv) continue;
