@@ -1,0 +1,14 @@
+{
+  "name": "two-screen-compare",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start:all": "cd qa-vision && npm run start:all",
+    "dev:qa": "cd qa-vision && npm run dev",
+    "dev:dev": "cd sample-dev && npm run dev",
+    "dev:prod": "cd sample-prod && npm run dev"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7"
+  }
+}

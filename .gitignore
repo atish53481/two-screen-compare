@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Next.js / build output
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+
+# Runtime data & evidence (screenshots, PDFs, session snapshots may contain app data)
+qa-vision/reports/
+qa-vision/data/
+
+# Playwright
+test-results/
+playwright-report/
+
+# Env & secrets
+.env*
+*.pem
+
+# Logs / OS
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
+Thumbs.db
