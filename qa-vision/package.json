@@ -17,6 +17,7 @@
     "test": "npm run test:unit && npm run test:e2e"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.13.0",
     "date-fns": "^4.1.0",
     "exceljs": "^4.4.0",
     "lucide-react": "^0.475.0",

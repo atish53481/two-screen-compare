@@ -23,9 +23,9 @@ export type Category =
 
 export type Severity = 'low' | 'medium' | 'high' | 'critical';
 
-/** Minimal AI analysis shape; filled in by the AI provider layer later. */
+/** Advisory AI analysis; never alters Finding.classification. */
 export interface AiAnalysis {
-  status: string;
+  status: 'ok' | 'unavailable' | 'error';
   provider: string;
   model: string;
   explanation: string;

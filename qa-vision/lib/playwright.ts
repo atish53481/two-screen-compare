@@ -13,7 +13,8 @@ import { diffData } from './engine/data-rules';
 import { diffNetwork, diffRuntime, toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
 import { originOf, resolveLoginUrl, getDataDir } from './engine/secrets';
 import { openStore } from './engine/store';
-import type { FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
+import { analyzeFindings, providerFromEnv, DEFAULT_AI_OPTIONS } from './engine/ai';
+import type { Finding, AiAnalysis, FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
 
 /**
  * Safety policies for the PROD (mirror) environment:
@@ -2246,6 +2247,53 @@ class QAComparisonEngine {
       /* ignore */
     }
     this.persistRun(session, this.lastSnapshot);
+    this.scheduleAiAnalysis(session, this.lastSnapshot);
+  }
+
+  /** Background, fire-and-forget: must never block or throw into Stop. Advisory only; never touches classification. */
+  private scheduleAiAnalysis(session: ComparisonSession, snap: SessionSnapshot) {
+    void (async () => {
+      try {
+        const provider = providerFromEnv(process.env);
+        if (!provider) return;
+        const findings = session.mismatches.filter((f) => !f.ai || f.ai.status !== 'ok');
+        if (!findings.length) return;
+        const results = await analyzeFindings(findings, provider, DEFAULT_AI_OPTIONS);
+        for (const f of findings) {
+          const ai = results.get(f.id);
+          if (!ai) continue;
+          f.ai = ai;
+          this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: f });
+        }
+        this.persistRun(session, snap); // same finding objects, so ai is included; endedAt unchanged
+      } catch (e) {
+        console.error('AI analysis failed:', (e as Error).message);
+      }
+    })();
+  }
+
+  async analyzeFinding(
+    ref: { sessionId?: string; runId?: string },
+    findingId: string
+  ): Promise<{ ok: boolean; finding?: any; ai?: AiAnalysis }> {
+    try {
+      const provider = providerFromEnv(process.env);
+      const store = openStore(path.join(getDataDir(), 'qa-vision.db'));
+      const session = ref.sessionId ? this.sessions.get(ref.sessionId) : undefined;
+      const run = !session && ref.runId ? store.getRun(ref.runId) : undefined;
+      const list: Finding[] | undefined = session?.mismatches ?? run?.mismatches;
+      const finding = list?.find((f) => f.id === findingId);
+      if (!finding) return { ok: false };
+      const ai = (await analyzeFindings([finding], provider, DEFAULT_AI_OPTIONS)).get(finding.id);
+      if (!ai) return { ok: false };
+      finding.ai = ai;
+      if (session) this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: finding });
+      else if (run) store.saveRun(run);
+      return { ok: true, finding, ai };
+    } catch (e) {
+      console.error('AI analysis failed:', (e as Error).message);
+      return { ok: false };
+    }
   }
 
   async closeSession(sessionId: string) {

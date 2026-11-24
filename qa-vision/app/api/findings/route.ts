@@ -9,8 +9,11 @@ export async function POST(request: NextRequest) {
     const { action, sessionId, runId, findingId, note } = await request.json();
 
     if (action === 'analyze') {
-      // Wired in Task 14
-      return NextResponse.json({ error: 'AI analysis not configured' }, { status: 501 });
+      if (typeof findingId !== 'string' || !findingId || (!sessionId && !runId)) {
+        return NextResponse.json({ success: false, error: 'findingId and sessionId or runId required' }, { status: 400 });
+      }
+      const result = await comparisonEngine.analyzeFinding({ sessionId, runId }, findingId);
+      return NextResponse.json({ success: result.ok, ...result }, { status: result.ok ? 200 : 404 });
     }
     if (!['mark-expected', 'unmark-expected', 'highlight'].includes(action)) {
       return NextResponse.json({ success: false, error: 'Unknown action' }, { status: 400 });

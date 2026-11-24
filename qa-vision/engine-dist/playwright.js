@@ -55,6 +55,7 @@ const data_rules_1 = require("./engine/data-rules");
 const runtime_diff_1 = require("./engine/runtime-diff");
 const secrets_1 = require("./engine/secrets");
 const store_1 = require("./engine/store");
+const ai_1 = require("./engine/ai");
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
@@ -2021,6 +2022,57 @@ class QAComparisonEngine {
             /* ignore */
         }
         this.persistRun(session, this.lastSnapshot);
+        this.scheduleAiAnalysis(session, this.lastSnapshot);
+    }
+    /** Background, fire-and-forget: must never block or throw into Stop. Advisory only; never touches classification. */
+    scheduleAiAnalysis(session, snap) {
+        void (async () => {
+            try {
+                const provider = (0, ai_1.providerFromEnv)(process.env);
+                if (!provider)
+                    return;
+                const findings = session.mismatches.filter((f) => !f.ai || f.ai.status !== 'ok');
+                if (!findings.length)
+                    return;
+                const results = await (0, ai_1.analyzeFindings)(findings, provider, ai_1.DEFAULT_AI_OPTIONS);
+                for (const f of findings) {
+                    const ai = results.get(f.id);
+                    if (!ai)
+                        continue;
+                    f.ai = ai;
+                    this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: f });
+                }
+                this.persistRun(session, snap); // same finding objects, so ai is included; endedAt unchanged
+            }
+            catch (e) {
+                console.error('AI analysis failed:', e.message);
+            }
+        })();
+    }
+    async analyzeFinding(ref, findingId) {
+        try {
+            const provider = (0, ai_1.providerFromEnv)(process.env);
+            const store = (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db'));
+            const session = ref.sessionId ? this.sessions.get(ref.sessionId) : undefined;
+            const run = !session && ref.runId ? store.getRun(ref.runId) : undefined;
+            const list = session?.mismatches ?? run?.mismatches;
+            const finding = list?.find((f) => f.id === findingId);
+            if (!finding)
+                return { ok: false };
+            const ai = (await (0, ai_1.analyzeFindings)([finding], provider, ai_1.DEFAULT_AI_OPTIONS)).get(finding.id);
+            if (!ai)
+                return { ok: false };
+            finding.ai = ai;
+            if (session)
+                this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: finding });
+            else if (run)
+                store.saveRun(run);
+            return { ok: true, finding, ai };
+        }
+        catch (e) {
+            console.error('AI analysis failed:', e.message);
+            return { ok: false };
+        }
     }
     async closeSession(sessionId) {
         const session = this.sessions.get(sessionId);
