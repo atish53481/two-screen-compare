@@ -12,10 +12,42 @@ import { renderXlsx } from '@/lib/engine/reports/xlsx';
 import { renderCsv } from '@/lib/engine/reports/csv';
 import { generateComparisonPdf, type ReportInput, type ReportLog, type ReportMismatch } from '@/lib/report-generator';
 
+export const runtime = 'nodejs';
+
+const FORMATS = {
+  pdf: { type: 'application/pdf', ext: 'pdf' },
+  html: { type: 'text/html; charset=utf-8', ext: 'html' },
+  json: { type: 'application/json; charset=utf-8', ext: 'json' },
+  xlsx: { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', ext: 'xlsx' },
+  csv: { type: 'text/csv; charset=utf-8', ext: 'csv' },
+} as const;
+type Format = keyof typeof FORMATS;
+
+/** Evidence directory of a session; null when the id could escape the evidence root. */
+function evidenceDirFor(id: string): string | null {
+  const root = path.resolve(process.cwd(), 'reports', 'evidence');
+  const dir = path.resolve(root, id);
+  return path.dirname(dir) === root ? dir : null;
+}
+
+/** Re-resolve a screenshot reference inside the evidence directory only; anything else (or missing) becomes undefined. */
+function safeEvidencePath(dir: string | null, p: unknown): string | undefined {
+  if (!dir || typeof p !== 'string' || !p) return undefined;
+  const full = path.resolve(dir, p.split(/[\\/]/).pop() as string);
+  return path.dirname(full) === dir && fs.existsSync(full) ? full : undefined;
+}
+
 export async function POST(request: NextRequest) {
   try {
+    const bad = requireJson(request);
+    if (bad) return bad;
     const body = await request.json().catch(() => ({}));
+    const format = (body?.format ?? 'pdf') as Format;
+    if (!Object.prototype.hasOwnProperty.call(FORMATS, format)) {
+      return NextResponse.json({ success: false, error: 'format must be one of pdf, html, json, xlsx, csv' }, { status: 400 });
+    }
     const {
+      runId,
       sessionId,
       projectName,
       devUrl,
@@ -24,7 +56,35 @@ export async function POST(request: NextRequest) {
       mismatches: clientMismatches,
     } = body || {};
 
-    const serverSource = comparisonEngine.getReportSource(sessionId || null);
+    const hasRunId = typeof runId === 'string' && runId.length > 0;
+    const serverSource = hasRunId
+      ? openStore(path.join(getDataDir(), 'qa-vision.db')).getRun(runId)
+      : comparisonEngine.getReportSource(sessionId || null);
+    if (hasRunId && !serverSource) {
+      return NextResponse.json({ success: false, error: 'Run not found' }, { status: 404 });
+    }
+
+    if (format !== 'pdf') {
+      if (!serverSource) return NextResponse.json({ success: false, error: 'No session or run to report on' }, { status: 404 });
+      const model = buildReportModel(serverSource);
+      const stem = `qa-vision-report-${String(serverSource.id).replace(/[^\w.-]/g, '_')}`;
+      let payload: string | Buffer;
+      if (format === 'html') {
+        const dir = evidenceDirFor(String(serverSource.id));
+        payload = renderHtml(model, dir ? await loadEvidenceImages(dir, model) : new Map());
+      } else if (format === 'json') payload = renderJson(model);
+      else if (format === 'csv') payload = renderCsv(model);
+      else payload = await renderXlsx(model);
+      return new NextResponse(typeof payload === 'string' ? payload : new Uint8Array(payload), {
+        status: 200,
+        headers: {
+          'Content-Type': FORMATS[format].type,
+          'Content-Disposition': `attachment; filename="${stem}.${FORMATS[format].ext}"`,
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+    const evidenceDir = serverSource ? evidenceDirFor(String(serverSource.id)) : null;
 
     // The server holds the complete run; the dashboard only keeps a truncated live view.
     // Use server logs, and append only client-side entries the server does not have.
@@ -54,9 +114,14 @@ export async function POST(request: NextRequest) {
       severity: m.severity || 'medium',
       description: m.description,
       aiAnalysis: m.aiAnalysis,
-      devScreenshotPath: m.devScreenshotPath,
-      prodScreenshotPath: m.prodScreenshotPath,
-      diffScreenshotPath: m.diffScreenshotPath,
+      devScreenshotPath: safeEvidencePath(evidenceDir, m.devScreenshotPath),
+      prodScreenshotPath: safeEvidencePath(evidenceDir, m.prodScreenshotPath),
+      diffScreenshotPath: safeEvidencePath(evidenceDir, m.diffScreenshotPath),
+      property: m.property,
+      devSelector: m.devSelector,
+      prodSelector: m.prodSelector,
+      ruleApplied: m.ruleApplied,
+      ai: m.ai,
       diffPercent: m.diffPercent,
       classification: m.classification,
       occurrences: m.occurrences,
