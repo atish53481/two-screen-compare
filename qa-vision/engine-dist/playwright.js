@@ -368,7 +368,7 @@ class QAComparisonEngine {
             stepCounter: 0,
             uncomparedSteps: [],
             findingIndex: new Map(),
-            expected: new Set(),
+            expected: new Set(this.loadExpectations(opts.profileId).map((e) => e.fingerprint)),
             outOfSync: false,
             recorderReady: false,
             startedAt: new Date().toISOString(),
@@ -717,6 +717,14 @@ class QAComparisonEngine {
     if (el.ondblclick || el.hasAttribute('data-qa-dblclick')) return true;
     return !el.matches('button, a, input, select, textarea, summary, label, [role="button"]');
   }
+
+  // The highlight overlay (and anything inside it) is never a user action.
+  ['click', 'dblclick', 'mouseover', 'keydown', 'input', 'change'].forEach((t) => {
+    document.addEventListener(t, (e) => {
+      const el = e.target;
+      if (el && el.closest && el.closest('[data-qa-vision-highlight]')) e.stopImmediatePropagation();
+    }, true);
+  });
 
   document.addEventListener('click', (e) => {
     flushFill();
@@ -1865,6 +1873,121 @@ class QAComparisonEngine {
         session.mismatches.unshift(fullMismatch);
         this.io?.emit('mismatch', { sessionId, mismatch: fullMismatch });
         return true;
+    }
+    loadExpectations(profileId) {
+        if (!profileId)
+            return [];
+        try {
+            return (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db')).listExpectations(profileId);
+        }
+        catch (e) {
+            console.error('Could not load expectations:', e.message);
+            return [];
+        }
+    }
+    /** Re-derive a finding's classification from the expectation set; preset classifications (replay failures etc.) are kept. */
+    reclassify(finding, expected, note) {
+        const derived = finding.classification === 'POTENTIAL_DEFECT' || finding.classification === 'EXPECTED_DIFFERENCE';
+        if (!derived)
+            return;
+        const { classification, confidence } = (0, findings_1.classifyFinding)({ ...finding, classification: undefined }, expected, finding.fingerprint);
+        finding.classification = classification;
+        finding.confidence = confidence;
+        if (classification === 'EXPECTED_DIFFERENCE') {
+            finding.ruleApplied = 'user-expectation' + (note ? ': ' + note : '');
+            finding.expectationNote = note;
+        }
+        else {
+            finding.ruleApplied = null;
+            delete finding.expectationNote;
+        }
+    }
+    async markExpected(ref, findingId, expected, note = '') {
+        const store = (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db'));
+        const apply = (list, profileId, set) => {
+            const finding = list.find((f) => f.id === findingId);
+            if (!finding || !finding.fingerprint)
+                return null;
+            if (profileId) {
+                if (expected)
+                    store.addExpectation(profileId, finding.fingerprint, note);
+                else
+                    store.removeExpectation(profileId, finding.fingerprint);
+            }
+            if (expected)
+                set.add(finding.fingerprint);
+            else
+                set.delete(finding.fingerprint);
+            this.reclassify(finding, set, note);
+            return finding;
+        };
+        if (ref.sessionId) {
+            const session = this.sessions.get(ref.sessionId);
+            if (!session)
+                return { ok: false };
+            const finding = apply(session.mismatches, session.profileId, session.expected);
+            if (!finding)
+                return { ok: false };
+            this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: finding });
+            return { ok: true, finding };
+        }
+        if (ref.runId) {
+            const run = store.getRun(ref.runId);
+            if (!run)
+                return { ok: false };
+            const set = new Set(this.loadExpectations(run.profileId).map((e) => e.fingerprint));
+            const finding = apply(run.mismatches, run.profileId, set);
+            if (!finding)
+                return { ok: false };
+            store.saveRun(run);
+            return { ok: true, finding };
+        }
+        return { ok: false };
+    }
+    async highlightFinding(sessionId, findingId) {
+        const session = this.sessions.get(sessionId);
+        const finding = session?.mismatches.find((f) => f.id === findingId);
+        if (!session || !finding)
+            return { dev: false, prod: false, reason: 'Finding or session not found' };
+        const testId = (() => {
+            const c = String(finding.component ?? '');
+            const m = c.match(/data-testid=["']?([\w-]+)/) || c.match(/^([\w-]+)$/);
+            return m ? `[data-testid="${m[1]}"]` : '';
+        })();
+        const mark = async (page, selector) => {
+            for (const sel of [selector, testId]) {
+                if (!sel)
+                    continue;
+                try {
+                    const ok = await page.evaluate((s) => {
+                        const el = document.querySelector(s);
+                        if (!el)
+                            return false;
+                        el.scrollIntoView({ block: 'center', inline: 'center' });
+                        document.querySelectorAll('[data-qa-vision-highlight]').forEach((n) => n.remove());
+                        const r = el.getBoundingClientRect();
+                        const box = document.createElement('div');
+                        box.setAttribute('data-qa-vision-highlight', '');
+                        box.style.cssText =
+                            `position:absolute;left:${r.left + window.scrollX}px;top:${r.top + window.scrollY}px;` +
+                                `width:${r.width}px;height:${r.height}px;outline:3px solid #f43f5e;pointer-events:none;z-index:2147483647;`;
+                        document.body.appendChild(box);
+                        setTimeout(() => box.remove(), 3000);
+                        return true;
+                    }, sel);
+                    if (ok)
+                        return true;
+                }
+                catch {
+                    /* invalid selector or navigation: try next */
+                }
+            }
+            return false;
+        };
+        const dev = await mark(session.devPage, finding.devSelector);
+        const prod = await mark(session.prodPage, finding.prodSelector);
+        const missing = [dev ? '' : 'DEV', prod ? '' : 'PROD'].filter(Boolean);
+        return { dev, prod, ...(missing.length ? { reason: `Element not found on ${missing.join(' and ')}` } : {}) };
     }
     snapshotOf(session) {
         return {
