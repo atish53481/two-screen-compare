@@ -6,14 +6,14 @@ runSuite('Safety', async ({ check }) => {
   for (const bad of ['file:///etc/passwd', 'http://169.254.169.254/latest/meta-data', 'http://user:pw@localhost:3002']) {
     let rejected = false;
     try {
-      await engine.createSession(bad, PROD_URL, 'safety');
+      await engine.createSession(bad, PROD_URL, { projectName: 'safety' });
     } catch {
       rejected = true;
     }
     check(`rejects unsafe URL ${bad.slice(0, 40)}`, rejected);
   }
 
-  const id = await engine.createSession(DEV_URL, PROD_URL, 'safety-e2e'); // default policy
+  const id = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'safety-e2e' }); // default policy
   const s = engine.getSession(id);
   check('default safety policy is read-only', s.safetyPolicy === 'read-only', s.safetyPolicy);
   const { devPage: dev, prodPage: prod } = s;

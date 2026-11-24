@@ -4,6 +4,33 @@ import * as fs from 'fs';
 import * as path from 'path';
 import pixelmatch from 'pixelmatch';
 import { PNG } from 'pngjs';
+import { fingerprint, classifyFinding, normalizeCaptureSettings } from './engine/findings';
+import { SENSITIVE_FIELD_RE, STYLE_PROPS, ATTR_ALLOWLIST, extractPageSnapshot } from './engine/extract';
+import { diffDom, pairElements } from './engine/dom-diff';
+import { diffCss } from './engine/css-diff';
+import { diffA11y } from './engine/a11y-diff';
+import { diffData } from './engine/data-rules';
+import { diffNetwork, diffRuntime, toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
+import { originOf, resolveLoginUrl, getDataDir, getSecretFile, decryptSecret, loadKey, dbSecretPrefix } from './engine/secrets';
+import { runDataSourceChecks } from './engine/data-sources';
+import { openStore } from './engine/store';
+import { analyzeFindings, providerFromEnv, type AiProvider, DEFAULT_AI_OPTIONS } from './engine/ai';
+import type { Finding, AiAnalysis, FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
+
+/** Copy of v with every *ScreenshotPath value reduced to its base name (socket payloads must not leak disk paths). */
+function stripShotPaths<T>(v: T): T {
+  if (Array.isArray(v)) return v.map(stripShotPaths) as unknown as T;
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, x]) => [
+        k,
+        /ScreenshotPath$/.test(k) ? (typeof x === 'string' && x ? path.basename(x) : x) : stripShotPaths(x),
+      ])
+    ) as T;
+  }
+  return v;
+}
+
 
 /**
  * Safety policies for the PROD (mirror) environment:
@@ -21,7 +48,6 @@ const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const ALLOWLIST_PERMIT_WINDOW_MS = 5000;
 const DESTRUCTIVE_ACTION_RE =
   /\b(delete|remove|destroy|purge|drop|terminate|deactivate|unsubscribe|refund|purchase|buy now|pay|pay now|checkout|place order|submit order|transfer|wire|cancel (?:subscription|order|account|plan)|reset (?:password|account|data))\b/i;
-const SENSITIVE_FIELD_RE = /pass|pwd|secret|token|otp|cvv|cvc|card.?num|cc-|ssn|pin\b/i;
 
 const BLOCKED_HOSTS = new Set([
   '169.254.169.254',
@@ -159,8 +185,44 @@ type TargetResolution =
   | { ok: true; locator: Locator; strategy: string }
   | { ok: false; classification: 'UNMAPPED_OR_MISSING_FEATURE' | 'REPLAY_FAILURE'; detail: string };
 
+/** Max time for structural extraction plus diffs on one step. */
+const comparisonBudgetMs = () => Number(process.env.QA_VISION_COMPARE_BUDGET_MS) || 15000;
+
+export interface LoginCredentialResult {
+  creds: { username: string; password: string } | null;
+  error?: string;
+}
+
+/** Session lifecycle: windows open and idle (ready) -> comparing (running) <-> suspended (paused). */
+export type SessionPhase = 'ready' | 'running' | 'paused';
+
+export interface SessionOptions {
+  /**
+   * true (the engine default, used by the e2e suites): compare from launch, as before.
+   * false (the dashboard): open in 'ready' — nothing is replicated or compared until startComparison().
+   */
+  startImmediately?: boolean;
+  projectName?: string;
+  safetyPolicy?: SafetyPolicy;
+  safetyAllowlist?: string[];
+  ignoreRules?: string[];
+  capture?: Partial<CaptureSettings>;
+  profileId?: string;
+  login?: LoginConfig;
+  /**
+   * SERVER-ONLY decrypted credentials for auto-login (dev = side A, prod = side B).
+   * Never serialized, sent to the client or logged. `error` explains why creds are unavailable.
+   */
+  loginCredentials?: { dev?: LoginCredentialResult | null; prod?: LoginCredentialResult | null };
+  dataRules?: DataRule[];
+  apiChecks?: ApiCheck[];
+  dbChecks?: DbCheck[];
+}
+
 export interface ComparisonSession {
   id: string;
+  profileId?: string;
+  capture: CaptureSettings;
   projectName: string;
   devBrowser: Browser;
   prodBrowser: Browser;
@@ -171,7 +233,11 @@ export interface ComparisonSession {
   devUrl: string;
   prodUrl: string;
   isRunning: boolean;
+  /** Always equals (phase === 'paused'). */
   isPaused: boolean;
+  phase: SessionPhase;
+  /** True while startComparison() is in flight (rejects a concurrent second start). */
+  starting?: boolean;
   logs: any[];
   mismatches: any[];
   safetyPolicy: SafetyPolicy;
@@ -179,8 +245,13 @@ export interface ComparisonSession {
   safetyAllowlist: string[];
   /** Epoch ms until which PROD writes are permitted (set by an allowlisted action). */
   permitMutationsUntil: number;
+  /** True while the engine drives the DEV page itself (auto-login): recorder events are dropped. */
+  suppressCapture: boolean;
   ignoreRules: string[];
   ignore: CompiledIgnoreRules;
+  dataRules: DataRule[];
+  apiChecks: ApiCheck[];
+  dbChecks: DbCheck[];
   /** Ordered action queue: actions replay one at a time, in capture order. */
   actionQueue: Promise<void>;
   pendingActions: number;
@@ -189,15 +260,33 @@ export interface ComparisonSession {
   uncomparedSteps: string[];
   /** Fingerprint → finding, for de-duplicating repeated differences. */
   findingIndex: Map<string, any>;
+  /** Fingerprints the user marked as expected differences. */
+  expected: Set<string>;
   outOfSync: boolean;
   stopRequested?: boolean;
+  aiScheduled?: boolean;
   recorderReady: boolean;
+  /** Live-view frame loop (see startFrameStream). */
+  frameTimer?: ReturnType<typeof setInterval>;
+  frameBusy?: boolean;
+  /** Live-view input from the dashboard, applied to DEV one at a time in arrival order. */
+  liveInputQueue?: Promise<void>;
+  /** Epoch ms of the last Live-view click/key/wheel (mouse moves excluded); comparisons wait for a quiet gap. */
+  lastLiveInputAt?: number;
+  /** A frame refresh was requested while a grab was in flight: run one more when it finishes. */
+  frameAgain?: boolean;
   startedAt: string;
   evidenceDir: string;
+  /** Network/API entries seen since the last comparison (capped at 500 each). */
+  /** Consumers drain these with splice(0), never by reassigning. */
+  netLog: { dev: NetworkEntry[]; prod: NetworkEntry[] };
+  /** Console errors / page errors / failed requests since the last comparison. */
+  runtimeLog: { dev: RuntimeEvent[]; prod: RuntimeEvent[] };
 }
 
 export type SessionSnapshot = {
   id: string;
+  profileId?: string;
   projectName: string;
   devUrl: string;
   prodUrl: string;
@@ -228,12 +317,19 @@ type CapturedAction = {
   isSubmit?: boolean;
   isSensitive?: boolean;
   isMutation?: boolean;
+  key?: string;
+  ctrl?: boolean;
+  alt?: boolean;
+  shift?: boolean;
+  meta?: boolean;
 };
 
 type EngineGlobals = {
   sessions: Map<string, ComparisonSession>;
   lastSnapshot: SessionSnapshot | null;
   io: Server | null;
+  /** Reaper timer: armed while sessions exist and no dashboard socket is connected. */
+  orphanTimer: ReturnType<typeof setTimeout> | null;
 };
 
 function getEngineGlobals(): EngineGlobals {
@@ -243,6 +339,7 @@ function getEngineGlobals(): EngineGlobals {
       sessions: new Map(),
       lastSnapshot: null,
       io: null,
+      orphanTimer: null,
     };
   }
   return g.__qaVisionEngine;
@@ -265,16 +362,130 @@ class QAComparisonEngine {
 
   setSocketIO(io: Server) {
     getEngineGlobals().io = io;
+    // Orphan reaper: watch dashboard connections so unwatched sessions cannot pile up browsers.
+    io.on('connection', (socket) => {
+      this.evaluateOrphans();
+      socket.on('disconnect', () => this.evaluateOrphans());
+    });
+    this.evaluateOrphans();
   }
 
-  async createSession(
-    devUrl: string,
-    prodUrl: string,
-    projectName: string = 'QA Vision Session',
-    safetyPolicy: SafetyPolicy = 'read-only',
-    safetyAllowlist: string[] = [],
-    ignoreRules: string[] = []
-  ): Promise<string> {
+  /** QA_VISION_ORPHAN_TIMEOUT_MS (default 10 minutes); read at arm time so tests can change it. */
+  private orphanTimeoutMs(): number {
+    const n = Number(process.env.QA_VISION_ORPHAN_TIMEOUT_MS);
+    return Number.isFinite(n) && n > 0 ? n : 600000;
+  }
+
+  /**
+   * Arms the reaper timer when sessions exist and no dashboard socket is connected; any connected
+   * socket (or no sessions left) cancels it. Event-driven: called on connect, disconnect and session create.
+   */
+  private evaluateOrphans() {
+    const g = getEngineGlobals();
+    const io = g.io;
+    if (!io) return;
+    const watched = io.sockets.sockets.size > 0;
+    if (watched || this.sessions.size === 0) {
+      if (g.orphanTimer) clearTimeout(g.orphanTimer);
+      g.orphanTimer = null;
+      return;
+    }
+    if (g.orphanTimer) return;
+    const ms = this.orphanTimeoutMs();
+    g.orphanTimer = setTimeout(() => {
+      g.orphanTimer = null;
+      if (!g.io || g.io.sockets.sockets.size > 0) return;
+      const minutes = +(ms / 60000).toFixed(2);
+      const reason = `Session closed: no dashboard connected for ${minutes} min`;
+      console.warn(reason);
+      void Promise.all(Array.from(this.sessions.keys()).map((id) => this.closeSession(id, reason)));
+    }, ms);
+    g.orphanTimer.unref?.();
+  }
+
+  /** Live sessions as the dashboard needs them to reconnect after a page reload (same data the socket emits). */
+  listActiveSessions() {
+    return Array.from(this.sessions.values()).map((s) => ({
+      sessionId: s.id,
+      phase: s.phase,
+      profileId: s.profileId,
+      projectName: s.projectName,
+      devUrl: urlForLog(s.devUrl),
+      prodUrl: urlForLog(s.prodUrl),
+      startedAt: s.startedAt,
+      outOfSync: s.outOfSync,
+      logs: s.logs.slice(0, 1000).map((l) => stripShotPaths(l)),
+      mismatches: s.mismatches.slice(0, 500).map((m) => stripShotPaths(m)),
+    }));
+  }
+
+  /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
+  private attachCollectors(session: ComparisonSession, side: 'dev' | 'prod', page: Page) {
+    // Look logs up at event time: consumers may replace the arrays.
+    const net = { push: (e: NetworkEntry) => pushCapped(session.netLog[side], e) };
+    const rt = { push: (e: RuntimeEvent) => pushCapped(session.runtimeLog[side], e) };
+    page.on('response', async (res) => {
+      try {
+        const req = res.request();
+        const headers = res.headers();
+        const contentType = headers['content-type'] || '';
+        let json: unknown;
+        if (/json/i.test(contentType)) {
+          const len = Number(headers['content-length'] || 0);
+          if (!len || len <= 256 * 1024) {
+            try {
+              const body = await res.body();
+              if (body.length <= 256 * 1024) json = JSON.parse(body.toString('utf8'));
+            } catch {
+              /* schema stays null */
+            }
+          }
+        }
+        net.push(toNetworkEntry({
+          method: req.method(), url: res.url(), status: res.status(),
+          resourceType: req.resourceType(), contentType, json,
+        }));
+      } catch {
+        /* ignore */
+      }
+    });
+    page.on('requestfailed', (req) => {
+      try {
+        const failure = req.failure()?.errorText || 'failed';
+        net.push(toNetworkEntry({
+          method: req.method(), url: req.url(), status: null,
+          resourceType: req.resourceType(), failure,
+        }));
+        if (failure !== 'net::ERR_BLOCKED_BY_CLIENT') {
+          rt.push({ kind: 'request-failed', text: toRuntimeText(`${req.method()} ${req.url()} ${failure}`) });
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+    page.on('console', (msg) => {
+      try {
+        if (msg.type() === 'error') rt.push({ kind: 'console-error', text: toRuntimeText(msg.text()) });
+      } catch {
+        /* ignore */
+      }
+    });
+    page.on('pageerror', (err) => {
+      try {
+        rt.push({ kind: 'page-error', text: toRuntimeText(err?.message || String(err)) });
+      } catch {
+        /* ignore */
+      }
+    });
+  }
+
+  async createSession(devUrl: string, prodUrl: string, opts: SessionOptions = {}): Promise<string> {
+    const projectName = opts.projectName || 'QA Vision Session';
+    let safetyPolicy: SafetyPolicy = opts.safetyPolicy || 'read-only';
+    const safetyAllowlist = opts.safetyAllowlist || [];
+    const ignoreRules = opts.ignoreRules || [];
+    const capture = normalizeCaptureSettings(opts.capture);
+    const startImmediately = opts.startImmediately !== false;
     const devCheck = validateTargetUrl(devUrl);
     if (!devCheck.ok) throw new Error(`DEV URL rejected: ${devCheck.error}`);
     const prodCheck = validateTargetUrl(prodUrl);
@@ -288,12 +499,14 @@ class QAComparisonEngine {
     fs.mkdirSync(evidenceDir, { recursive: true });
 
     const launchOptions = {
-      headless: process.env.QA_VISION_HEADLESS === '1', // visible by default; headless for automated tests
+      // Headless by default: the user drives DEV from the dashboard's Live view (see handleLiveInput).
+      // QA_VISION_SHOW_BROWSERS=1 brings back the separate visible DEV/PROD windows.
+      headless: process.env.QA_VISION_SHOW_BROWSERS !== '1' || process.env.QA_VISION_HEADLESS === '1',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        `--window-size=1280,900`,
+        `--window-size=${capture.viewport.width},${capture.viewport.height + 100}`,
       ],
       timeout: 60000,
     };
@@ -302,17 +515,35 @@ class QAComparisonEngine {
     const prodBrowser = await chromium.launch(launchOptions);
 
     const devContext = await devBrowser.newContext({
-      viewport: { width: 1280, height: 800 },
+      viewport: { ...capture.viewport },
       userAgent: 'QA-Vision-DEV',
     });
 
     const prodContext = await prodBrowser.newContext({
-      viewport: { width: 1280, height: 800 },
+      viewport: { ...capture.viewport },
       userAgent: 'QA-Vision-PROD',
     });
 
     const devPage = await devContext.newPage();
     const prodPage = await prodContext.newPage();
+
+    // Headless browsers show no dialogs: an unhandled alert() would look like "nothing happened". Report each one
+    // in the log and on the dashboard, then answer it: alert/beforeunload are accepted, confirm/prompt dismissed
+    // (the safe answer: nothing is approved on the user's behalf).
+    for (const [side, page] of [['DEV', devPage], ['PROD', prodPage]] as const) {
+      page.on('dialog', async (dialog) => {
+        const kind = dialog.type();
+        const accept = kind === 'alert' || kind === 'beforeunload';
+        const message = dialog.message().replace(/\s+/g, ' ').trim().slice(0, 300);
+        try {
+          this.log(sessionId, `${side} ${kind}: "${message}" (${accept ? 'closed' : 'dismissed'} automatically)`, side === 'DEV' ? 'Info' : '', side === 'PROD' ? 'Info' : '');
+          this.io?.emit('page-dialog', { sessionId, side, kind, message });
+        } catch {
+          /* reporting must never leave the dialog open */
+        }
+        await (accept ? dialog.accept() : dialog.dismiss()).catch(() => {});
+      });
+    }
 
     // Title the windows so the user can tell them apart
     devPage.on('load', async () => {
@@ -336,6 +567,8 @@ class QAComparisonEngine {
 
     const session: ComparisonSession = {
       id: sessionId,
+      profileId: opts.profileId,
+      capture,
       projectName,
       devBrowser,
       prodBrowser,
@@ -347,6 +580,7 @@ class QAComparisonEngine {
       prodUrl,
       isRunning: true,
       isPaused: false,
+      phase: startImmediately ? 'running' : 'ready',
       logs: [],
       mismatches: [],
       safetyPolicy,
@@ -354,20 +588,31 @@ class QAComparisonEngine {
         .map((s) => String(s).trim().toLowerCase())
         .filter(Boolean),
       permitMutationsUntil: 0,
+      suppressCapture: false,
       ignoreRules: (ignoreRules || []).map((r) => String(r).trim()).filter(Boolean),
       ignore: compileIgnoreRules(ignoreRules || []),
+      dataRules: opts.dataRules || [],
+      apiChecks: opts.apiChecks || [],
+      dbChecks: opts.dbChecks || [],
       actionQueue: Promise.resolve(),
       pendingActions: 0,
       stepCounter: 0,
       uncomparedSteps: [],
       findingIndex: new Map(),
+      expected: new Set(this.loadExpectations(opts.profileId).map((e) => e.fingerprint)),
       outOfSync: false,
       recorderReady: false,
       startedAt: new Date().toISOString(),
       evidenceDir,
+      netLog: { dev: [], prod: [] },
+      runtimeLog: { dev: [], prod: [] },
     };
 
+    this.attachCollectors(session, 'dev', devPage);
+    this.attachCollectors(session, 'prod', prodPage);
+
     this.sessions.set(sessionId, session);
+    this.evaluateOrphans();
 
     // Surface closed windows instead of silently failing every later action
     for (const [label, browser] of [['DEV', devBrowser], ['PROD', prodBrowser]] as const) {
@@ -376,6 +621,8 @@ class QAComparisonEngine {
         if (!current || !current.isRunning) return;
         this.log(sessionId, `${label} browser window was closed — replication stopped; Stop and start a new session`, label === 'DEV' ? 'Error' : 'n/a', 'Error');
         this.setSyncState(sessionId, true, `${label} browser closed`);
+        // The session has effectively ended: record the run now; Stop later rewrites the same row
+        this.persistRun(current);
       });
     }
 
@@ -393,6 +640,16 @@ class QAComparisonEngine {
     // Ensure injection is present after first paint (React hydration)
     await this.injectRecorderScript(devPage);
     session.recorderReady = true;
+
+    if (opts.login && opts.login.strategy === 'form') {
+      for (const side of ['DEV', 'PROD'] as const) {
+        const r = side === 'DEV' ? opts.loginCredentials?.dev : opts.loginCredentials?.prod;
+        await this.performLogin(sessionId, side, r?.creds ?? null, opts.login, r?.error);
+      }
+    }
+
+    // Dashboard sessions run the data checks at Start Comparison instead
+    if (startImmediately) await this.runDataChecks(sessionId);
 
     this.log(sessionId, 'Session initialized', 'Success', 'Success');
     this.log(
@@ -416,12 +673,19 @@ class QAComparisonEngine {
         this.log(sessionId, `Ignore rule "${r}" is not a valid regular expression and was skipped`, 'Info', 'Error');
       }
     }
-    this.log(sessionId, 'Action recorder active on DEV — interact only in the QA Vision DEV window', 'Active', 'Active');
+    this.log(sessionId, 'Action recorder active on DEV — interact in the DEV pane of Live Comparison', 'Active', 'Active');
 
-    // Baseline comparison of the landing pages (runs on the queue, does not block the API)
-    this.enqueueTask(sessionId, async () => {
-      await this.compareAfterAction(sessionId, ['initial']);
-    });
+    if (startImmediately) {
+      // Baseline comparison of the landing pages (runs on the queue, does not block the API)
+      this.enqueueTask(sessionId, async () => {
+        await this.compareAfterAction(sessionId, ['initial']);
+      });
+    } else {
+      this.log(sessionId, 'Ready — log in or navigate in the DEV pane, then press Start Comparison to begin', 'Ready', 'Ready');
+      this.io?.emit('status', { sessionId, phase: session.phase, message: 'Ready' });
+    }
+
+    this.startFrameStream(sessionId);
 
     console.log(`✅ QA Vision session created: ${sessionId}`);
     console.log(`   DEV  → ${devUrl}`);
@@ -430,6 +694,75 @@ class QAComparisonEngine {
     console.log(`   Project → ${projectName}`);
 
     return sessionId;
+  }
+
+  /**
+   * Profile auto-login (form strategy). Drives the page directly: DEV recorder events are
+   * suppressed so nothing is recorded, and PROD gets a short mutation window for the login POST
+   * (audited by the network guard log). The password is never logged.
+   */
+  private async performLogin(
+    sessionId: string,
+    side: 'DEV' | 'PROD',
+    creds: { username: string; password: string } | null,
+    cfg: LoginConfig,
+    unavailableReason?: string
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    if (!creds) {
+      this.log(
+        sessionId,
+        `Auto-login unavailable on ${side}: ${unavailableReason || 'no stored credentials'} — log in manually in the window`,
+        'Info',
+        'Info'
+      );
+      return false;
+    }
+    const page = side === 'DEV' ? session.devPage : session.prodPage;
+    const timeout = cfg.timeoutMs ?? 15000;
+    // Only DEV has a recorder; PROD login must not drop real user actions made in the DEV window
+    session.suppressCapture = side === 'DEV';
+    try {
+      const baseUrl = side === 'DEV' ? session.devUrl : session.prodUrl;
+      const boundOrigin = originOf(baseUrl);
+      const mismatch = async () => {
+        this.log(sessionId, `Auto-login unavailable on ${side}: login page origin mismatch — log in manually in the window`, 'Info', 'Info');
+        return false;
+      };
+      const target = resolveLoginUrl(cfg.loginPath, baseUrl);
+      if (!target) return await mismatch();
+      if (cfg.loginPath && page.url() !== target) await page.goto(target, { waitUntil: 'domcontentloaded', timeout });
+      // Never type a secret into a page whose origin is not the one the credentials are bound to
+      const onBoundOrigin = () => originOf(page.url()) === boundOrigin;
+      // Let client-side frameworks hydrate so typed values are not lost
+      await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 5000) }).catch(() => {});
+      if (!onBoundOrigin()) return await mismatch();
+      await page.locator(cfg.usernameSelector).first().fill(creds.username, { timeout });
+      if (!onBoundOrigin()) return await mismatch();
+      await page.locator(cfg.passwordSelector).first().fill(creds.password, { timeout });
+      if (side === 'PROD') {
+        session.permitMutationsUntil = Date.now() + 5000;
+        this.log(sessionId, 'PROD login submitted (profile login flow)', 'n/a', 'Info');
+      }
+      await page.locator(cfg.submitSelector).first().click({ timeout });
+      if (cfg.successSelector) {
+        await page.locator(cfg.successSelector).first().waitFor({ state: 'visible', timeout });
+      } else {
+        await page.locator(cfg.passwordSelector).first().waitFor({ state: 'hidden', timeout });
+      }
+      this.log(sessionId, `Logged in on ${side} as ${creds.username}`, 'Info', 'Info');
+      return true;
+    } catch (error: any) {
+      const reason = String(error?.message || error).split(String.fromCharCode(10))[0].split(creds.password).join('***');
+      this.log(sessionId, `Login on ${side} failed: ${reason}`, 'Info', 'Error');
+      return false;
+    } finally {
+      if (side === 'PROD') session.permitMutationsUntil = 0;
+      // Let any debounced recorder flush (fill timer 120ms) fire while still suppressed
+      if (side === 'DEV') await new Promise((r) => setTimeout(r, 400));
+      session.suppressCapture = false;
+    }
   }
 
   /**
@@ -506,6 +839,12 @@ class QAComparisonEngine {
     await devPage.exposeFunction('__qaVisionOnAction', async (action: CapturedAction) => {
       const current = this.sessions.get(sessionId);
       if (!current || !current.isRunning || current.isPaused || current.stopRequested) return;
+      // Ready: nothing is recorded or replicated (the single "Ready" line was logged at launch)
+      if (current.phase === 'ready') return;
+      if (current.suppressCapture) {
+        this.log(sessionId, 'Action in DEV window ignored while auto-login was running', 'Info', 'Info');
+        return;
+      }
       // Do not await: the DEV page must not block on PROD replay. Order is kept by the queue.
       void this.enqueueAction(sessionId, action);
     });
@@ -627,9 +966,46 @@ class QAComparisonEngine {
     if (pendingFill) {
       const p = pendingFill;
       pendingFill = null;
+      flushClicks();
       emit(p.action);
     }
   }
+
+  // Plain clicks are held briefly so a following dblclick can cancel them (otherwise the
+  // two click events of a double-click would be replayed as extra single clicks on PROD).
+  const clickDelayMs = 250;
+  let pendingClicks = []; // { target, timer, action }
+
+  function flushClicks() {
+    const list = pendingClicks;
+    pendingClicks = [];
+    list.forEach((p) => {
+      clearTimeout(p.timer);
+      emit(p.action);
+    });
+  }
+
+  function clickTarget(e) {
+    return e.target && e.target.closest
+      ? (e.target.closest('button, a, input, select, textarea, [role="button"], [data-testid], label') || e.target)
+      : e.target;
+  }
+
+  // Native controls that navigate or submit are emitted immediately (a delayed emit could be
+  // lost to an unload); everything else, or anything marked as having a dblclick handler, waits.
+  function shouldDelayClick(el) {
+    if (!el || !el.matches) return false;
+    if (el.ondblclick || el.hasAttribute('data-qa-dblclick')) return true;
+    return !el.matches('button, a, input, select, textarea, summary, label, [role="button"]');
+  }
+
+  // The highlight overlay (and anything inside it) is never a user action.
+  ['click', 'dblclick', 'mouseover', 'keydown', 'input', 'change'].forEach((t) => {
+    document.addEventListener(t, (e) => {
+      const el = e.target;
+      if (el && el.closest && el.closest('[data-qa-vision-highlight]')) e.stopImmediatePropagation();
+    }, true);
+  });
 
   document.addEventListener('click', (e) => {
     flushFill();
@@ -637,15 +1013,109 @@ class QAComparisonEngine {
     if (now - lastActionTime < debounceMs) return;
     lastActionTime = now;
 
-    const target = e.target && e.target.closest
-      ? (e.target.closest('button, a, input, select, textarea, [role="button"], [data-testid], label') || e.target)
-      : e.target;
+    const target = clickTarget(e);
+    cancelHover();
 
-    const info = describe(target);
+    const action = { type: 'click', ...describe(target), isMutation: true };
+    flushClicks();
+    if (!shouldDelayClick(target)) {
+      emit(action);
+      return;
+    }
+    const entry = { target: target, action: action, timer: null };
+    entry.timer = setTimeout(() => {
+      pendingClicks = pendingClicks.filter((p) => p !== entry);
+      emit(action);
+    }, clickDelayMs);
+    pendingClicks.push(entry);
+  }, true);
+
+  document.addEventListener('dblclick', (e) => {
+    flushFill();
+    const target = clickTarget(e);
+    // Drop the single clicks that belong to this double-click.
+    pendingClicks = pendingClicks.filter((p) => {
+      if (p.target !== target) return true;
+      clearTimeout(p.timer);
+      return false;
+    });
+    flushClicks();
+    lastActionTime = Date.now();
+    emit({ type: 'dblclick', ...describe(target), isMutation: true });
+  }, true);
+
+  // Hover: emitted after a dwell on an interactive / titled element, at most once per element per 2 s.
+  const hoverDwellMs = 600;
+  const hoverRepeatMs = 2000;
+  const lastHover = new WeakMap();
+  let hoverEl = null;
+  let hoverTimer = null;
+
+  function cancelHover() {
+    if (hoverTimer) clearTimeout(hoverTimer);
+    hoverTimer = null;
+    hoverEl = null;
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const el = e.target && e.target.closest
+      ? e.target.closest('button, a, input, select, textarea, [role="button"], [title], [aria-describedby]')
+      : null;
+    if (el === hoverEl) return;
+    cancelHover();
+    if (!el) return;
+    hoverEl = el;
+    hoverTimer = setTimeout(() => {
+      hoverTimer = null;
+      if (!el.isConnected) return;
+      const last = lastHover.get(el) || 0;
+      if (Date.now() - last < hoverRepeatMs) return;
+      lastHover.set(el, Date.now());
+      flushFill();
+      flushClicks();
+      emit({ type: 'hover', ...describe(el), isMutation: false });
+    }, hoverDwellMs);
+  }, true);
+  document.addEventListener('mouseleave', cancelHover, true);
+
+  // A click still waiting out its delay must not be lost when the page unloads.
+  window.addEventListener('pagehide', flushClicks, true);
+  window.addEventListener('beforeunload', flushClicks, true);
+
+  // Keyboard: navigation / control keys and anything with a modifier. Plain typing stays 'fill'.
+  const namedKeys = /^(Enter|Escape|Tab|Arrow(Up|Down|Left|Right)|PageUp|PageDown|Home|End)$/;
+  const modifierOnly = /^(Control|Shift|Alt|Meta|AltGraph|CapsLock)$/;
+
+  document.addEventListener('keydown', (e) => {
+    if (modifierOnly.test(e.key) || e.isComposing) return;
+    const hasModifier = e.ctrlKey || e.altKey || e.metaKey;
+    if (!namedKeys.test(e.key) && !hasModifier) return;
+    // AltGr / Alt combinations that produce a typed character are typing, not shortcuts.
+    const printable = e.key.length === 1;
+    if (e.getModifierState && e.getModifierState('AltGraph')) return;
+    if (printable && e.altKey && !e.metaKey) return;
+
+    const active = document.activeElement;
+    const tag = active && active.tagName ? active.tagName.toLowerCase() : '';
+    // Enter on a button or link already produces a click event, which is recorded on its own.
+    if (e.key === 'Enter' && !hasModifier && (tag === 'button' || tag === 'a' || tag === 'summary')) return;
+
+    flushFill();
+    flushClicks();
+    const info = describe(active && active !== document.body && active !== document.documentElement ? active : null);
+    // Never record what is typed into a sensitive field: only named keys are kept there.
+    if (info.isSensitive && !namedKeys.test(e.key)) return;
+    const isFormEnter = e.key === 'Enter' && !!active && !!active.form && tag !== 'textarea';
     emit({
-      type: 'click',
+      type: 'key',
       ...info,
-      isMutation: true,
+      key: e.key,
+      ctrl: e.ctrlKey,
+      alt: e.altKey,
+      shift: e.shiftKey,
+      meta: e.metaKey,
+      isSubmit: isFormEnter || (!!info.isSubmit && (e.key === 'Enter' || e.key === ' ')),
+      isMutation: isFormEnter,
     });
   }, true);
 
@@ -715,7 +1185,7 @@ class QAComparisonEngine {
    */
   enqueueAction(sessionId: string, action: CapturedAction): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return Promise.resolve();
+    if (!session || session.phase === 'ready') return Promise.resolve();
     session.pendingActions++;
     return this.enqueueTask(sessionId, async () => {
       const current = this.sessions.get(sessionId);
@@ -728,9 +1198,12 @@ class QAComparisonEngine {
         current.pendingActions = Math.max(0, current.pendingActions - 1);
       }
       if (executed) current.uncomparedSteps.push(stepId);
-      if (current.pendingActions === 0 && current.uncomparedSteps.length && current.isRunning && !current.isPaused) {
-        const steps = current.uncomparedSteps.splice(0);
-        await this.compareAfterAction(sessionId, steps);
+      const due = () => current.pendingActions === 0 && current.uncomparedSteps.length > 0 && current.isRunning && current.phase === 'running';
+      if (due()) {
+        // Live-view input arrives in bursts; comparing mid-typing would catch DEV ahead of PROD ("test@ac" vs "test@a").
+        // If more actions get queued while we wait, the last of them runs the comparison instead.
+        await this.waitForLiveInputQuiet(current);
+        if (due()) await this.compareAfterAction(sessionId, current.uncomparedSteps.splice(0));
       }
     });
   }
@@ -750,6 +1223,16 @@ class QAComparisonEngine {
    * client-side login state) is not transferred.
    */
   async resync(sessionId: string): Promise<{ ok: boolean; message: string; devUrl?: string; prodUrl?: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.isRunning) return { ok: false, message: 'No active session' };
+    if (session.phase !== 'running' || session.starting) {
+      return { ok: false, message: `Resync is only available while comparing (session is ${session.starting ? 'starting' : session.phase})` };
+    }
+    return this.performResync(sessionId, 'resync');
+  }
+
+  /** Resync without the phase check: used by Start Comparison and Start again, which own the phase transition. */
+  private async performResync(sessionId: string, stepLabel: string): Promise<{ ok: boolean; message: string; devUrl?: string; prodUrl?: string }> {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isRunning) return { ok: false, message: 'No active session' };
     if (!session.devBrowser.isConnected() || !session.prodBrowser.isConnected() || session.devPage.isClosed() || session.prodPage.isClosed()) {
@@ -781,10 +1264,10 @@ class QAComparisonEngine {
         recorderOk ? 'Synced' : 'Error'
       );
       this.setSyncState(sessionId, false, 'resynchronized');
-      session.uncomparedSteps.push('resync');
+      session.uncomparedSteps.push(stepLabel);
       await this.enqueueTask(sessionId, async () => {
         const steps = session.uncomparedSteps.splice(0);
-        await this.compareAfterAction(sessionId, steps.length ? steps : ['resync']);
+        await this.compareAfterAction(sessionId, steps.length ? steps : [stepLabel]);
       });
       return {
         ok: recorderOk,
@@ -801,17 +1284,87 @@ class QAComparisonEngine {
     }
   }
 
-  async setPaused(sessionId: string, paused: boolean) {
+  getPhase(sessionId: string): SessionPhase | undefined {
+    return this.sessions.get(sessionId)?.phase;
+  }
+
+  private setPhase(session: ComparisonSession, phase: SessionPhase) {
+    session.phase = phase;
+    session.isPaused = phase === 'paused';
+    this.io?.emit('status', { sessionId: session.id, phase, message: phase });
+  }
+
+  /**
+   * Start Comparison (valid only from 'ready'): run the start-of-session data checks, align PROD to
+   * DEV's current page and run the baseline comparison, then begin replicating DEV actions.
+   */
+  async startComparison(
+    sessionId: string
+  ): Promise<{ ok: boolean; status: 'ok' | 'not-found' | 'bad-phase' | 'failed'; phase?: SessionPhase; message: string }> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-    session.isPaused = paused;
-    this.log(sessionId, paused ? 'Session paused' : 'Session resumed', 'OK', 'OK');
+    if (!session || !session.isRunning) return { ok: false, status: 'not-found', message: 'No active session' };
+    if (session.phase !== 'ready' || session.starting) {
+      return { ok: false, status: 'bad-phase', phase: session.phase, message: `Session is ${session.starting ? 'starting' : session.phase}, not ready` };
+    }
+    // The phase stays 'ready' (recorder events dropped) until PROD is aligned; `starting` rejects pause/start meanwhile
+    session.starting = true;
+    try {
+      await this.runDataChecks(sessionId);
+      const r = await this.performResync(sessionId, 'initial');
+      if (!r.ok) return { ok: false, status: 'failed', phase: session.phase, message: r.message };
+      this.setPhase(session, 'running');
+      this.log(sessionId, 'Comparison started', 'Started', 'Started');
+      return { ok: true, status: 'ok', phase: session.phase, message: r.message };
+    } catch (err: any) {
+      const message = `Start failed: ${String(err?.message || err).split('\n')[0]}`;
+      this.log(sessionId, message, 'Error', 'Error');
+      return { ok: false, status: 'failed', phase: session.phase, message };
+    } finally {
+      session.starting = false;
+    }
+  }
+
+  /**
+   * Pause (running -> paused) or resume (paused -> running). Resume first resyncs PROD to DEV and
+   * compares, so drift is caught; if that fails the session stays paused and ok is false.
+   */
+  async setPaused(
+    sessionId: string,
+    paused: boolean
+  ): Promise<{ ok: boolean; status: 'ok' | 'not-found' | 'bad-phase' | 'failed'; phase?: SessionPhase; message: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.isRunning) return { ok: false, status: 'not-found', message: 'No active session' };
+    const bad = (message: string) => ({ ok: false, status: 'bad-phase' as const, phase: session.phase, message });
+    if (session.starting) return bad('Session is starting; wait for Start to finish');
+    if (paused) {
+      if (session.phase === 'paused') return { ok: true, status: 'ok', phase: session.phase, message: 'Already paused' };
+      if (session.phase !== 'running') return bad(`Cannot pause a session that is ${session.phase}`);
+      this.setPhase(session, 'paused');
+      this.log(sessionId, 'Session paused', 'OK', 'OK');
+      return { ok: true, status: 'ok', phase: session.phase, message: 'Paused' };
+    }
+    if (session.phase === 'running') return { ok: true, status: 'ok', phase: session.phase, message: 'Already running' };
+    if (session.phase !== 'paused') return bad(`Cannot resume a session that is ${session.phase}`);
+    session.starting = true; // also blocks a second resume / a pause while resyncing
+    try {
+      const r = await this.performResync(sessionId, 'resume');
+      if (!r.ok) return { ok: false, status: 'failed', phase: session.phase, message: r.message };
+      this.setPhase(session, 'running');
+      this.log(sessionId, 'Session resumed', 'OK', 'OK');
+      return { ok: true, status: 'ok', phase: session.phase, message: r.message };
+    } catch (err: any) {
+      const message = `Resume failed: ${String(err?.message || err).split('\n')[0]}`;
+      this.log(sessionId, message, 'Error', 'Error');
+      return { ok: false, status: 'failed', phase: session.phase, message };
+    } finally {
+      session.starting = false;
+    }
   }
 
   /** Replay one DEV action on PROD. Returns true when the DEV action happened (so a comparison is due). */
   async replicateAction(sessionId: string, action: CapturedAction, stepId = "manual"): Promise<boolean> {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.isRunning || session.isPaused) return false;
+    if (!session || !session.isRunning || session.phase !== 'running') return false;
 
     const { prodPage } = session;
     const label =
@@ -864,6 +1417,42 @@ class QAComparisonEngine {
           await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
           await target.locator.click({ timeout: 5000 }); // no force: respect PROD actionability
           this.log(sessionId, `Clicked ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          break;
+        }
+        case 'dblclick': {
+          const target = await this.resolveProdTarget(prodPage, action);
+          if (!target.ok) return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
+          await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          await target.locator.dblclick({ timeout: 5000 });
+          this.log(sessionId, `Double-clicked ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          break;
+        }
+        case 'hover': {
+          const target = await this.resolveProdTarget(prodPage, action);
+          if (!target.ok) return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
+          await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+          await target.locator.hover({ timeout: 5000 });
+          this.log(sessionId, `Hovered ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          break;
+        }
+        case 'key': {
+          const key = action.key || '';
+          if (!key) break;
+          const combo = [action.ctrl && 'Control', action.alt && 'Alt', action.meta && 'Meta', action.shift && 'Shift', key]
+            .filter(Boolean)
+            .join('+');
+          const focusable = action.tag && !/^(body|html)$/.test(action.tag);
+          const target = focusable ? await this.resolveProdTarget(prodPage, action) : null;
+          if (target && !target.ok) {
+            return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
+          }
+          if (target && target.ok) {
+            await target.locator.press(combo, { timeout: 5000 });
+            this.log(sessionId, `Pressed ${combo} on ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+          } else {
+            await prodPage.keyboard.press(combo);
+            this.log(sessionId, `Pressed ${combo} (page keyboard)`, 'Success', 'Success');
+          }
           break;
         }
         case 'fill':
@@ -947,7 +1536,9 @@ class QAComparisonEngine {
     action: CapturedAction
   ): { allow: boolean; reason: string; allowlisted: boolean } {
     if (session.safetyPolicy === 'full') return { allow: true, reason: 'full policy', allowlisted: false };
-    if (action.type !== 'click') {
+    // A double-click is two clicks; Enter in a form submits it. Hover and other keys never mutate.
+    const mutating = action.type === 'click' || action.type === 'dblclick' || (action.type === 'key' && !!action.isSubmit);
+    if (!mutating) {
       // Typing, scrolling and in-base navigation (GET) do not mutate server state;
       // any request they trigger still goes through the network guard.
       return { allow: true, reason: 'non-mutating', allowlisted: false };
@@ -1154,7 +1745,6 @@ class QAComparisonEngine {
     prodValue: string;
     severity: string;
     description: string;
-    aiAnalysis: string;
   }> {
     const diffs: Array<{
       component: string;
@@ -1163,7 +1753,6 @@ class QAComparisonEngine {
       prodValue: string;
       severity: string;
       description: string;
-      aiAnalysis: string;
     }> = [];
 
     const normalizeKey = (item: { testId: string; key: string; tag: string; text: string }) => {
@@ -1243,8 +1832,7 @@ class QAComparisonEngine {
         devValue: dText || '(missing on DEV)',
         prodValue: pText || '(missing on PROD)',
         severity,
-        description: `Exact text differs for "${component}".`,
-        aiAnalysis: `DEV shows exactly: "${dText || '(none)'}". PROD shows exactly: "${pText || '(none)'}".`,
+        description: `Exact text differs for "${component}". DEV shows exactly: "${dText || '(none)'}". PROD shows exactly: "${pText || '(none)'}".`,
       });
     }
 
@@ -1273,8 +1861,7 @@ class QAComparisonEngine {
           devValue: d,
           prodValue: related,
           severity: 'high',
-          description: 'Exact on-screen copy differs between environments.',
-          aiAnalysis: `DEV text: "${d}". PROD text: "${related}".`,
+          description: `Exact on-screen copy differs between environments. DEV text: "${d}". PROD text: "${related}".`,
         });
       }
     }
@@ -1290,9 +1877,11 @@ class QAComparisonEngine {
   }
 
   /** Wait until a page has a parsed document and its UI has had a moment to settle. */
-  private async waitForSettled(page: Page) {
+  private async waitForSettled(page: Page, settleMs: number) {
     await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(350);
+    // Let in-flight API calls finish so network logs are drained consistently on both sides (non-fatal)
+    await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(settleMs);
   }
 
   /**
@@ -1305,7 +1894,7 @@ class QAComparisonEngine {
     const stepLabel = steps.length > 3 ? `${steps[0]}…${steps[steps.length - 1]} (${steps.length} steps)` : steps.join(', ');
 
     try {
-      await Promise.all([this.waitForSettled(session.devPage), this.waitForSettled(session.prodPage)]);
+      await Promise.all([this.waitForSettled(session.devPage, session.capture.settleMs), this.waitForSettled(session.prodPage, session.capture.settleMs)]);
 
       // Out-of-sync detection: PROD should be on the page equivalent to DEV's
       const expectedProd = mapDevUrlToProd(session.devPage.url(), session.devUrl, session.prodUrl);
@@ -1325,10 +1914,37 @@ class QAComparisonEngine {
         this.setSyncState(sessionId, false, 'in sync');
       }
 
+      const cap = session.capture;
+      if (cap.scopeSelector) {
+        const [devHas, prodHas] = await Promise.all([
+          session.devPage.locator(cap.scopeSelector).count().catch(() => 0),
+          session.prodPage.locator(cap.scopeSelector).count().catch(() => 0),
+        ]);
+        if (!devHas || !prodHas) {
+          const missing = [!devHas ? 'DEV' : '', !prodHas ? 'PROD' : ''].filter(Boolean).join(' and ');
+          this.recordMismatch(sessionId, {
+            component: `Comparison scope ${cap.scopeSelector}`,
+            type: 'Navigation',
+            devValue: devHas ? 'scope element present' : 'scope element missing',
+            prodValue: prodHas ? 'scope element present' : 'scope element missing',
+            severity: 'medium',
+            classification: 'NOT_COMPARABLE',
+            description: `Scope selector "${cap.scopeSelector}" was not found on ${missing}; this step could not be compared.`,
+          });
+          this.log(sessionId, `Compared after ${stepLabel}: scope "${cap.scopeSelector}" missing on ${missing} - NOT_COMPARABLE`, 'Captured', 'Differences');
+          return;
+        }
+      }
+      const shoot = (page: Page) => {
+        const shotOpts = { type: 'png' as const, mask: cap.maskSelectors.map((m) => page.locator(m)) };
+        return cap.scopeSelector
+          ? page.locator(cap.scopeSelector).first().screenshot(shotOpts)
+          : page.screenshot({ ...shotOpts, fullPage: cap.fullPage });
+      };
       const stamp = Date.now();
       const [devScreenshot, prodScreenshot, devContent, prodContent] = await Promise.all([
-        session.devPage.screenshot({ type: 'png', fullPage: false }),
-        session.prodPage.screenshot({ type: 'png', fullPage: false }),
+        shoot(session.devPage),
+        shoot(session.prodPage),
         this.extractPageContent(session.devPage),
         this.extractPageContent(session.prodPage),
       ]);
@@ -1342,7 +1958,8 @@ class QAComparisonEngine {
         devScreenshot,
         prodScreenshot,
         path.join(session.evidenceDir, `diff-${stamp}.png`),
-        path.join(session.evidenceDir, `side-by-side-${stamp}.png`)
+        path.join(session.evidenceDir, `side-by-side-${stamp}.png`),
+        cap.pixelThreshold
       );
       const evidence = {
         devScreenshotPath: devPath,
@@ -1372,11 +1989,84 @@ class QAComparisonEngine {
       let added = 0;
       let repeated = 0;
       const tally = (isNew: boolean) => (isNew ? added++ : repeated++);
+      const counts: Record<string, number> = { Text: 0, DOM: 0, CSS: 0, Layout: 0, Accessibility: 0, Data: 0, Network: 0, Console: 0 };
 
-      for (const td of textDiffs) tally(this.recordMismatch(sessionId, { ...td, ...evidence }));
+      for (const td of textDiffs) {
+        const isNew = this.recordMismatch(sessionId, { ...td, ...evidence });
+        tally(isNew);
+        if (isNew) counts.Text++;
+      }
+
+      // 1b) Structural comparisons (DOM, CSS, layout, a11y, data, network, console) under a time budget
+      const budgetStart = Date.now();
+      const budgetMs = comparisonBudgetMs();
+      let budgetExceeded = false;
+      let structuralFailure = '';
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        const extractArg = {
+          scopeSelector: cap.scopeSelector,
+          maxElements: 400,
+          maxRows: 50,
+          sensitiveSource: SENSITIVE_FIELD_RE.source,
+          styleProps: [...STYLE_PROPS],
+          attrAllowlist: [...ATTR_ALLOWLIST],
+        };
+        const timeout = <T,>(p: Promise<T>) =>
+          Promise.race([p, new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error('budget')), budgetMs); })]);
+        const [devSnap, prodSnap]: PageSnapshot[] = await timeout(
+          Promise.all([session.devPage.evaluate(extractPageSnapshot, extractArg), session.prodPage.evaluate(extractPageSnapshot, extractArg)])
+        );
+        const { pairs } = pairElements(devSnap.elements, prodSnap.elements);
+        // DEV runs ahead of PROD while actions are still queued: keep the logs for the comparison that follows
+        const deferLogs = session.pendingActions > 0;
+        const drafts: FindingDraft[] = [
+          ...diffDom(devSnap.elements, prodSnap.elements),
+          ...diffCss(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
+          ...diffA11y(pairs),
+          ...diffData(pairs, devSnap.tables, prodSnap.tables, session.dataRules),
+          ...(deferLogs ? [] : diffNetwork(session.netLog.dev.splice(0), session.netLog.prod.splice(0))),
+          ...(deferLogs ? [] : diffRuntime(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0))),
+        ];
+        if (Date.now() - budgetStart > budgetMs) budgetExceeded = true;
+        else {
+          for (const d of drafts) {
+            if (session.ignore.active) {
+              const excludedBy = session.ignore.exclude(d);
+              if (excludedBy) {
+                suppressed.push(`${d.component} (${excludedBy})`);
+                continue;
+              }
+              if (session.ignore.normalize(d.devValue) === session.ignore.normalize(d.prodValue)) {
+                suppressed.push(`${d.component} (normalized)`);
+                continue;
+              }
+            }
+            const isNew = this.recordMismatch(sessionId, { ...d, ...evidence });
+            tally(isNew);
+            if (isNew) counts[d.type] = (counts[d.type] || 0) + 1;
+          }
+        }
+      } catch (e: any) {
+        if (e?.message === 'budget') budgetExceeded = true;
+        else structuralFailure = String(e?.message || e).split(String.fromCharCode(10))[0];
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      if (budgetExceeded || structuralFailure) {
+        session.netLog.dev.splice(0);
+        session.netLog.prod.splice(0);
+        session.runtimeLog.dev.splice(0);
+        session.runtimeLog.prod.splice(0);
+        if (budgetExceeded) {
+          this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${budgetMs} ms): keeping text and visual findings only`, 'Captured', 'Error');
+        } else {
+          this.log(sessionId, `Structural comparison failed after ${stepLabel}: ${structuralFailure}; keeping text and visual findings only`, 'Captured', 'Error');
+        }
+      }
 
       // 2) Visual summary
-      if (ratio > 0.02 && textDiffs.length === 0) {
+      if (ratio > cap.visualDiffRatio && textDiffs.length === 0) {
         tally(
           this.recordMismatch(sessionId, {
             component: 'Viewport appearance',
@@ -1402,9 +2092,15 @@ class QAComparisonEngine {
         );
       }
 
+      try {
+        await this.runDataChecks(sessionId, new URL(session.devPage.url()).pathname || '/');
+      } catch {
+        /* never fails the comparison */
+      }
+
       this.log(
         sessionId,
-        `Compared after ${stepLabel}: ${added} new difference(s), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
+        `Compared after ${stepLabel}: ${added} new (Text ${counts.Text}, DOM ${counts.DOM}, CSS ${counts.CSS}, Layout ${counts.Layout}, A11y ${counts.Accessibility}, Data ${counts.Data}, Network ${counts.Network}, Console ${counts.Console}), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
           (suppressed.length ? `; ${suppressed.length} suppressed by ignore rules: ${suppressed.slice(0, 5).join(', ')}${suppressed.length > 5 ? '…' : ''}` : ''),
         'Captured',
         added > 0 ? 'Differences' : 'Captured'
@@ -1415,11 +2111,50 @@ class QAComparisonEngine {
     }
   }
 
+  /** Decrypt a stored connection string; null on any failure. Never logs the value. */
+  private getSecret(ref: string): string | null {
+    try {
+      const dir = getDataDir();
+      const blob = getSecretFile(dir, ref);
+      return blob ? decryptSecret(blob, loadKey(process.env, dir)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Run the profile's API and DB checks and record their findings through the normal pipeline.
+   * Session start: all checks. After a comparison (afterDevPath): API checks whose whenPathStartsWith matches.
+   * PROD safety: the checks only ever call GET on each page's context.request (runApiCheck's sole method),
+   * so they cannot mutate PROD; DB checks run in BEGIN READ ONLY and never touch the browser.
+   */
+  private async runDataChecks(sessionId: string, afterDevPath?: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session || (!session.apiChecks.length && !session.dbChecks.length)) return;
+    try {
+      const drafts = await runDataSourceChecks({
+        apiChecks: session.apiChecks,
+        dbChecks: session.dbChecks,
+        devCtx: session.devContext.request,
+        prodCtx: session.prodContext.request,
+        devBase: session.devUrl,
+        prodBase: session.prodUrl,
+        getSecret: (ref) => this.getSecret(ref),
+        afterDevPath,
+        refPrefix: session.profileId ? dbSecretPrefix(session.profileId) : 'no-profile:',
+      });
+      for (const d of drafts) this.recordMismatch(sessionId, d);
+    } catch (e: any) {
+      this.log(sessionId, `Data checks failed: ${String(e?.message || e).split(String.fromCharCode(10))[0].slice(0, 200)}`, 'Error', 'Error');
+    }
+  }
+
   private async compareScreenshots(
     buf1: Buffer,
     buf2: Buffer,
     preferredDiffPath: string,
-    sideBySidePath?: string
+    sideBySidePath?: string,
+    pixelThreshold = 0.1
   ): Promise<{ ratio: number; diffPath?: string; sideBySidePath?: string }> {
     const img1 = PNG.sync.read(buf1);
     const img2 = PNG.sync.read(buf2);
@@ -1432,7 +2167,7 @@ class QAComparisonEngine {
 
     const diff = new PNG({ width: img1.width, height: img1.height });
     const numDiffPixels = pixelmatch(img1.data, img2.data, diff.data, img1.width, img1.height, {
-      threshold: 0.1,
+      threshold: pixelThreshold,
       includeAA: true,
       diffColor: [255, 0, 0],
       alpha: 0.6,
@@ -1576,19 +2311,7 @@ class QAComparisonEngine {
     };
 
     session.logs.unshift(entry);
-    this.io?.emit('log', { sessionId, log: entry });
-  }
-
-  /** Identity of a finding: same page + same kind + same element + same values. */
-  private fingerprint(page: string, m: any): string {
-    const base = [page, m.type, m.classification || '', m.component];
-    if (m.type === 'Visual') {
-      // pixel ratio jitters between captures; bucket to whole percent
-      base.push(String(Math.round((Number(m.diffPercent) || 0) * 100)));
-    } else {
-      base.push(String(m.devValue ?? ''), String(m.prodValue ?? ''), m.type === 'Interaction' || m.type === 'Safety' ? String(m.description ?? '') : '');
-    }
-    return base.join('␟');
+    this.io?.emit('log', { sessionId, log: stripShotPaths(entry) });
   }
 
   /**
@@ -1608,7 +2331,7 @@ class QAComparisonEngine {
     }
 
     const now = new Date().toISOString();
-    const fp = this.fingerprint(page, mismatch);
+    const fp = fingerprint(page, mismatch);
     const existing = session.findingIndex.get(fp);
     if (existing) {
       existing.occurrences = (existing.occurrences || 1) + 1;
@@ -1616,7 +2339,7 @@ class QAComparisonEngine {
       if (Array.isArray(mismatch.stepIds)) {
         existing.stepIds = Array.from(new Set([...(existing.stepIds || []), ...mismatch.stepIds])).slice(-100);
       }
-      this.io?.emit('mismatch-update', { sessionId, mismatch: existing });
+      this.io?.emit('mismatch-update', { sessionId, mismatch: stripShotPaths(existing) });
       return false;
     }
 
@@ -1628,17 +2351,135 @@ class QAComparisonEngine {
       occurrences: 1,
       page,
       ...mismatch,
+      fingerprint: fp,
+      ...classifyFinding(mismatch, session.expected, fp),
     };
 
     session.findingIndex.set(fp, fullMismatch);
     session.mismatches.unshift(fullMismatch);
-    this.io?.emit('mismatch', { sessionId, mismatch: fullMismatch });
+    this.io?.emit('mismatch', { sessionId, mismatch: stripShotPaths(fullMismatch) });
     return true;
   }
 
-  private archiveSession(session: ComparisonSession) {
-    this.lastSnapshot = {
+  private loadExpectations(profileId?: string): Array<{ fingerprint: string; note: string }> {
+    if (!profileId) return [];
+    try {
+      return openStore(path.join(getDataDir(), 'qa-vision.db')).listExpectations(profileId);
+    } catch (e) {
+      console.error('Could not load expectations:', (e as Error).message);
+      return [];
+    }
+  }
+
+  /** Re-derive a finding's classification from the expectation set; preset classifications (replay failures etc.) are kept. */
+  private reclassify(finding: any, expected: Set<string>, note: string) {
+    const derived = finding.classification === 'POTENTIAL_DEFECT' || finding.classification === 'EXPECTED_DIFFERENCE';
+    if (!derived) return;
+    const { classification, confidence } = classifyFinding(
+      { ...finding, classification: undefined },
+      expected,
+      finding.fingerprint
+    );
+    finding.classification = classification;
+    finding.confidence = confidence;
+    if (classification === 'EXPECTED_DIFFERENCE') {
+      finding.ruleApplied = 'user-expectation' + (note ? ': ' + note : '');
+      finding.expectationNote = note;
+    } else {
+      finding.ruleApplied = null;
+      delete finding.expectationNote;
+    }
+  }
+
+  async markExpected(
+    ref: { sessionId?: string; runId?: string },
+    findingId: string,
+    expected: boolean,
+    note = ''
+  ): Promise<{ ok: boolean; finding?: any }> {
+    const store = openStore(path.join(getDataDir(), 'qa-vision.db'));
+    const apply = (list: any[], profileId: string | undefined, set: Set<string>) => {
+      const finding = list.find((f) => f.id === findingId);
+      if (!finding || !finding.fingerprint) return null;
+      if (profileId) {
+        if (expected) store.addExpectation(profileId, finding.fingerprint, note);
+        else store.removeExpectation(profileId, finding.fingerprint);
+      }
+      if (expected) set.add(finding.fingerprint);
+      else set.delete(finding.fingerprint);
+      this.reclassify(finding, set, note);
+      return finding;
+    };
+
+    if (ref.sessionId) {
+      const session = this.sessions.get(ref.sessionId);
+      if (!session) return { ok: false };
+      const finding = apply(session.mismatches, session.profileId, session.expected);
+      if (!finding) return { ok: false };
+      this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stripShotPaths(finding) });
+      return { ok: true, finding };
+    }
+    if (ref.runId) {
+      const run = store.getRun(ref.runId);
+      if (!run) return { ok: false };
+      const set = new Set(this.loadExpectations(run.profileId).map((e) => e.fingerprint));
+      const finding = apply(run.mismatches, run.profileId, set);
+      if (!finding) return { ok: false };
+      store.saveRun(run);
+      return { ok: true, finding };
+    }
+    return { ok: false };
+  }
+
+  async highlightFinding(
+    sessionId: string,
+    findingId: string
+  ): Promise<{ dev: boolean; prod: boolean; reason?: string }> {
+    const session = this.sessions.get(sessionId);
+    const finding = session?.mismatches.find((f) => f.id === findingId);
+    if (!session || !finding) return { dev: false, prod: false, reason: 'Finding or session not found' };
+
+    const testId = (() => {
+      const c = String(finding.component ?? '');
+      const m = c.match(/data-testid=["']?([\w-]+)/) || c.match(/^([\w-]+)$/);
+      return m ? `[data-testid="${m[1]}"]` : '';
+    })();
+    const mark = async (page: Page, selector?: string): Promise<boolean> => {
+      for (const sel of [selector, testId]) {
+        if (!sel) continue;
+        try {
+          const ok = await page.evaluate((s) => {
+            const el = document.querySelector(s);
+            if (!el) return false;
+            el.scrollIntoView({ block: 'center', inline: 'center' });
+            document.querySelectorAll('[data-qa-vision-highlight]').forEach((n) => n.remove());
+            const r = el.getBoundingClientRect();
+            const box = document.createElement('div');
+            box.setAttribute('data-qa-vision-highlight', '');
+            box.style.cssText =
+              `position:absolute;left:${r.left + window.scrollX}px;top:${r.top + window.scrollY}px;` +
+              `width:${r.width}px;height:${r.height}px;outline:3px solid #f43f5e;pointer-events:none;z-index:2147483647;`;
+            document.body.appendChild(box);
+            setTimeout(() => box.remove(), 3000);
+            return true;
+          }, sel);
+          if (ok) return true;
+        } catch {
+          /* invalid selector or navigation: try next */
+        }
+      }
+      return false;
+    };
+    const dev = await mark(session.devPage, finding.devSelector);
+    const prod = await mark(session.prodPage, finding.prodSelector);
+    const missing = [dev ? '' : 'DEV', prod ? '' : 'PROD'].filter(Boolean);
+    return { dev, prod, ...(missing.length ? { reason: `Element not found on ${missing.join(' and ')}` } : {}) };
+  }
+
+  private snapshotOf(session: ComparisonSession): SessionSnapshot {
+    return {
       id: session.id,
+      profileId: session.profileId,
       projectName: session.projectName,
       devUrl: session.devUrl,
       prodUrl: session.prodUrl,
@@ -1647,6 +2488,19 @@ class QAComparisonEngine {
       logs: [...session.logs],
       mismatches: [...session.mismatches],
     };
+  }
+
+  /** Idempotent (saveRun replaces by run id). A storage failure must never break session teardown. */
+  private persistRun(session: ComparisonSession, snap?: SessionSnapshot) {
+    try {
+      openStore(path.join(getDataDir(), 'qa-vision.db')).saveRun(snap ?? this.snapshotOf(session));
+    } catch (e) {
+      console.error('Could not persist run history:', (e as Error).message);
+    }
+  }
+
+  private archiveSession(session: ComparisonSession) {
+    this.lastSnapshot = this.snapshotOf(session);
 
     try {
       const snapPath = path.join(session.evidenceDir, 'session-snapshot.json');
@@ -1654,11 +2508,236 @@ class QAComparisonEngine {
     } catch {
       /* ignore */
     }
+    this.persistRun(session, this.lastSnapshot);
+    this.scheduleAiAnalysis(session);
   }
 
-  async closeSession(sessionId: string) {
+  /** Resolves the AI provider; tests may replace it with a fake. */
+  aiProviderFactory: () => AiProvider | null = () => providerFromEnv(process.env);
+  /** Last background AI run (tests await it; never rejects). */
+  aiPending: Promise<void> = Promise.resolve();
+
+  /** Background, fire-and-forget: must never block or throw into Stop. Advisory only; never touches classification. */
+  private scheduleAiAnalysis(session: ComparisonSession) {
+    if (session.aiScheduled) return; // a second Stop must not start a second paid run
+    session.aiScheduled = true;
+    this.aiPending = (async () => {
+      try {
+        const provider = this.aiProviderFactory();
+        if (!provider) return;
+        const findings = session.mismatches.filter((f) => !f.ai || f.ai.status !== 'ok');
+        if (!findings.length) return;
+        const results = await analyzeFindings(findings, provider, DEFAULT_AI_OPTIONS);
+        // Merge only `ai` into the stored run: a runId-based mark-expected may have saved newer state meanwhile.
+        const store = openStore(path.join(getDataDir(), 'qa-vision.db'));
+        const run = store.getRun(session.id);
+        for (const f of findings) {
+          const ai = results.get(f.id);
+          if (!ai) continue;
+          f.ai = ai;
+          const stored = run?.mismatches.find((m: any) => m.id === f.id);
+          if (stored) stored.ai = ai;
+          this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stripShotPaths(stored ?? f) });
+        }
+        if (run) store.saveRun(run);
+      } catch (e) {
+        console.error('AI analysis failed:', (e as Error).message);
+      }
+    })();
+  }
+
+  async analyzeFinding(
+    ref: { sessionId?: string; runId?: string },
+    findingId: string
+  ): Promise<{ ok: boolean; finding?: any; ai?: AiAnalysis }> {
+    try {
+      const provider = this.aiProviderFactory();
+      const store = openStore(path.join(getDataDir(), 'qa-vision.db'));
+      const session = ref.sessionId ? this.sessions.get(ref.sessionId) : undefined;
+      const run = !session && ref.runId ? store.getRun(ref.runId) : undefined;
+      const list: Finding[] | undefined = session?.mismatches ?? run?.mismatches;
+      const finding = list?.find((f) => f.id === findingId);
+      if (!finding) return { ok: false };
+      const ai = (await analyzeFindings([finding], provider, DEFAULT_AI_OPTIONS)).get(finding.id);
+      if (!ai) return { ok: false };
+      finding.ai = ai;
+      if (session) this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stripShotPaths(finding) });
+      else if (run) store.saveRun(run);
+      return { ok: true, finding, ai };
+    } catch (e) {
+      console.error('AI analysis failed:', (e as Error).message);
+      return { ok: false };
+    }
+  }
+
+  /**
+   * Live view: every 1000 ms, while the session runs, is not paused and at least one socket is connected, emit a
+   * `frame {sessionId, side, data (base64 JPEG q50), url}` per side. A tick is skipped while the previous one is still
+   * in flight. Password inputs (and the profile's mask selectors) are masked in the pixels; a frame whose masking
+   * fails is dropped, never sent unmasked.
+   */
+  startFrameStream(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.frameTimer) return;
+    // Frames keep flowing while paused: the Live view is where the user drives DEV, so it must never freeze.
+    session.frameTimer = setInterval(() => {
+      if (!session.isRunning) return this.stopFrameStream(sessionId);
+      void this.emitFrames(session, ['dev', 'prod']);
+    }, 1000);
+    session.frameTimer.unref?.();
+  }
+
+  /** One frame per requested side (skipped while a previous grab is in flight or nobody is watching). */
+  private async emitFrames(session: ComparisonSession, sides: Array<'dev' | 'prod'>, urgent = false) {
+    const io = this.io;
+    if (!session.isRunning || !io || io.sockets.sockets.size < 1) return;
+    if (session.frameBusy) {
+      if (urgent) session.frameAgain = true; // input feedback must not be dropped; refresh DEV right after
+      return;
+    }
+    const grab = async (page: Page): Promise<string | null> => {
+      try {
+        // Password inputs already render as dots, so they stay visible (the user must see typing land there), as in
+        // evidence screenshots. The profile's mask selectors are still blacked out.
+        const masks = session.capture.maskSelectors.map((sel) => page.locator(sel));
+        // caret: 'initial' keeps the text cursor visible, so the user can see which field has focus
+        const buf = await page.screenshot({ type: 'jpeg', quality: 50, mask: masks, maskColor: '#000000', caret: 'initial', timeout: 4000 });
+        return buf.toString('base64');
+      } catch {
+        return null;
+      }
+    };
+    session.frameBusy = true;
+    try {
+      for (const side of sides) {
+        const page = side === 'dev' ? session.devPage : session.prodPage;
+        const data = await grab(page);
+        // DEV only: name the focused field, so focus stays visible even on a masked password input. Never its value.
+        const focus =
+          side === 'dev'
+            ? await page
+                .evaluate(() => {
+                  const el = document.activeElement as HTMLElement | null;
+                  if (!el || el === document.body || el === document.documentElement) return '';
+                  const tag = el.tagName.toLowerCase();
+                  const type = el.getAttribute('type');
+                  const name =
+                    el.getAttribute('aria-label') || el.getAttribute('name') || el.getAttribute('placeholder') || el.id ||
+                    (tag === 'button' || tag === 'a' ? (el.innerText || '').trim().slice(0, 40) : ''); // never editable content
+                  return `${tag}${type ? `[${type}]` : ''}${name ? ` "${name}"` : ''}`.slice(0, 80);
+                })
+                .catch(() => '')
+            : undefined;
+        if (data && session.isRunning) io.emit('frame', { sessionId: session.id, side, data, url: urlForLog(page.url()), focus });
+      }
+    } finally {
+      session.frameBusy = false;
+    }
+    if (session.frameAgain) {
+      session.frameAgain = false;
+      void this.emitFrames(session, ['dev']);
+    }
+  }
+
+  /**
+   * Wait (max 4 s) until no Live-view input arrived for 700 ms (longer than the recorder's 120 ms fill debounce).
+   * Ends early when another action gets queued: that action's task runs the comparison, so replays never stall here.
+   */
+  private async waitForLiveInputQuiet(session: ComparisonSession) {
+    const start = Date.now();
+    while (
+      Date.now() - start < 4000 &&
+      session.pendingActions === 0 &&
+      session.lastLiveInputAt &&
+      Date.now() - session.lastLiveInputAt < 700
+    ) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
+  /**
+   * Live-view input: the dashboard's DEV pane forwards mouse/keyboard input here, and it is dispatched as real
+   * input on the DEV page. The DEV recorder therefore captures it exactly as if the user had used a DEV window,
+   * and PROD mirrors it through the normal replay path. Coordinates are CSS pixels in the DEV viewport (the
+   * frame is a viewport screenshot). Inputs apply one at a time, in arrival order; bad input is ignored.
+   */
+  handleLiveInput(sessionId: string, input: unknown) {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.isRunning || session.stopRequested || !input || typeof input !== 'object') return;
+    const i = input as Record<string, unknown>;
+    const { width, height } = session.capture.viewport;
+    const coord = (v: unknown, max: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(Math.max(n, 0), max - 1) : null;
+    };
+    const str = (v: unknown, max: number) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : null);
+    if (i.kind !== 'move') session.lastLiveInputAt = Date.now();
+    const apply = async () => {
+      if (!session.isRunning || session.stopRequested || session.suppressCapture) return;
+      const page = session.devPage;
+      const mouse = page.mouse;
+      switch (i.kind) {
+        case 'move':
+        case 'click':
+        case 'down':
+        case 'up':
+        case 'wheel': {
+          const x = coord(i.x, width);
+          const y = coord(i.y, height);
+          if (x === null || y === null) return;
+          await mouse.move(x, y);
+          const button = i.button === 'right' ? 'right' : 'left';
+          const clickCount = i.count === 3 ? 3 : i.count === 2 ? 2 : 1; // 2 = word, 3 = line selection
+          if (i.kind === 'click') {
+            await mouse.down({ button, clickCount });
+            await mouse.up({ button, clickCount });
+          } else if (i.kind === 'down') {
+            await mouse.down({ button, clickCount }); // separate down/move/up: drag-to-select works
+          } else if (i.kind === 'up') {
+            await mouse.up({ button, clickCount });
+          } else if (i.kind === 'wheel') {
+            const dy = Math.max(-3000, Math.min(3000, Number(i.deltaY) || 0));
+            const dx = Math.max(-3000, Math.min(3000, Number(i.deltaX) || 0));
+            if (dx || dy) await mouse.wheel(dx, dy);
+          }
+          break;
+        }
+        case 'key': {
+          // Playwright key names, optionally with modifiers: "Enter", "Shift+Tab", "Control+a"
+          const key = str(i.key, 40);
+          if (key && /^[\x20-\x7e]+$/.test(key)) await page.keyboard.press(key);
+          break;
+        }
+        case 'text': {
+          // Printable characters typed into the pane; pasted text arrives here too
+          const text = str(i.text, 5000);
+          if (text) await page.keyboard.type(text);
+          break;
+        }
+        default:
+          return;
+      }
+      // Refresh DEV now (mouse moves excluded) so the pane responds without waiting for the 1 s tick
+      if (i.kind !== 'move') {
+        session.lastLiveInputAt = Date.now(); // the quiet gap starts once the input has actually been applied
+        setTimeout(() => void this.emitFrames(session, ['dev'], true), 80);
+      }
+    };
+    session.liveInputQueue = (session.liveInputQueue ?? Promise.resolve())
+      .then(() => Promise.race([apply(), new Promise<void>((r) => setTimeout(r, 5000))]))
+      .catch((e) => console.error('Live input failed:', (e as Error).message));
+  }
+
+  stopFrameStream(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (session?.frameTimer) clearInterval(session.frameTimer);
+    if (session) session.frameTimer = undefined;
+  }
+
+  async closeSession(sessionId: string, reason?: string) {
     const session = this.sessions.get(sessionId);
     if (session) {
+      this.stopFrameStream(sessionId);
       // Stop accepting new DEV actions, let queued replays/comparisons finish (bounded), then archive.
       session.stopRequested = true;
       const drained = await Promise.race([
@@ -1666,14 +2745,20 @@ class QAComparisonEngine {
         new Promise<boolean>((r) => setTimeout(() => r(false), 10000)),
       ]);
       if (!drained) this.log(sessionId, 'Stop: in-flight work did not finish within 10s and was cancelled', 'Info', 'Info');
-      this.log(sessionId, 'Session stopped by user', 'Stopped', 'Stopped');
+      this.log(sessionId, reason ?? 'Session stopped by user', 'Stopped', 'Stopped');
       session.isRunning = false;
       this.archiveSession(session);
       await session.devBrowser.close().catch(() => {});
       await session.prodBrowser.close().catch(() => {});
       this.sessions.delete(sessionId);
+      this.evaluateOrphans();
       console.log(`Session ${sessionId} closed`);
     }
+  }
+
+  /** Synchronous: persist every live session's run (used on process shutdown; safe inside 'exit'). */
+  persistAllSessions() {
+    for (const s of this.sessions.values()) if (s.isRunning) this.persistRun(s);
   }
 
   async closeAllSessions() {
@@ -1721,17 +2806,32 @@ class QAComparisonEngine {
     return this.lastSnapshot;
   }
 
-  async startSessionWithRecorder(
-    devUrl: string,
-    prodUrl: string,
-    projectName = 'QA Vision Session',
-    safetyPolicy: SafetyPolicy = 'read-only',
-    safetyAllowlist: string[] = [],
-    ignoreRules: string[] = []
-  ) {
-    return this.createSession(devUrl, prodUrl, projectName, safetyPolicy, safetyAllowlist, ignoreRules);
+  async startSessionWithRecorder(devUrl: string, prodUrl: string, opts: SessionOptions = {}) {
+    return this.createSession(devUrl, prodUrl, opts);
   }
 }
 
 export const comparisonEngine = new QAComparisonEngine();
 export default comparisonEngine;
+
+// One process-level shutdown hook (guarded so hot reloads do not stack handlers). Existing handlers are untouched.
+// The hook resolves the live engine at exit time, so a reloaded module's instance is the one persisted.
+type ShutdownGlobals = typeof globalThis & { __qaVisionShutdownHook?: boolean; __qaVisionLiveEngine?: QAComparisonEngine };
+const shutdownGlobals = globalThis as ShutdownGlobals;
+shutdownGlobals.__qaVisionLiveEngine = comparisonEngine;
+
+export function persistLiveSessions() {
+  shutdownGlobals.__qaVisionLiveEngine?.persistAllSessions();
+}
+
+if (!shutdownGlobals.__qaVisionShutdownHook) {
+  shutdownGlobals.__qaVisionShutdownHook = true;
+  for (const ev of ['beforeExit', 'exit'] as const) process.on(ev, persistLiveSessions);
+  for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
+    process.on(sig, () => {
+      persistLiveSessions();
+      // Only restore default termination when nobody else handles the signal
+      if (process.listenerCount(sig) <= 1) process.exit(code);
+    });
+  }
+}
