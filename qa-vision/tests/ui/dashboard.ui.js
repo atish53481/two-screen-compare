@@ -190,6 +190,28 @@ const postJson = (p, body) =>
       assert((await page.locator('[data-testid="finding-row"]').count()) === 0, 'findings appeared before Start');
     });
 
+    // Reload the page and wait for the dashboard to come back (reconnect-on-load)
+    const liveSessions = async () => (await (await fetch(BASE + '/api/session')).json()).sessions;
+    const reload = async () => {
+      await page.reload();
+      await page.getByRole('button', { name: 'Live Comparison' }).waitFor();
+    };
+
+    await test('reload while READY: same session is adopted with START COMPARISON; Launch stays blocked', async () => {
+      const before = await liveSessions();
+      assert(before.length === 1 && before[0].sessionId === sessionId && before[0].phase === 'ready', `sessions ${JSON.stringify(before.map((x) => [x.sessionId, x.phase]))}`);
+      const paths = [...JSON.stringify(before).matchAll(/"\w*ScreenshotPath":"([^"]*)"/g)].map((m) => m[1]);
+      assert(paths.every((v) => !/[\\/]/.test(v)), `screenshot path leaked: ${paths.find((v) => /[\\/]/.test(v))}`);
+      await reload();
+      await btn(/START COMPARISON/).waitFor({ timeout: 10000 });
+      assert((await page.getByText('Reconnected to running session').count()) > 0, 'status text missing');
+      assert((await btn(/LAUNCH ENVIRONMENTS/).count()) === 0, 'Launch offered while a session is active');
+      assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'ready', 'phase banner not ready');
+      await page.getByRole('button', { name: 'Live Comparison' }).click();
+      await page.waitForSelector('[data-testid="live-frame-dev"]', { timeout: 10000 });
+      await page.waitForSelector('[data-testid="live-frame-prod"]', { timeout: 10000 });
+    });
+
     await test('start: unknown session -> 404', async () => {
       const r = await postJson('/api/session', { action: 'start', sessionId: 'sess_nope' });
       assert(r.status === 404, `status ${r.status}`);
@@ -219,6 +241,26 @@ const postJson = (p, body) =>
       assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'paused', 'phase banner not paused');
       await btn(/START AGAIN/).click();
       await btn(/PAUSE/).waitFor({ timeout: 30000 });
+    });
+
+    await test('reload while RUNNING: findings and logs repopulate, PAUSE/STOP shown, same sessionId', async () => {
+      const findingsBefore = await page.locator('[data-testid="finding-row"]').count();
+      const live = await liveSessions();
+      assert(live.length === 1 && live[0].sessionId === sessionId && live[0].phase === 'running', 'session not listed as running');
+      const paths = [...JSON.stringify(live).matchAll(/"\w*ScreenshotPath":"([^"]*)"/g)].map((m) => m[1]);
+      assert(paths.length > 0 && paths.every((v) => !/[\\/]/.test(v)), `screenshot paths not base names: ${paths.slice(0, 2)}`);
+      await reload();
+      await btn(/PAUSE/).waitFor({ timeout: 10000 });
+      assert(await btn(/STOP/).first().isVisible(), 'STOP missing after reload');
+      assert((await btn(/START COMPARISON/).count()) === 0, 'START COMPARISON shown while running');
+      assert((await btn(/LAUNCH ENVIRONMENTS/).count()) === 0, 'Launch offered while a session is active');
+      await page.waitForSelector('[data-testid="finding-row"]', { timeout: 10000 });
+      const findingsAfter = await page.locator('[data-testid="finding-row"]').count();
+      assert(findingsAfter >= findingsBefore && findingsAfter > 0, `findings ${findingsBefore} -> ${findingsAfter}`);
+      // The engine refuses a second launch, and the UI never sent one
+      const dup = await postJson('/api/session', { action: 'create', devUrl: DEV_URL, prodUrl: PROD_URL });
+      assert(dup.status === 409, `second create -> ${dup.status}`);
+      assert((await liveSessions()).length === 1, 'a second session exists');
     });
 
     await test('finding filters narrow list', async () => {
@@ -294,6 +336,12 @@ const postJson = (p, body) =>
       await page.waitForSelector(`[data-finding-id="${markedId}"][data-expected="true"]`, { timeout: 10000 });
       const dim = await page.locator(`[data-finding-id="${markedId}"]`).evaluate((el) => getComputedStyle(el).opacity);
       assert(Number(dim) < 1, 'stored finding not dimmed');
+    });
+
+    await test('after Stop no session is orphaned: GET /api/session lists none', async () => {
+      assert((await liveSessions()).length === 0, 'session still listed after Stop');
+      await reload();
+      assert((await btn(/LAUNCH ENVIRONMENTS/).count()) > 0, 'Launch not offered when idle after reload');
     });
 
     await test('history exports HTML (content-type text/html)', async () => {

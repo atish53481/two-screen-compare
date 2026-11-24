@@ -166,6 +166,7 @@ All variables are optional and server-side only. `qa-vision/.env.example` holds 
 | `QA_VISION_DIST_DIR` | Next.js `distDir` override. `test:ui` sets `.next-ui` so it never clobbers a running dashboard's build |
 | `QA_VISION_ALLOWED_HOSTS` | Restrict target hosts (suffix match) |
 | `QA_VISION_HEADLESS` | `1` launches comparison browsers headless |
+| `QA_VISION_ORPHAN_TIMEOUT_MS` | Milliseconds with no dashboard connected before the engine closes all running sessions (their runs are saved). Default `600000` (10 minutes). Reloading the dashboard reconnects to the running session instead |
 | `QA_DEV_URL`, `QA_PROD_URL` | Point the test suites at other deployments |
 | `QA_TEST_PG_URL` | Test only: a PostgreSQL connection string that enables the real-server database-check test |
 

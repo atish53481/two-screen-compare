@@ -26,6 +26,8 @@ interface LogEntry {
   status: 'match' | 'mismatch' | 'skipped' | 'info';
 }
 
+const SESSION_HINT_KEY = 'qa-vision:sessionId';
+
 const QA_VISION = () => {
   // Dynamic Profile System
   const [profiles, setProfiles] = useState<ComparisonProfile[]>([]);
@@ -122,6 +124,61 @@ const QA_VISION = () => {
     };
   }, []);
 
+  // Reconnect on load: a reload must not orphan the engine session's DEV/PROD browsers.
+  // The server is the source of truth; sessionStorage only says which session this tab last owned.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/session');
+        const data = await res.json();
+        if (cancelled || !res.ok || sessionRef.current) return;
+        const live: any[] = Array.isArray(data?.sessions) ? data.sessions : [];
+        let hint: string | null = null;
+        try {
+          hint = sessionStorage.getItem(SESSION_HINT_KEY);
+        } catch {
+          /* storage unavailable */
+        }
+        const s = live.find(x => x.sessionId === hint) || live[0];
+        if (!s) {
+          try {
+            sessionStorage.removeItem(SESSION_HINT_KEY);
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        sessionRef.current = s.sessionId; // live socket events (frames, logs) now flow into this tab
+        setSessionId(s.sessionId);
+        setEvidenceSessionId(s.sessionId);
+        setIsRunning(true);
+        setPhase(s.phase === 'paused' ? 'paused' : s.phase === 'running' ? 'running' : 'ready');
+        if (s.profileId) setSelectedProfileId(s.profileId);
+        // Live events that raced the fetch are already in state: keep them, drop duplicates by id
+        const merge = <T extends { id?: string }>(fetched: T[], current: T[]) => {
+          const seen = new Set<string>();
+          return [...current, ...fetched].filter(x => !x.id || (!seen.has(x.id) && !!seen.add(x.id)));
+        };
+        setLogs(prev => merge<LogEntry>(Array.isArray(s.logs) ? s.logs : [], prev).slice(0, 1000));
+        setMismatches(prev => merge<Mismatch>(Array.isArray(s.mismatches) ? s.mismatches : [], prev).slice(0, 500));
+        setOutOfSync(Boolean(s.outOfSync));
+        try {
+          sessionStorage.setItem(SESSION_HINT_KEY, s.sessionId);
+        } catch {
+          /* ignore */
+        }
+        setActiveTab('dashboard');
+        setStatus('Reconnected to running session');
+      } catch {
+        /* server unreachable: stay idle */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const fetchProfiles = async () => {
     try {
       const res = await fetch('/api/profiles');
@@ -172,6 +229,11 @@ const QA_VISION = () => {
       if (res.ok && data.success && data.sessionId) {
         setSessionId(data.sessionId);
         sessionRef.current = data.sessionId;
+        try {
+          sessionStorage.setItem(SESSION_HINT_KEY, data.sessionId);
+        } catch {
+          /* ignore */
+        }
         setEvidenceSessionId(data.sessionId);
         setIsRunning(true);
         setPhase('ready');
@@ -279,6 +341,11 @@ const QA_VISION = () => {
       console.warn('Backend stop request failed (normal if in demo)');
     }
 
+    try {
+      sessionStorage.removeItem(SESSION_HINT_KEY);
+    } catch {
+      /* ignore */
+    }
     setIsRunning(false);
     setIsStopping(false);
     setPhase('ready');

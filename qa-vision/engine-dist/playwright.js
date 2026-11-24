@@ -202,6 +202,7 @@ function getEngineGlobals() {
             sessions: new Map(),
             lastSnapshot: null,
             io: null,
+            orphanTimer: null,
         };
     }
     return g.__qaVisionEngine;
@@ -222,6 +223,62 @@ class QAComparisonEngine {
     }
     setSocketIO(io) {
         getEngineGlobals().io = io;
+        // Orphan reaper: watch dashboard connections so unwatched sessions cannot pile up browsers.
+        io.on('connection', (socket) => {
+            this.evaluateOrphans();
+            socket.on('disconnect', () => this.evaluateOrphans());
+        });
+        this.evaluateOrphans();
+    }
+    /** QA_VISION_ORPHAN_TIMEOUT_MS (default 10 minutes); read at arm time so tests can change it. */
+    orphanTimeoutMs() {
+        const n = Number(process.env.QA_VISION_ORPHAN_TIMEOUT_MS);
+        return Number.isFinite(n) && n > 0 ? n : 600000;
+    }
+    /**
+     * Arms the reaper timer when sessions exist and no dashboard socket is connected; any connected
+     * socket (or no sessions left) cancels it. Event-driven: called on connect, disconnect and session create.
+     */
+    evaluateOrphans() {
+        const g = getEngineGlobals();
+        const io = g.io;
+        if (!io)
+            return;
+        const watched = io.sockets.sockets.size > 0;
+        if (watched || this.sessions.size === 0) {
+            if (g.orphanTimer)
+                clearTimeout(g.orphanTimer);
+            g.orphanTimer = null;
+            return;
+        }
+        if (g.orphanTimer)
+            return;
+        const ms = this.orphanTimeoutMs();
+        g.orphanTimer = setTimeout(() => {
+            g.orphanTimer = null;
+            if (!g.io || g.io.sockets.sockets.size > 0)
+                return;
+            const minutes = +(ms / 60000).toFixed(2);
+            const reason = `Session closed: no dashboard connected for ${minutes} min`;
+            console.warn(reason);
+            void Promise.all(Array.from(this.sessions.keys()).map((id) => this.closeSession(id, reason)));
+        }, ms);
+        g.orphanTimer.unref?.();
+    }
+    /** Live sessions as the dashboard needs them to reconnect after a page reload (same data the socket emits). */
+    listActiveSessions() {
+        return Array.from(this.sessions.values()).map((s) => ({
+            sessionId: s.id,
+            phase: s.phase,
+            profileId: s.profileId,
+            projectName: s.projectName,
+            devUrl: urlForLog(s.devUrl),
+            prodUrl: urlForLog(s.prodUrl),
+            startedAt: s.startedAt,
+            outOfSync: s.outOfSync,
+            logs: s.logs.slice(0, 1000).map((l) => stripShotPaths(l)),
+            mismatches: s.mismatches.slice(0, 500).map((m) => stripShotPaths(m)),
+        }));
     }
     /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
     attachCollectors(session, side, page) {
@@ -310,7 +367,9 @@ class QAComparisonEngine {
         const evidenceDir = path.join(process.cwd(), 'reports', 'evidence', sessionId);
         fs.mkdirSync(evidenceDir, { recursive: true });
         const launchOptions = {
-            headless: process.env.QA_VISION_HEADLESS === '1', // visible by default; headless for automated tests
+            // Headless by default: the user drives DEV from the dashboard's Live view (see handleLiveInput).
+            // QA_VISION_SHOW_BROWSERS=1 brings back the separate visible DEV/PROD windows.
+            headless: process.env.QA_VISION_SHOW_BROWSERS !== '1' || process.env.QA_VISION_HEADLESS === '1',
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -397,6 +456,7 @@ class QAComparisonEngine {
         this.attachCollectors(session, 'dev', devPage);
         this.attachCollectors(session, 'prod', prodPage);
         this.sessions.set(sessionId, session);
+        this.evaluateOrphans();
         // Surface closed windows instead of silently failing every later action
         for (const [label, browser] of [['DEV', devBrowser], ['PROD', prodBrowser]]) {
             browser.on('disconnected', () => {
@@ -442,7 +502,7 @@ class QAComparisonEngine {
                 this.log(sessionId, `Ignore rule "${r}" is not a valid regular expression and was skipped`, 'Info', 'Error');
             }
         }
-        this.log(sessionId, 'Action recorder active on DEV — interact only in the QA Vision DEV window', 'Active', 'Active');
+        this.log(sessionId, 'Action recorder active on DEV — interact in the DEV pane of Live Comparison', 'Active', 'Active');
         if (startImmediately) {
             // Baseline comparison of the landing pages (runs on the queue, does not block the API)
             this.enqueueTask(sessionId, async () => {
@@ -450,7 +510,7 @@ class QAComparisonEngine {
             });
         }
         else {
-            this.log(sessionId, 'Ready — log in or navigate in the DEV window, then press Start Comparison to begin', 'Ready', 'Ready');
+            this.log(sessionId, 'Ready — log in or navigate in the DEV pane, then press Start Comparison to begin', 'Ready', 'Ready');
             this.io?.emit('status', { sessionId, phase: session.phase, message: 'Ready' });
         }
         this.startFrameStream(sessionId);
@@ -2258,6 +2318,19 @@ class QAComparisonEngine {
         const session = this.sessions.get(sessionId);
         if (!session || session.frameTimer)
             return;
+        // Frames keep flowing while paused: the Live view is where the user drives DEV, so it must never freeze.
+        session.frameTimer = setInterval(() => {
+            if (!session.isRunning)
+                return this.stopFrameStream(sessionId);
+            void this.emitFrames(session, ['dev', 'prod']);
+        }, 1000);
+        session.frameTimer.unref?.();
+    }
+    /** One frame per requested side (skipped while a previous grab is in flight or nobody is watching). */
+    async emitFrames(session, sides) {
+        const io = this.io;
+        if (session.frameBusy || !session.isRunning || !io || io.sockets.sockets.size < 1)
+            return;
         const grab = async (page) => {
             try {
                 const masks = ['input[type="password"]', ...session.capture.maskSelectors].map((sel) => page.locator(sel));
@@ -2268,25 +2341,88 @@ class QAComparisonEngine {
                 return null;
             }
         };
-        session.frameTimer = setInterval(async () => {
-            const io = this.io;
-            if (!session.isRunning)
-                return this.stopFrameStream(sessionId);
-            if (session.frameBusy || session.isPaused || !io || io.sockets.sockets.size < 1)
+        session.frameBusy = true;
+        try {
+            for (const side of sides) {
+                const page = side === 'dev' ? session.devPage : session.prodPage;
+                const data = await grab(page);
+                if (data && session.isRunning)
+                    io.emit('frame', { sessionId: session.id, side, data, url: urlForLog(page.url()) });
+            }
+        }
+        finally {
+            session.frameBusy = false;
+        }
+    }
+    /**
+     * Live-view input: the dashboard's DEV pane forwards mouse/keyboard input here, and it is dispatched as real
+     * input on the DEV page. The DEV recorder therefore captures it exactly as if the user had used a DEV window,
+     * and PROD mirrors it through the normal replay path. Coordinates are CSS pixels in the DEV viewport (the
+     * frame is a viewport screenshot). Inputs apply one at a time, in arrival order; bad input is ignored.
+     */
+    handleLiveInput(sessionId, input) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.isRunning || session.stopRequested || !input || typeof input !== 'object')
+            return;
+        const i = input;
+        const { width, height } = session.capture.viewport;
+        const coord = (v, max) => {
+            const n = Number(v);
+            return Number.isFinite(n) ? Math.min(Math.max(n, 0), max - 1) : null;
+        };
+        const str = (v, max) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : null);
+        const apply = async () => {
+            if (!session.isRunning || session.stopRequested || session.suppressCapture)
                 return;
-            session.frameBusy = true;
-            try {
-                for (const [side, page] of [['dev', session.devPage], ['prod', session.prodPage]]) {
-                    const data = await grab(page);
-                    if (data && session.isRunning && !session.isPaused)
-                        io.emit('frame', { sessionId, side, data, url: urlForLog(page.url()) });
+            const page = session.devPage;
+            const mouse = page.mouse;
+            switch (i.kind) {
+                case 'move':
+                case 'click':
+                case 'wheel': {
+                    const x = coord(i.x, width);
+                    const y = coord(i.y, height);
+                    if (x === null || y === null)
+                        return;
+                    await mouse.move(x, y);
+                    if (i.kind === 'click') {
+                        const button = i.button === 'right' ? 'right' : 'left';
+                        const clickCount = i.count === 2 ? 2 : 1;
+                        await mouse.down({ button, clickCount });
+                        await mouse.up({ button, clickCount });
+                    }
+                    else if (i.kind === 'wheel') {
+                        const dy = Math.max(-3000, Math.min(3000, Number(i.deltaY) || 0));
+                        const dx = Math.max(-3000, Math.min(3000, Number(i.deltaX) || 0));
+                        if (dx || dy)
+                            await mouse.wheel(dx, dy);
+                    }
+                    break;
                 }
+                case 'key': {
+                    // Playwright key names, optionally with modifiers: "Enter", "Shift+Tab", "Control+a"
+                    const key = str(i.key, 40);
+                    if (key && /^[\x20-\x7e]+$/.test(key))
+                        await page.keyboard.press(key);
+                    break;
+                }
+                case 'text': {
+                    // Printable characters typed into the pane; pasted text arrives here too
+                    const text = str(i.text, 5000);
+                    if (text)
+                        await page.keyboard.type(text);
+                    break;
+                }
+                default:
+                    return;
             }
-            finally {
-                session.frameBusy = false;
-            }
-        }, 1000);
-        session.frameTimer.unref?.();
+            // Refresh DEV now (mouse moves excluded) so the pane responds without waiting for the 1 s tick
+            if (i.kind !== 'move')
+                setTimeout(() => void this.emitFrames(session, ['dev']), 120);
+        };
+        session.liveInputQueue = (session.liveInputQueue ?? Promise.resolve())
+            .then(() => Promise.race([apply(), new Promise((r) => setTimeout(r, 5000))]))
+            .catch((e) => console.error('Live input failed:', e.message));
     }
     stopFrameStream(sessionId) {
         const session = this.sessions.get(sessionId);
@@ -2295,7 +2431,7 @@ class QAComparisonEngine {
         if (session)
             session.frameTimer = undefined;
     }
-    async closeSession(sessionId) {
+    async closeSession(sessionId, reason) {
         const session = this.sessions.get(sessionId);
         if (session) {
             this.stopFrameStream(sessionId);
@@ -2307,12 +2443,13 @@ class QAComparisonEngine {
             ]);
             if (!drained)
                 this.log(sessionId, 'Stop: in-flight work did not finish within 10s and was cancelled', 'Info', 'Info');
-            this.log(sessionId, 'Session stopped by user', 'Stopped', 'Stopped');
+            this.log(sessionId, reason ?? 'Session stopped by user', 'Stopped', 'Stopped');
             session.isRunning = false;
             this.archiveSession(session);
             await session.devBrowser.close().catch(() => { });
             await session.prodBrowser.close().catch(() => { });
             this.sessions.delete(sessionId);
+            this.evaluateOrphans();
             console.log(`Session ${sessionId} closed`);
         }
     }

@@ -26,6 +26,15 @@ export async function POST(request: NextRequest) {
 
     switch (action) {
       case 'create': {
+        // One dashboard session at a time: a second launch would pile up more browsers
+        const active = comparisonEngine.listActiveSessions();
+        if (active.length > 0) {
+          return NextResponse.json(
+            { success: false, error: 'A session is already active. Stop it before launching again.', sessionId: active[0].sessionId },
+            { status: 409 }
+          );
+        }
+
         if (!devUrl || !prodUrl) {
           return NextResponse.json(
             { success: false, error: 'devUrl and prodUrl are required' },
@@ -174,6 +183,8 @@ export async function GET(request: NextRequest) {
   }
   return NextResponse.json({
     status: 'QA Vision Automation Engine Ready',
+    // Live sessions, so a reloaded dashboard can reconnect instead of orphaning their browsers
+    sessions: comparisonEngine.listActiveSessions(),
     capabilities: [
       'Dual browser control (Chromium)',
       'DOM-based action replication',

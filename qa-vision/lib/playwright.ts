@@ -324,6 +324,8 @@ type EngineGlobals = {
   sessions: Map<string, ComparisonSession>;
   lastSnapshot: SessionSnapshot | null;
   io: Server | null;
+  /** Reaper timer: armed while sessions exist and no dashboard socket is connected. */
+  orphanTimer: ReturnType<typeof setTimeout> | null;
 };
 
 function getEngineGlobals(): EngineGlobals {
@@ -333,6 +335,7 @@ function getEngineGlobals(): EngineGlobals {
       sessions: new Map(),
       lastSnapshot: null,
       io: null,
+      orphanTimer: null,
     };
   }
   return g.__qaVisionEngine;
@@ -355,6 +358,61 @@ class QAComparisonEngine {
 
   setSocketIO(io: Server) {
     getEngineGlobals().io = io;
+    // Orphan reaper: watch dashboard connections so unwatched sessions cannot pile up browsers.
+    io.on('connection', (socket) => {
+      this.evaluateOrphans();
+      socket.on('disconnect', () => this.evaluateOrphans());
+    });
+    this.evaluateOrphans();
+  }
+
+  /** QA_VISION_ORPHAN_TIMEOUT_MS (default 10 minutes); read at arm time so tests can change it. */
+  private orphanTimeoutMs(): number {
+    const n = Number(process.env.QA_VISION_ORPHAN_TIMEOUT_MS);
+    return Number.isFinite(n) && n > 0 ? n : 600000;
+  }
+
+  /**
+   * Arms the reaper timer when sessions exist and no dashboard socket is connected; any connected
+   * socket (or no sessions left) cancels it. Event-driven: called on connect, disconnect and session create.
+   */
+  private evaluateOrphans() {
+    const g = getEngineGlobals();
+    const io = g.io;
+    if (!io) return;
+    const watched = io.sockets.sockets.size > 0;
+    if (watched || this.sessions.size === 0) {
+      if (g.orphanTimer) clearTimeout(g.orphanTimer);
+      g.orphanTimer = null;
+      return;
+    }
+    if (g.orphanTimer) return;
+    const ms = this.orphanTimeoutMs();
+    g.orphanTimer = setTimeout(() => {
+      g.orphanTimer = null;
+      if (!g.io || g.io.sockets.sockets.size > 0) return;
+      const minutes = +(ms / 60000).toFixed(2);
+      const reason = `Session closed: no dashboard connected for ${minutes} min`;
+      console.warn(reason);
+      void Promise.all(Array.from(this.sessions.keys()).map((id) => this.closeSession(id, reason)));
+    }, ms);
+    g.orphanTimer.unref?.();
+  }
+
+  /** Live sessions as the dashboard needs them to reconnect after a page reload (same data the socket emits). */
+  listActiveSessions() {
+    return Array.from(this.sessions.values()).map((s) => ({
+      sessionId: s.id,
+      phase: s.phase,
+      profileId: s.profileId,
+      projectName: s.projectName,
+      devUrl: urlForLog(s.devUrl),
+      prodUrl: urlForLog(s.prodUrl),
+      startedAt: s.startedAt,
+      outOfSync: s.outOfSync,
+      logs: s.logs.slice(0, 1000).map((l) => stripShotPaths(l)),
+      mismatches: s.mismatches.slice(0, 500).map((m) => stripShotPaths(m)),
+    }));
   }
 
   /** Collects network/API and console/page-error facts (never bodies or values). Listeners never throw. */
@@ -532,6 +590,7 @@ class QAComparisonEngine {
     this.attachCollectors(session, 'prod', prodPage);
 
     this.sessions.set(sessionId, session);
+    this.evaluateOrphans();
 
     // Surface closed windows instead of silently failing every later action
     for (const [label, browser] of [['DEV', devBrowser], ['PROD', prodBrowser]] as const) {
@@ -2597,7 +2656,7 @@ class QAComparisonEngine {
     if (session) session.frameTimer = undefined;
   }
 
-  async closeSession(sessionId: string) {
+  async closeSession(sessionId: string, reason?: string) {
     const session = this.sessions.get(sessionId);
     if (session) {
       this.stopFrameStream(sessionId);
@@ -2608,12 +2667,13 @@ class QAComparisonEngine {
         new Promise<boolean>((r) => setTimeout(() => r(false), 10000)),
       ]);
       if (!drained) this.log(sessionId, 'Stop: in-flight work did not finish within 10s and was cancelled', 'Info', 'Info');
-      this.log(sessionId, 'Session stopped by user', 'Stopped', 'Stopped');
+      this.log(sessionId, reason ?? 'Session stopped by user', 'Stopped', 'Stopped');
       session.isRunning = false;
       this.archiveSession(session);
       await session.devBrowser.close().catch(() => {});
       await session.prodBrowser.close().catch(() => {});
       this.sessions.delete(sessionId);
+      this.evaluateOrphans();
       console.log(`Session ${sessionId} closed`);
     }
   }
