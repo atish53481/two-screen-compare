@@ -1,8 +1,10 @@
-import type { LoginConfig } from './engine/types';
+import type { LoginConfig, CaptureSettings, DataRule, ApiCheck, DbCheck } from './engine/types';
 
 export interface ProfileCredentials {
   username: string;
   secretRef?: string;
+  /** Client view only: true when a password is stored (the password itself is never returned). */
+  stored?: boolean;
 }
 
 /** Accepted on save only; encrypted and stripped before persisting. */
@@ -19,6 +21,11 @@ export interface ComparisonProfile {
   credentialsA?: ProfileCredentials;
   credentialsB?: ProfileCredentials;
   login?: LoginConfig;
+  capture?: Partial<CaptureSettings>;
+  dataRules?: DataRule[];
+  /** Placeholders until the API/DB check engine lands. */
+  apiChecks?: ApiCheck[];
+  dbChecks?: DbCheck[];
   safetyPolicy: 'read-only' | 'allow-safe' | 'full';
   /**
    * Actions/requests allowed on PROD despite the safety policy.

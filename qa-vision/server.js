@@ -7,7 +7,7 @@ const comparisonEngine = playwrightModule.default || playwrightModule.comparison
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = 'localhost';
-const port = 3001;
+const port = Number(process.env.QA_VISION_PORT) || 3001;
 
 const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();

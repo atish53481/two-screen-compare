@@ -3,9 +3,33 @@ import { profileManager } from '../../../lib/profile-manager';
 import { requireJson } from '../../../lib/http-guards';
 import { SecretError } from '../../../lib/engine/secrets';
 
+/** Client view of a profile: secret references and passwords never leave the server, only a `stored` flag. */
+function toClient(profile: any) {
+  const out: any = { ...profile };
+  for (const f of ['credentialsA', 'credentialsB']) {
+    if (out[f] && typeof out[f] === 'object') {
+      const { secretRef, password: _p, ...rest } = out[f];
+      out[f] = { ...rest, stored: Boolean(secretRef) };
+    }
+  }
+  return out;
+}
+
+/** Inbound profile: drop the client-only `stored` flag and any client-supplied secretRef. */
+function fromClient(profile: any) {
+  const out: any = { ...profile };
+  for (const f of ['credentialsA', 'credentialsB']) {
+    if (out[f] && typeof out[f] === 'object') {
+      const { stored: _s, secretRef: _r, ...rest } = out[f];
+      out[f] = rest;
+    }
+  }
+  return out;
+}
+
 export async function GET() {
   try {
-    const profiles = profileManager.getAllProfiles();
+    const profiles = profileManager.getAllProfiles().map(toClient);
     return NextResponse.json({ success: true, profiles });
   } catch (error) {
     return NextResponse.json({ success: false, error: 'Failed to load profiles' }, { status: 500 });
@@ -19,8 +43,8 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     
     if (body.action === 'save') {
-      const savedProfile = profileManager.saveProfile(body.profile);
-      return NextResponse.json({ success: true, profile: savedProfile });
+      const savedProfile = profileManager.saveProfile(fromClient(body.profile));
+      return NextResponse.json({ success: true, profile: toClient(savedProfile) });
     }
     
     if (body.action === 'delete') {

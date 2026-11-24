@@ -1,27 +1,21 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { io as connectSocket, type Socket } from 'socket.io-client';
 import { Play, Pause, Square, RefreshCw, Download, Settings, AlertTriangle, CheckCircle, XCircle, Eye, Power, Plus, Trash2, Edit } from 'lucide-react';
 import { format } from 'date-fns';
 import type { ComparisonProfile } from '../lib/types';
+import LiveView, { type Frame } from './components/LiveView';
+import Timeline from './components/Timeline';
+import FindingsPanel from './components/FindingsPanel';
+import EvidenceViewer from './components/EvidenceViewer';
+import HistoryTab from './components/HistoryTab';
+import ProfileSettings from './components/ProfileSettings';
+import { downloadReport, EXPORT_FORMATS, jsonHeaders, type ExportFormat, type Finding } from './components/types';
 
 
 
-interface Mismatch {
-  id: string;
-  timestamp: string;
-  page: string;
-  component: string;
-  type: string;
-  devValue: string;
-  prodValue: string;
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  description: string;
-  aiAnalysis?: string;
-  classification?: string;
-  occurrences?: number;
-  stepIds?: string[];
-}
+type Mismatch = Finding;
 
 interface LogEntry {
   id: string;
@@ -55,7 +49,17 @@ const QA_VISION = () => {
   const [mismatches, setMismatches] = useState<Mismatch[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedMismatch, setSelectedMismatch] = useState<Mismatch | null>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'profiles' | 'logs' | 'report'>('profiles');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'profiles' | 'logs' | 'history' | 'report'>('profiles');
+  const [frames, setFrames] = useState<{ dev?: Frame; prod?: Frame }>({});
+  const [outOfSync, setOutOfSync] = useState(false);
+  const [selectedStep, setSelectedStep] = useState<string | null>(null);
+  // Evidence/report source: kept after Stop so findings stay inspectable; viewRun = stored run opened read-only
+  const [evidenceSessionId, setEvidenceSessionId] = useState<string | null>(null);
+  const [viewRun, setViewRun] = useState<{ id: string; projectName: string } | null>(null);
+  const [historyKey, setHistoryKey] = useState(0);
+  const [exportNote, setExportNote] = useState('');
+  const sessionRef = React.useRef<string | null>(null);
+  const viewRunRef = React.useRef(false);
   const [status, setStatus] = useState('QA Vision Master Ready — Load or create a comparison profile');
   const [lastReportMeta, setLastReportMeta] = useState<{
     id: string;
@@ -64,43 +68,41 @@ const QA_VISION = () => {
   } | null>(null);
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
+  useEffect(() => {
+    sessionRef.current = sessionId;
+    viewRunRef.current = viewRun !== null;
+  }, [sessionId, viewRun]);
   const currentProfile = profiles.find(p => p.id === selectedProfileId) || profiles[0];
 
   // Load profiles from API + Socket.IO
   useEffect(() => {
     fetchProfiles();
 
-    // Real-time Socket.IO connection
-    let socket: any = null;
-    const initSocket = () => {
-      if (typeof window !== 'undefined' && (window as any).io) {
-        socket = (window as any).io('http://localhost:3001', {
-          path: '/socket.io',
-          reconnection: true,
-          reconnectionAttempts: 5
-        });
-
-        socket.on('connect', () => console.log('🔌 QA Vision Master connected to real-time engine'));
-        socket.on('log', (data: any) => {
-          if (data?.log) setLogs(prev => [data.log, ...prev].slice(0, 1000));
-        });
-        socket.on('mismatch', (data: any) => {
-          if (data?.mismatch) setMismatches(prev => [data.mismatch, ...prev].slice(0, 500));
-        });
-        socket.on('mismatch-update', (data: any) => {
-          const m = data?.mismatch;
-          if (m?.id) setMismatches(prev => prev.map(x => (x.id === m.id ? { ...x, ...m } : x)));
-        });
-        socket.on('sync-state', (data: any) => {
-          if (data?.outOfSync) setStatus(`⚠️ OUT OF SYNC — ${data.detail}. Use RESYNCHRONIZE BROWSERS.`);
-        });
-      }
-    };
-
-    const timer = setTimeout(initSocket, 800);
+    // Real-time Socket.IO connection (same origin as the dashboard; server.js hosts both)
+    const socket: Socket = connectSocket({ path: '/socket.io', reconnection: true, reconnectionAttempts: 5 });
+    // Live events only feed the live session; a stored run opened read-only is never touched
+    const mine = (data: any) => !viewRunRef.current && (!sessionRef.current || data?.sessionId === sessionRef.current);
+    socket.on('log', (data: any) => {
+      if (data?.log && mine(data)) setLogs(prev => [data.log, ...prev].slice(0, 1000));
+    });
+    socket.on('mismatch', (data: any) => {
+      if (data?.mismatch && mine(data)) setMismatches(prev => [data.mismatch, ...prev].slice(0, 500));
+    });
+    socket.on('mismatch-update', (data: any) => {
+      const m = data?.mismatch;
+      if (m?.id && mine(data)) setMismatches(prev => prev.map(x => (x.id === m.id ? { ...x, ...m } : x)));
+    });
+    socket.on('sync-state', (data: any) => {
+      if (!mine(data)) return;
+      setOutOfSync(Boolean(data?.outOfSync));
+      if (data?.outOfSync) setStatus(`⚠️ OUT OF SYNC — ${data.detail}. Use RESYNCHRONIZE BROWSERS.`);
+    });
+    socket.on('frame', (data: any) => {
+      if (!sessionRef.current || data?.sessionId !== sessionRef.current || (data.side !== 'dev' && data.side !== 'prod')) return;
+      setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || '') } }));
+    });
     return () => {
-      clearTimeout(timer);
-      if (socket) socket.disconnect();
+      socket.disconnect();
     };
   }, []);
 
@@ -127,12 +129,16 @@ const QA_VISION = () => {
     setLogs([]);
     setMismatches([]);
     setSelectedMismatch(null);
+    setViewRun(null);
+    setFrames({});
+    setOutOfSync(false);
+    setSelectedStep(null);
     addLog('Launching real session with recorder', 'Launching', 'Launching', 'info');
 
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({
           action: 'create',
           devUrl: currentProfile.urlA,
@@ -141,6 +147,7 @@ const QA_VISION = () => {
           safetyPolicy: currentProfile.safetyPolicy || 'read-only',
           safetyAllowlist: currentProfile.safetyAllowlist || [],
           ignoreRules: currentProfile.ignoreRules || [],
+          profileId: currentProfile.id,
         }),
       });
 
@@ -148,6 +155,8 @@ const QA_VISION = () => {
 
       if (res.ok && data.success && data.sessionId) {
         setSessionId(data.sessionId);
+        sessionRef.current = data.sessionId;
+        setEvidenceSessionId(data.sessionId);
         setIsRunning(true);
         setIsPaused(false);
         setMismatches([]);
@@ -180,7 +189,7 @@ const QA_VISION = () => {
       if (sessionId) {
         await fetch('/api/session', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: jsonHeaders,
           body: JSON.stringify({ action: 'pause', sessionId, paused: next }),
         });
       }
@@ -199,7 +208,7 @@ const QA_VISION = () => {
     try {
       await fetch('/api/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'stop', sessionId })
       });
     } catch (e) {
@@ -209,6 +218,8 @@ const QA_VISION = () => {
     setIsRunning(false);
     setIsStopping(false);
     setSessionId(null);
+    setFrames({});
+    setHistoryKey(k => k + 1);
     setStatus('✅ Session stopped. Results below are kept — click Export PDF Report for the consolidated report.');
   };
 
@@ -220,7 +231,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'resync', sessionId }),
       });
       const data = await res.json().catch(() => ({}));
@@ -269,7 +280,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/profiles', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'save', profile: currentProfile })
       });
       const data = await res.json();
@@ -286,7 +297,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/profiles', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'save', profile: newProfile })
       });
       const data = await res.json();
@@ -309,7 +320,7 @@ const QA_VISION = () => {
     try {
       await fetch('/api/profiles', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'delete', id })
       });
       await fetchProfiles();
@@ -317,6 +328,42 @@ const QA_VISION = () => {
       setStatus('Profile deleted');
     } catch (err) {
       setStatus('Failed to delete profile');
+    }
+  };
+
+  // Duplicate: new id, name "<name> (copy)"; secrets are never copied, so the user must re-enter passwords
+  const duplicateProfile = async (id: string) => {
+    const src = profiles.find(p => p.id === id);
+    if (!src) return;
+    const { id: _id, createdAt: _c, updatedAt: _u, credentialsA, credentialsB, ...rest } = src;
+    const strip = (c?: ComparisonProfile['credentialsA']) => (c ? { username: c.username } : undefined);
+    try {
+      const res = await fetch('/api/profiles', {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ action: 'save', profile: { ...rest, name: `${src.name} (copy)`, credentialsA: strip(credentialsA), credentialsB: strip(credentialsB) } }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        await fetchProfiles();
+        setSelectedProfileId(data.profile.id);
+        setStatus(`Duplicated as "${data.profile.name}". Re-enter any passwords: secrets are not copied.`);
+      } else setStatus(`Duplicate failed: ${data.error || 'unknown error'}`);
+    } catch {
+      setStatus('Failed to duplicate profile');
+    }
+  };
+
+  const exportAs = async (fmt: ExportFormat) => {
+    const ref = viewRun || !isRunning ? { runId: viewRun?.id || evidenceSessionId || undefined } : { sessionId: sessionId || undefined };
+    if (!ref.runId && !ref.sessionId) {
+      setExportNote('Nothing to export yet: run a session or open a stored run first.');
+      return;
+    }
+    try {
+      setExportNote(`Exported ${await downloadReport(fmt, ref)}`);
+    } catch (e: any) {
+      setExportNote(`Export failed: ${e?.message || 'unknown error'}`);
     }
   };
 
@@ -341,7 +388,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/report', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({
           sessionId,
           projectName: currentProfile?.name || 'QA Vision Comparison',
@@ -591,6 +638,7 @@ const QA_VISION = () => {
                 { id: 'profiles', label: 'Profiles' },
                 { id: 'dashboard', label: 'Live Comparison' },
                 { id: 'logs', label: 'Execution Log' },
+                { id: 'history', label: 'History' },
                 { id: 'report', label: 'Reports' },
               ].map((tab) => (
                 <button
@@ -610,133 +658,41 @@ const QA_VISION = () => {
 
           {/* Live Dashboard View */}
           {activeTab === 'dashboard' && (
-            <div className="flex-1 flex flex-col p-8 overflow-hidden">
-              <div className="flex-1 grid grid-cols-2 gap-6 min-h-0">
-                {/* DEV Browser Window */}
-                <div className="flex flex-col border border-zinc-700 rounded-3xl overflow-hidden bg-zinc-950">
-                  <div className="bg-zinc-900 px-6 py-3 flex items-center justify-between border-b border-zinc-800">
-                    <div className="flex items-center gap-3">
-                      <div className="text-emerald-400">
-                        <span className="font-mono text-xs">DEV</span>
-                      </div>
-                      <div className="text-xs text-zinc-400 font-mono truncate max-w-[260px]">{currentProfile?.urlA || 'http://localhost:3002'}</div>
-                    </div>
-                    <div className="text-[10px] px-3 py-0.5 bg-emerald-900/60 text-emerald-400 rounded">PRIMARY REFERENCE</div>
-                  </div>
-
-                  <div className="flex-1 bg-zinc-950 flex items-center justify-center relative">
-                    <div className="text-center">
-                      <div className="mx-auto w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500 to-cyan-400 flex items-center justify-center mb-6">
-                        <Eye className="h-8 w-8 text-white" />
-                      </div>
-                      <div className="text-zinc-400 text-sm">DEV Environment</div>
-                      <div className="text-xs text-emerald-400 mt-1 font-mono">DEV is the Master Control Environment</div>
-                      {isRunning && <div className="mt-8 text-emerald-400 text-xs flex items-center gap-2 justify-center">
-                        <div className="h-1.5 w-1.5 bg-current rounded-full animate-ping"></div>
-                        REAL SYNC ACTIVE — Actions performed here are replicated in PRODUCTION
-                      </div>}
-                    </div>
-
-                    {/* Simulated overlay hint */}
-                    {isRunning && (
-                      <div className="absolute bottom-8 left-8 bg-black/80 text-[10px] px-4 py-2 rounded-2xl border border-emerald-500/30 font-mono">
-                        Click anywhere in this window → replicated in PRODUCTION
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="bg-zinc-900 px-6 py-4 text-xs text-zinc-400 flex items-center justify-between font-mono border-t border-zinc-800">
-                    <div>Current URL: /dashboard</div>
-                    <div className={isRunning && !isPaused ? 'text-emerald-400' : 'text-zinc-500'}>
-                      {isRunning && !isPaused ? 'Synced ✓' : isPaused ? 'Paused' : 'Idle'}
-                    </div>
-                  </div>
+            <div className="flex-1 flex flex-col gap-4 p-6 overflow-auto">
+              {viewRun && (
+                <div data-testid="readonly-banner" className="flex items-center justify-between rounded-xl border border-amber-700/50 bg-amber-950/30 px-4 py-2 text-sm text-amber-200">
+                  <span>Stored run &quot;{viewRun.projectName}&quot; (read-only)</span>
+                  <button type="button" onClick={() => { setViewRun(null); setMismatches([]); setLogs([]); setSelectedMismatch(null); setEvidenceSessionId(sessionId); }} className="underline">Close run</button>
                 </div>
-
-                {/* PRODUCTION Browser Window */}
-                <div className="flex flex-col border border-zinc-700 rounded-3xl overflow-hidden bg-zinc-950">
-                  <div className="bg-zinc-900 px-6 py-3 flex items-center justify-between border-b border-zinc-800">
-                    <div className="flex items-center gap-3">
-                      <div className="text-rose-400">
-                        <span className="font-mono text-xs">PROD</span>
-                      </div>
-                      <div className="text-xs text-zinc-400 font-mono truncate max-w-[260px]">{currentProfile?.urlB || 'http://localhost:3003'}</div>
-                    </div>
-                  </div>
-
-                  <div className="flex-1 bg-zinc-950 flex items-center justify-center relative">
-                    <div className="text-center">
-                      <div className="mx-auto w-16 h-16 rounded-2xl bg-gradient-to-br from-rose-500 to-orange-400 flex items-center justify-center mb-6">
-                        <Eye className="h-8 w-8 text-white" />
-                      </div>
-                      <div className="text-zinc-400 text-sm">PRODUCTION Environment</div>
-                      <div className="text-xs text-rose-400 mt-1 font-mono">PRODUCTION — Mirrored from DEV in real-time</div>
-                    </div>
-                  </div>
-
-                  <div className="bg-zinc-900 px-6 py-4 text-xs text-zinc-400 flex items-center justify-between font-mono border-t border-zinc-800">
-                    <div>Current URL: /dashboard</div>
-                    <div className={isRunning && !isPaused ? 'text-emerald-400' : 'text-zinc-500'}>
-                      {isRunning && !isPaused ? 'Synced ✓' : isPaused ? 'Paused' : 'Idle'}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Real-time Mismatches Panel */}
-              <div className="mt-8">
-                <div className="flex items-center justify-between mb-4 px-1">
-                  <div className="flex items-center gap-3">
-                    <AlertTriangle className="h-5 w-5 text-amber-400" />
-                    <h3 className="font-semibold text-lg">Detected Differences (Live)</h3>
-                  </div>
-                  <div className="text-xs text-zinc-400 font-mono">
-                    {mismatches.filter(m => m.severity === 'high' || m.severity === 'critical').length} high-severity • {mismatches.filter(m => m.severity === 'medium').length} medium
-                  </div>
-                </div>
-
-                <div className="bg-zinc-900 rounded-3xl border border-zinc-800 overflow-hidden">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="border-b border-zinc-800 text-left text-xs text-zinc-400">
-                        <th className="py-4 px-8 font-normal">PAGE</th>
-                        <th className="py-4 px-6 font-normal">COMPONENT</th>
-                        <th className="py-4 px-6 font-normal">TYPE</th>
-                        <th className="py-4 px-6 font-normal">DEV</th>
-                        <th className="py-4 px-6 font-normal">PROD</th>
-                        <th className="py-4 px-6 font-normal">SEVERITY</th>
-                        <th className="py-4 px-6 font-normal w-8"></th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-zinc-800 text-sm">
-                      {mismatches.map((mismatch) => (
-                        <tr 
-                          key={mismatch.id}
-                          onClick={() => setSelectedMismatch(mismatch)}
-                          className="hover:bg-zinc-800/70 cursor-pointer transition-colors group"
-                        >
-                          <td className="py-5 px-8 font-mono text-xs text-zinc-400">{mismatch.page}</td>
-                          <td className="py-5 px-6 font-medium">{mismatch.component}</td>
-                          <td className="py-5 px-6">
-                            <span className="inline-block px-3 py-1 text-xs rounded-full bg-zinc-800 text-zinc-400">{mismatch.type}</span>
-                          </td>
-                          <td className="py-5 px-6 font-mono text-emerald-400">{mismatch.devValue}</td>
-                          <td className="py-5 px-6 font-mono text-rose-400">{mismatch.prodValue}</td>
-                          <td className="py-5 px-6">
-                            <span className={`inline-block px-4 py-1 text-xs font-medium rounded-2xl ${severityColor(mismatch.severity)}`}>
-                              {mismatch.severity.toUpperCase()}
-                            </span>
-                          </td>
-                          <td className="py-5 px-6 opacity-0 group-hover:opacity-100">
-                            <Eye className="h-4 w-4 text-zinc-400" />
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+              )}
+              {!viewRun && (
+                <LiveView
+                  labelA={currentProfile?.labelA || 'DEV'}
+                  labelB={currentProfile?.labelB || 'PROD'}
+                  frames={frames}
+                  isRunning={isRunning}
+                  isPaused={isPaused}
+                  outOfSync={outOfSync}
+                />
+              )}
+              <Timeline logs={logs} findings={mismatches} selectedStep={selectedStep} onSelectStep={setSelectedStep} />
+              <FindingsPanel findings={mismatches} selectedId={selectedMismatch?.id || null} stepFilter={selectedStep} onSelect={setSelectedMismatch} />
             </div>
+          )}
+
+          {activeTab === 'history' && (
+            <HistoryTab
+              refreshKey={historyKey}
+              onOpen={(run) => {
+                setViewRun({ id: run.id, projectName: run.projectName });
+                setEvidenceSessionId(run.id);
+                setMismatches(run.mismatches);
+                setLogs(run.logs);
+                setSelectedMismatch(null);
+                setSelectedStep(null);
+                setActiveTab('dashboard');
+              }}
+            />
           )}
 
           {/* Profiles Tab - Dynamic UI (Main Feature) */}
@@ -790,7 +746,7 @@ const QA_VISION = () => {
                       >
                         <div className="flex items-start justify-between gap-4">
                           <div>
-                            <div className="text-xl font-semibold">{profile.name}</div>
+                            <div data-testid="profile-name" className="text-xl font-semibold">{profile.name}</div>
                             <div className="text-sm text-zinc-400 mt-1">
                               {profile.labelA} → {profile.labelB} · Safety: {profile.safetyPolicy}
                             </div>
@@ -814,6 +770,14 @@ const QA_VISION = () => {
                               }`}
                             >
                               {isSelected ? 'Selected' : 'Select'}
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="profile-duplicate"
+                              onClick={() => duplicateProfile(profile.id)}
+                              className="px-4 py-2 rounded-xl text-sm bg-zinc-800 hover:bg-zinc-700"
+                            >
+                              Duplicate
                             </button>
                             {profile.id !== 'default' && (
                               <button
@@ -998,6 +962,13 @@ const QA_VISION = () => {
                       </p>
                     </div>
 
+                    <ProfileSettings
+                      profile={currentProfile}
+                      onChange={(patch) =>
+                        setProfiles((prev) => prev.map((p) => (p.id === currentProfile.id ? { ...p, ...patch } : p)))
+                      }
+                    />
+
                     <div className="flex flex-col sm:flex-row gap-3 pt-2">
                       <button
                         type="button"
@@ -1181,6 +1152,21 @@ const QA_VISION = () => {
                   {isGeneratingReport ? 'GENERATING PDF…' : 'DOWNLOAD PDF WITH ACTUAL DIFFERENCES'}
                 </button>
 
+                <div className="mt-6 grid grid-cols-5 gap-2" data-testid="export-buttons">
+                  {EXPORT_FORMATS.map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      data-testid={`export-${f}`}
+                      onClick={() => void exportAs(f)}
+                      className="py-3 rounded-2xl bg-zinc-800 hover:bg-zinc-700 text-sm font-medium uppercase"
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+                {exportNote && <div data-testid="export-note" className="mt-3 text-center text-xs text-zinc-400">{exportNote}</div>}
+
                 <p className="text-center text-xs text-zinc-500 mt-8">
                   The PDF opens in a new tab and downloads. It includes summary, each difference
                   (DEV vs PROD), severity, and visual DIFF images when the session recorded them.
@@ -1190,35 +1176,18 @@ const QA_VISION = () => {
           )}
         </div>
 
-        {/* Detail Sidebar */}
-        {selectedMismatch && (
-          <div className="w-96 border-l border-zinc-700 bg-zinc-900 p-8 overflow-auto">
-            <button onClick={() => setSelectedMismatch(null)} className="float-right text-zinc-400 hover:text-white">✕</button>
-
-            <div className="uppercase tracking-[2px] text-xs text-rose-400 mb-2">MISMATCH DETAIL</div>
-            <h3 className="text-2xl font-semibold leading-tight mb-6">{selectedMismatch.component}</h3>
-
-            <div className="space-y-8">
-              <div>
-                <div className="text-xs text-zinc-400 mb-3">AI ROOT CAUSE ANALYSIS</div>
-                <div className="bg-zinc-950 p-6 rounded-3xl text-sm leading-relaxed border border-zinc-800">
-                  {selectedMismatch.aiAnalysis}
-                </div>
-              </div>
-
-              <div>
-                <div className="text-xs text-zinc-400 mb-4">VISUAL EVIDENCE</div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="aspect-video bg-zinc-800 rounded-2xl flex items-center justify-center text-xs text-zinc-500 border border-dashed">DEV Screenshot</div>
-                  <div className="aspect-video bg-zinc-800 rounded-2xl flex items-center justify-center text-xs text-zinc-500 border border-dashed">PROD Screenshot</div>
-                </div>
-              </div>
-
-              <div className="pt-4">
-                <button className="w-full py-4 bg-white text-black rounded-2xl font-medium">HIGHLIGHT IN BOTH BROWSERS</button>
-              </div>
-            </div>
-          </div>
+        {/* Evidence viewer */}
+        {selectedMismatch && activeTab === 'dashboard' && evidenceSessionId && (
+          <EvidenceViewer
+            key={selectedMismatch.id}
+            finding={selectedMismatch}
+            target={{ evidenceId: viewRun?.id || evidenceSessionId, live: !viewRun && isRunning && sessionId === evidenceSessionId }}
+            onUpdate={(f) => {
+              setSelectedMismatch(f);
+              setMismatches(prev => prev.map(x => (x.id === f.id ? { ...x, ...f } : x)));
+            }}
+            onClose={() => setSelectedMismatch(null)}
+          />
         )}
       </div>
     </div>

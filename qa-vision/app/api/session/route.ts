@@ -51,8 +51,9 @@ export async function POST(request: NextRequest) {
         // Secrets are resolved server-side only; they never reach the client or the logs
         let login;
         let loginCredentials;
+        let profile: ReturnType<typeof profileManager.getProfile>;
         if (typeof profileId === 'string' && profileId) {
-          const profile = profileManager.getProfile(profileId);
+          profile = profileManager.getProfile(profileId);
           if (!profile) {
             return NextResponse.json({ success: false, error: 'Profile not found' }, { status: 404 });
           }
@@ -74,7 +75,10 @@ export async function POST(request: NextRequest) {
             ignoreRules: Array.isArray(ignoreRules)
               ? ignoreRules.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 100)
               : [],
-            capture: capture && typeof capture === 'object' ? capture : undefined,
+            capture: capture && typeof capture === 'object' ? capture : profile?.capture,
+            dataRules: Array.isArray(profile?.dataRules) ? profile.dataRules : undefined,
+            apiChecks: Array.isArray(profile?.apiChecks) ? profile.apiChecks : undefined,
+            dbChecks: Array.isArray(profile?.dbChecks) ? profile.dbChecks : undefined,
             profileId: typeof profileId === 'string' ? profileId : undefined,
             login,
             loginCredentials,

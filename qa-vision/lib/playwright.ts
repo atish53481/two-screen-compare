@@ -236,6 +236,9 @@ export interface ComparisonSession {
   stopRequested?: boolean;
   aiScheduled?: boolean;
   recorderReady: boolean;
+  /** Live-view frame loop (see startFrameStream). */
+  frameTimer?: ReturnType<typeof setInterval>;
+  frameBusy?: boolean;
   startedAt: string;
   evidenceDir: string;
   /** Network/API entries seen since the last comparison (capped at 500 each). */
@@ -554,6 +557,8 @@ class QAComparisonEngine {
     this.enqueueTask(sessionId, async () => {
       await this.compareAfterAction(sessionId, ['initial']);
     });
+
+    this.startFrameStream(sessionId);
 
     console.log(`✅ QA Vision session created: ${sessionId}`);
     console.log(`   DEV  → ${devUrl}`);
@@ -2309,9 +2314,51 @@ class QAComparisonEngine {
     }
   }
 
+  /**
+   * Live view: every 1000 ms, while the session runs, is not paused and at least one socket is connected, emit a
+   * `frame {sessionId, side, data (base64 JPEG q50), url}` per side. A tick is skipped while the previous one is still
+   * in flight. Password inputs (and the profile's mask selectors) are masked in the pixels; a frame whose masking
+   * fails is dropped, never sent unmasked.
+   */
+  startFrameStream(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.frameTimer) return;
+    const grab = async (page: Page): Promise<string | null> => {
+      try {
+        const masks = ['input[type="password"]', ...session.capture.maskSelectors].map((sel) => page.locator(sel));
+        const buf = await page.screenshot({ type: 'jpeg', quality: 50, mask: masks, maskColor: '#000000', timeout: 4000 });
+        return buf.toString('base64');
+      } catch {
+        return null;
+      }
+    };
+    session.frameTimer = setInterval(async () => {
+      const io = this.io;
+      if (!session.isRunning) return this.stopFrameStream(sessionId);
+      if (session.frameBusy || session.isPaused || !io || io.sockets.sockets.size < 1) return;
+      session.frameBusy = true;
+      try {
+        for (const [side, page] of [['dev', session.devPage], ['prod', session.prodPage]] as const) {
+          const data = await grab(page);
+          if (data && session.isRunning && !session.isPaused) io.emit('frame', { sessionId, side, data, url: urlForLog(page.url()) });
+        }
+      } finally {
+        session.frameBusy = false;
+      }
+    }, 1000);
+    session.frameTimer.unref?.();
+  }
+
+  stopFrameStream(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (session?.frameTimer) clearInterval(session.frameTimer);
+    if (session) session.frameTimer = undefined;
+  }
+
   async closeSession(sessionId: string) {
     const session = this.sessions.get(sessionId);
     if (session) {
+      this.stopFrameStream(sessionId);
       // Stop accepting new DEV actions, let queued replays/comparisons finish (bounded), then archive.
       session.stopRequested = true;
       const drained = await Promise.race([
