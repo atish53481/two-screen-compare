@@ -150,13 +150,23 @@ function readJson(file) {
 }
 function migrateLegacyFiles(store, dir) {
     // Task 11 blobs first (already encrypted), then profiles (plaintext passwords get encrypted).
+    // Each entry is imported on its own: one malformed entry is logged and skipped, never fatal.
     const secretsFile = path_1.default.join(dir, 'secrets.json');
     if (fs_1.default.existsSync(secretsFile)) {
         const map = readJson(secretsFile);
-        if (map && typeof map === 'object') {
-            for (const [ref, blob] of Object.entries(map))
-                if (typeof blob === 'string')
-                    store.putSecret(ref, blob);
+        if (map && typeof map === 'object' && !Array.isArray(map)) {
+            for (const [ref, blob] of Object.entries(map)) {
+                try {
+                    if (typeof blob === 'string')
+                        store.putSecret(ref, blob);
+                }
+                catch (e) {
+                    console.error(`Secret "${ref}": skipped during migration (${e.message})`);
+                }
+            }
+        }
+        else {
+            console.error('secrets.json is not a valid secret map; nothing imported');
         }
         fs_1.default.renameSync(secretsFile, `${secretsFile}.migrated`);
     }
@@ -165,18 +175,26 @@ function migrateLegacyFiles(store, dir) {
         const list = readJson(profilesFile);
         if (Array.isArray(list)) {
             for (const p of list) {
-                if (!p || typeof p.id !== 'string')
-                    continue;
-                const hasPlain = [p.credentialsA, p.credentialsB].some((c) => c && 'password' in c);
-                let profile = p;
-                if (hasPlain) {
-                    const r = (0, secrets_1.safeStoreProfileSecrets)(p, dir);
-                    if (r.error)
-                        console.error(`Profile "${p.id}": could not encrypt legacy password (${r.error}); it was removed`);
-                    profile = r.profile;
+                try {
+                    if (!p || typeof p.id !== 'string')
+                        continue;
+                    const hasPlain = [p.credentialsA, p.credentialsB].some((c) => c && typeof c === 'object' && 'password' in c);
+                    let profile = p;
+                    if (hasPlain) {
+                        const r = (0, secrets_1.safeStoreProfileSecrets)(p, dir);
+                        if (r.error)
+                            console.error(`Profile "${p.id}": could not encrypt legacy password (${r.error}); it was removed`);
+                        profile = r.profile;
+                    }
+                    store.saveProfile(profile);
                 }
-                store.saveProfile(profile);
+                catch (e) {
+                    console.error(`Profile "${p?.id}": skipped during migration (${e.message})`);
+                }
             }
+        }
+        else {
+            console.error('profiles.json is not a profile list; nothing imported');
         }
         fs_1.default.renameSync(profilesFile, `${profilesFile}.migrated`);
     }

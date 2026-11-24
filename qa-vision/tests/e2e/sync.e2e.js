@@ -1,5 +1,6 @@
 // Synchronization & findings: ordered queue (no skipped comparisons), de-duplication,
 // out-of-sync detection + resync, Stop draining in-flight work, ignore rules.
+const { openStore } = require('../../engine-dist/engine/store.js');
 const { engine, DEV_URL, PROD_URL, SAMPLE_EMAIL, SAMPLE_PASSWORD, idle, waitForLoginForm, runSuite } = require('./helpers');
 
 const compareLogs = (s) => s.logs.filter((l) => l.action.startsWith('Compared after'));
@@ -76,6 +77,8 @@ runSuite('Synchronization & findings', async ({ check }) => {
   const lastStep = replayedSteps(snap.logs)[0];
   check('Stop waits for the last action and its comparison', !!lastStep && coveredSteps(snap.logs).has(lastStep), `last=${lastStep}`);
   check('Stop is logged in the archived run', snap.logs.some((l) => l.action === 'Session stopped by user'));
+  const stored = openStore().getRun(a);
+  check('stopped session is persisted to run history', !!stored && !!stored.endedAt && stored.logs.length === snap.logs.length, stored ? `logs=${stored.logs.length}` : 'missing');
 
   // ---------- Session B: ignore rules ----------
   const b = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-B', ignoreRules: ['numbers', 'text:environment'] });
@@ -91,4 +94,15 @@ runSuite('Synchronization & findings', async ({ check }) => {
   check('numbers rule suppresses number-only differences', !numberOnlyB);
   check('suppressions are logged, not silent', B.logs.some((l) => /suppressed by ignore rules/.test(l.action)));
   await engine.closeSession(b);
+
+  // ---------- Session C: closing the DEV window still records the run ----------
+  const c = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-C' });
+  const C = engine.getSession(c);
+  await waitForLoginForm(C);
+  await C.devBrowser.close();
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline && !openStore().getRun(c)) await new Promise((r) => setTimeout(r, 200));
+  const closedRun = openStore().getRun(c);
+  check('closing the DEV browser persists the run row', !!closedRun && closedRun.projectName === 'sync-C');
+  await engine.closeSession(c);
 });

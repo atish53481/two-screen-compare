@@ -497,6 +497,8 @@ class QAComparisonEngine {
         if (!current || !current.isRunning) return;
         this.log(sessionId, `${label} browser window was closed — replication stopped; Stop and start a new session`, label === 'DEV' ? 'Error' : 'n/a', 'Error');
         this.setSyncState(sessionId, true, `${label} browser closed`);
+        // The session has effectively ended: record the run now; Stop later rewrites the same row
+        this.persistRun(this.snapshotOf(current));
       });
     }
 
@@ -2088,8 +2090,8 @@ class QAComparisonEngine {
     return true;
   }
 
-  private archiveSession(session: ComparisonSession) {
-    this.lastSnapshot = {
+  private snapshotOf(session: ComparisonSession): SessionSnapshot {
+    return {
       id: session.id,
       profileId: session.profileId,
       projectName: session.projectName,
@@ -2100,6 +2102,19 @@ class QAComparisonEngine {
       logs: [...session.logs],
       mismatches: [...session.mismatches],
     };
+  }
+
+  /** Idempotent (saveRun replaces by run id). A storage failure must never break session teardown. */
+  private persistRun(snap: SessionSnapshot) {
+    try {
+      openStore(path.join(getDataDir(), 'qa-vision.db')).saveRun(snap);
+    } catch (e) {
+      console.error('Could not persist run history:', (e as Error).message);
+    }
+  }
+
+  private archiveSession(session: ComparisonSession) {
+    this.lastSnapshot = this.snapshotOf(session);
 
     try {
       const snapPath = path.join(session.evidenceDir, 'session-snapshot.json');
@@ -2107,13 +2122,7 @@ class QAComparisonEngine {
     } catch {
       /* ignore */
     }
-
-    // Persist to run history; a storage failure must never break session teardown
-    try {
-      openStore(path.join(getDataDir(), 'qa-vision.db')).saveRun(this.lastSnapshot as SessionSnapshot);
-    } catch (e) {
-      console.error('Could not persist run history:', (e as Error).message);
-    }
+    this.persistRun(this.lastSnapshot);
   }
 
   async closeSession(sessionId: string) {

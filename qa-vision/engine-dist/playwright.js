@@ -386,6 +386,8 @@ class QAComparisonEngine {
                     return;
                 this.log(sessionId, `${label} browser window was closed — replication stopped; Stop and start a new session`, label === 'DEV' ? 'Error' : 'n/a', 'Error');
                 this.setSyncState(sessionId, true, `${label} browser closed`);
+                // The session has effectively ended: record the run now; Stop later rewrites the same row
+                this.persistRun(this.snapshotOf(current));
             });
         }
         // Network-level write guard on PROD (installed before any navigation)
@@ -1863,8 +1865,8 @@ class QAComparisonEngine {
         this.io?.emit('mismatch', { sessionId, mismatch: fullMismatch });
         return true;
     }
-    archiveSession(session) {
-        this.lastSnapshot = {
+    snapshotOf(session) {
+        return {
             id: session.id,
             profileId: session.profileId,
             projectName: session.projectName,
@@ -1875,6 +1877,18 @@ class QAComparisonEngine {
             logs: [...session.logs],
             mismatches: [...session.mismatches],
         };
+    }
+    /** Idempotent (saveRun replaces by run id). A storage failure must never break session teardown. */
+    persistRun(snap) {
+        try {
+            (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db')).saveRun(snap);
+        }
+        catch (e) {
+            console.error('Could not persist run history:', e.message);
+        }
+    }
+    archiveSession(session) {
+        this.lastSnapshot = this.snapshotOf(session);
         try {
             const snapPath = path.join(session.evidenceDir, 'session-snapshot.json');
             fs.writeFileSync(snapPath, JSON.stringify(this.lastSnapshot, null, 2));
@@ -1882,13 +1896,7 @@ class QAComparisonEngine {
         catch {
             /* ignore */
         }
-        // Persist to run history; a storage failure must never break session teardown
-        try {
-            (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db')).saveRun(this.lastSnapshot);
-        }
-        catch (e) {
-            console.error('Could not persist run history:', e.message);
-        }
+        this.persistRun(this.lastSnapshot);
     }
     async closeSession(sessionId) {
         const session = this.sessions.get(sessionId);

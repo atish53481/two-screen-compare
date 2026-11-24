@@ -132,3 +132,36 @@ test('migration imports secrets.json blobs and renames the file', () => {
   assert.ok(!fs.existsSync(path.join(dir, 'secrets.json')));
   assert.ok(fs.existsSync(path.join(dir, 'secrets.json.migrated')));
 });
+
+test('migration skips a malformed profile entry, imports the rest and still renames', () => {
+  const dir = tmp();
+  const origErr = console.error;
+  console.error = () => {};
+  try {
+    fs.writeFileSync(path.join(dir, 'profiles.json'), JSON.stringify([
+      { id: 'bad', credentialsA: 'oops' },
+      { id: 'good', name: 'G' },
+      null,
+    ]));
+    const store = openStore(dbIn(dir));
+    assert.ok(store.getProfile('good'));
+    assert.ok(!fs.existsSync(path.join(dir, 'profiles.json')));
+    assert.ok(fs.existsSync(path.join(dir, 'profiles.json.migrated')));
+  } finally {
+    console.error = origErr;
+  }
+});
+
+test('corrupt secrets.json is skipped without crashing and renamed', () => {
+  const dir = tmp();
+  const origErr = console.error;
+  console.error = () => {};
+  try {
+    fs.writeFileSync(path.join(dir, 'secrets.json'), '{not json');
+    const store = openStore(dbIn(dir));
+    assert.equal(store.getSecret('anything'), null);
+    assert.ok(fs.existsSync(path.join(dir, 'secrets.json.migrated')));
+  } finally {
+    console.error = origErr;
+  }
+});
