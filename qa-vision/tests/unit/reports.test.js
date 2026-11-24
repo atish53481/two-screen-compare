@@ -39,7 +39,7 @@ test('summary counts by severity, type and classification', () => {
   assert.equal(m.summary.byClassification.POTENTIAL_DEFECT, 1);
   assert.equal(m.summary.expected, 1);
   assert.equal(m.summary.replayIssues, 1);
-  assert.equal(m.summary.skippedUnsafe, 1);
+  assert.equal(m.summary.skippedUnsafe, 2); // 1 finding + 1 uncovered skipped log
   assert.equal(m.summary.interactions, 1);
   assert.equal(m.summary.comparisons, 1);
   assert.equal(m.timeline[0].action, 'Skipped on PROD (strict): click "Delete"');
@@ -58,7 +58,7 @@ test('html contains every section heading', () => {
     'Skipped unsafe actions', 'Timeline', 'AI analysis', 'Evidence', 'Observed facts', 'Hypotheses']) {
     assert.ok(html.includes(h), h);
   }
-  assert.ok(html.includes('data:image/png;base64,AAAA'));
+  assert.ok(html.includes('data:image/jpeg;base64,AAAA'));
   assert.ok(html.includes('FACT-X') && html.includes('HYP-Y'));
 });
 

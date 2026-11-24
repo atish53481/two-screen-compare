@@ -21,13 +21,25 @@ const findingRows = (fs: Finding[]) =>
         .join('')}</table>`
     : '<p class="muted">None.</p>';
 
-/** One self-contained file: inline CSS, screenshots as data: URIs from `images` (file name -> base64 PNG). */
+/**
+ * One self-contained file: inline CSS, each screenshot embedded once as a data: URI (base64 JPEG from `images`,
+ * file name -> base64) and referenced by every finding that uses it.
+ */
 export function renderHtml(model: ReportModel, images: Map<string, string>): string {
   const { meta, summary, findings } = model;
-  const img = (name?: string, label?: string) =>
-    name && images.has(name)
-      ? `<figure><img alt="${e(label)}" src="data:image/png;base64,${e(images.get(name))}"><figcaption>${e(label)}: ${e(name)}</figcaption></figure>`
-      : '';
+  const B64 = /^[A-Za-z0-9+/=]+$/;
+  const usedBy = new Map<string, string[]>();
+  for (const f of findings)
+    for (const n of [f.devScreenshotPath, f.prodScreenshotPath, f.diffScreenshotPath])
+      if (n) usedBy.set(n, [...(usedBy.get(n) || []), f.id]);
+  const evidence = [...usedBy].map(([name, ids]) => {
+    const b64 = images.get(name);
+    const body =
+      b64 && B64.test(b64)
+        ? `<img alt="${e(name)}" src="data:image/jpeg;base64,${b64}">`
+        : '<p class="muted">(image omitted: missing, over the embed budget, or resize unavailable)</p>';
+    return `<figure id="img-${e(name)}">${body}<figcaption>${e(name)} - findings: ${e(ids.join(', '))}</figcaption></figure>`;
+  });
 
   const ai = findings
     .filter((f) => f.ai && f.ai.status === 'ok')
@@ -38,13 +50,6 @@ export function renderHtml(model: ReportModel, images: Map<string, string>): str
 <h4>Suggested investigation</h4>${list(a.suggestedInvestigation || [])}
 <p class="muted">Advisory only (${e(a.provider)} / ${e(a.model)}${a.proposedClassification ? `; proposes ${e(a.proposedClassification)}` : ''}).</p></div>`;
     });
-
-  const evidence = findings
-    .filter((f) => f.devScreenshotPath || f.prodScreenshotPath || f.diffScreenshotPath)
-    .map(
-      (f) =>
-        `<div class="card"><h3>${e(f.type)} - ${e(f.component)} <span class="muted">${e(f.id)}</span></h3>${img(f.devScreenshotPath, 'DEV')}${img(f.prodScreenshotPath, 'PROD')}${img(f.diffScreenshotPath, 'Diff')}</div>`
-    );
 
   const timeline = model.timeline.length
     ? `<table><tr><th>Step</th><th>Action</th><th>DEV</th><th>PROD</th><th>Status</th><th>Findings</th></tr>${model.timeline
@@ -71,7 +76,7 @@ img{max-width:100%;border:1px solid #ccc}figure{margin:.5rem 0}</style></head><b
 <h2>Differences by type</h2>${countTable(summary.byType)}${countTable(summary.byClassification)}
 <h2>Expected differences</h2>${findingRows(findings.filter((f) => f.classification === 'EXPECTED_DIFFERENCE'))}
 <h2>Replay issues</h2>${findingRows(findings.filter((f) => f.classification === 'REPLAY_FAILURE'))}
-<h2>Skipped unsafe actions</h2>${findingRows(findings.filter((f) => f.classification === 'SKIPPED_BY_SAFETY_POLICY'))}
+<h2>Skipped unsafe actions</h2>${findingRows(findings.filter((f) => f.classification === 'SKIPPED_BY_SAFETY_POLICY'))}${list(model.skippedActions)}
 <h2>All findings</h2>${findingRows(findings)}
 <h2>Timeline</h2>${timeline}
 <h2>AI analysis</h2><p class="muted">Observed facts and hypotheses are listed separately. AI output is advisory and never changes a classification.</p>${ai.join('') || '<p class="muted">No AI analysis available.</p>'}
@@ -80,33 +85,3 @@ img{max-width:100%;border:1px solid #ccc}figure{margin:.5rem 0}</style></head><b
 `;
 }
 
-/**
- * Reads the named screenshots from `evidenceDir` only (anything resolving outside it, or missing, is skipped)
- * and downscales each to <= 1200 px wide. Returns file name -> base64 PNG.
- */
-export async function loadEvidenceImages(evidenceDir: string, model: ReportModel): Promise<Map<string, string>> {
-  const fs = await import('fs');
-  const path = await import('path');
-  const out = new Map<string, string>();
-  const root = path.resolve(evidenceDir);
-  const names = new Set<string>();
-  for (const f of model.findings) for (const n of [f.devScreenshotPath, f.prodScreenshotPath, f.diffScreenshotPath]) if (n) names.add(n);
-  let sharp: any = null;
-  try {
-    sharp = (await import('sharp')).default;
-  } catch {
-    /* embed originals */
-  }
-  for (const name of names) {
-    try {
-      const full = path.resolve(root, name);
-      if (path.dirname(full) !== root || !fs.existsSync(full)) continue;
-      let bytes: Buffer = fs.readFileSync(full);
-      if (sharp) bytes = await sharp(bytes).resize({ width: 1200, withoutEnlargement: true }).png().toBuffer();
-      out.set(name, bytes.toString('base64'));
-    } catch {
-      /* missing or unreadable image never fails the report */
-    }
-  }
-  return out;
-}
