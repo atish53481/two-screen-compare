@@ -1,8 +1,13 @@
 ﻿import { NextRequest, NextResponse } from 'next/server';
 import comparisonEngine, { validateTargetUrl } from '@/lib/playwright';
+import { requireJson } from '@/lib/http-guards';
+import { profileManager } from '@/lib/profile-manager';
+import { getDataDir, resolveSessionLogin } from '@/lib/engine/secrets';
 
 export async function POST(request: NextRequest) {
   try {
+    const rejected = requireJson(request);
+    if (rejected) return rejected;
     const body = await request.json();
     const {
       action,
@@ -14,11 +19,22 @@ export async function POST(request: NextRequest) {
       safetyPolicy,
       safetyAllowlist,
       ignoreRules,
+      capture,
       paused,
+      profileId,
     } = body;
 
     switch (action) {
       case 'create': {
+        // One dashboard session at a time: a second launch would pile up more browsers
+        const active = comparisonEngine.listActiveSessions();
+        if (active.length > 0) {
+          return NextResponse.json(
+            { success: false, error: 'A session is already active. Stop it before launching again.', sessionId: active[0].sessionId },
+            { status: 409 }
+          );
+        }
+
         if (!devUrl || !prodUrl) {
           return NextResponse.json(
             { success: false, error: 'devUrl and prodUrl are required' },
@@ -41,22 +57,50 @@ export async function POST(request: NextRequest) {
           ? safetyAllowlist.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 50)
           : [];
 
+        // Secrets are resolved server-side only; they never reach the client or the logs
+        let login;
+        let loginCredentials;
+        let profile: ReturnType<typeof profileManager.getProfile>;
+        if (typeof profileId === 'string' && profileId) {
+          profile = profileManager.getProfile(profileId);
+          if (!profile) {
+            return NextResponse.json({ success: false, error: 'Profile not found' }, { status: 404 });
+          }
+          const resolved = resolveSessionLogin(profile, devUrl, prodUrl, getDataDir());
+          if (!resolved.ok) {
+            return NextResponse.json({ success: false, error: resolved.error }, { status: 400 });
+          }
+          login = resolved.login;
+          loginCredentials = resolved.loginCredentials;
+        }
+
         const newSessionId = await comparisonEngine.startSessionWithRecorder(
           devUrl,
           prodUrl,
-          projectName || 'QA Vision Session',
-          policy,
-          allowlist,
-          Array.isArray(ignoreRules)
-            ? ignoreRules.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 100)
-            : []
+          {
+            startImmediately: false, // dashboard sessions open 'ready'; the user presses Start Comparison
+            projectName: projectName || 'QA Vision Session',
+            safetyPolicy: policy,
+            safetyAllowlist: allowlist,
+            ignoreRules: Array.isArray(ignoreRules)
+              ? ignoreRules.filter((s: unknown) => typeof s === 'string' && s.trim()).slice(0, 100)
+              : [],
+            capture: capture && typeof capture === 'object' ? capture : profile?.capture,
+            dataRules: Array.isArray(profile?.dataRules) ? profile.dataRules : undefined,
+            apiChecks: Array.isArray(profile?.apiChecks) ? profile.apiChecks : undefined,
+            dbChecks: Array.isArray(profile?.dbChecks) ? profile.dbChecks : undefined,
+            profileId: typeof profileId === 'string' ? profileId : undefined,
+            login,
+            loginCredentials,
+          }
         );
 
         return NextResponse.json({
           success: true,
           sessionId: newSessionId,
+          phase: comparisonEngine.getPhase(newSessionId) ?? 'ready',
           message:
-            'Real synchronized session started. Use only the Playwright DEV window — actions mirror to PROD.',
+            'DEV and PROD windows are ready. Log in or navigate in the DEV window, then press Start Comparison.',
         });
       }
 
@@ -78,8 +122,21 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        await comparisonEngine.setPaused(sessionId, Boolean(paused));
-        return NextResponse.json({ success: true, paused: Boolean(paused) });
+        const r = await comparisonEngine.setPaused(sessionId, Boolean(paused));
+        const status = r.ok ? 200 : r.status === 'not-found' ? 404 : 409;
+        return NextResponse.json(
+          { success: r.ok, error: r.ok ? undefined : r.message, message: r.message, paused: r.phase === 'paused', phase: r.phase },
+          { status }
+        );
+      }
+
+      case 'start': {
+        if (!sessionId) {
+          return NextResponse.json({ success: false, error: 'sessionId required' }, { status: 400 });
+        }
+        const r = await comparisonEngine.startComparison(sessionId);
+        const status = r.status === 'ok' ? 200 : r.status === 'not-found' ? 404 : 409;
+        return NextResponse.json({ ...r, success: r.ok, error: r.ok ? undefined : r.message }, { status });
       }
 
       case 'resync': {
@@ -117,9 +174,17 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const sid = request.nextUrl.searchParams.get('sessionId');
+  if (sid) {
+    const phase = comparisonEngine.getPhase(sid);
+    if (!phase) return NextResponse.json({ success: false, error: 'Unknown session' }, { status: 404 });
+    return NextResponse.json({ success: true, sessionId: sid, phase, paused: phase === 'paused' });
+  }
   return NextResponse.json({
     status: 'QA Vision Automation Engine Ready',
+    // Live sessions, so a reloaded dashboard can reconnect instead of orphaning their browsers
+    sessions: comparisonEngine.listActiveSessions(),
     capabilities: [
       'Dual browser control (Chromium)',
       'DOM-based action replication',

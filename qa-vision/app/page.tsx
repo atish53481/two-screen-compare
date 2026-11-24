@@ -1,27 +1,21 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { io as connectSocket, type Socket } from 'socket.io-client';
 import { Play, Pause, Square, RefreshCw, Download, Settings, AlertTriangle, CheckCircle, XCircle, Eye, Power, Plus, Trash2, Edit } from 'lucide-react';
 import { format } from 'date-fns';
 import type { ComparisonProfile } from '../lib/types';
+import LiveView, { type Frame, type LiveInput } from './components/LiveView';
+import Timeline from './components/Timeline';
+import FindingsPanel from './components/FindingsPanel';
+import EvidenceViewer from './components/EvidenceViewer';
+import HistoryTab from './components/HistoryTab';
+import ProfileSettings from './components/ProfileSettings';
+import { downloadReport, EXPORT_FORMATS, jsonHeaders, type ExportFormat, type Finding } from './components/types';
 
 
 
-interface Mismatch {
-  id: string;
-  timestamp: string;
-  page: string;
-  component: string;
-  type: string;
-  devValue: string;
-  prodValue: string;
-  severity: 'low' | 'medium' | 'high' | 'critical';
-  description: string;
-  aiAnalysis?: string;
-  classification?: string;
-  occurrences?: number;
-  stepIds?: string[];
-}
+type Mismatch = Finding;
 
 interface LogEntry {
   id: string;
@@ -31,6 +25,8 @@ interface LogEntry {
   prodResult: string;
   status: 'match' | 'mismatch' | 'skipped' | 'info';
 }
+
+const SESSION_HINT_KEY = 'qa-vision:sessionId';
 
 const QA_VISION = () => {
   // Dynamic Profile System
@@ -49,13 +45,33 @@ const QA_VISION = () => {
   });
 
   const [isRunning, setIsRunning] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
+  // Session phase: 'ready' (windows open, nothing compared) -> 'running' <-> 'paused'
+  const [phase, setPhase] = useState<'ready' | 'running' | 'paused'>('ready');
+  const isPaused = phase === 'paused';
+  const [isBusy, setIsBusy] = useState(false); // a session request is in flight
+  const busyRef = React.useRef(false); // synchronous guard: a double click never sends a second request
+  const reqToken = React.useRef(0); // Stop bumps it so a late start/pause response cannot change state
   const [isStopping, setIsStopping] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [mismatches, setMismatches] = useState<Mismatch[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedMismatch, setSelectedMismatch] = useState<Mismatch | null>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'profiles' | 'logs' | 'report'>('profiles');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'profiles' | 'logs' | 'history' | 'report'>('profiles');
+  const [frames, setFrames] = useState<{ dev?: Frame; prod?: Frame }>({});
+  const [outOfSync, setOutOfSync] = useState(false);
+  const [selectedStep, setSelectedStep] = useState<string | null>(null);
+  // Evidence/report source: kept after Stop so findings stay inspectable; viewRun = stored run opened read-only
+  const [evidenceSessionId, setEvidenceSessionId] = useState<string | null>(null);
+  const [viewRun, setViewRun] = useState<{ id: string; projectName: string } | null>(null);
+  const [historyKey, setHistoryKey] = useState(0);
+  const [exportNote, setExportNote] = useState('');
+  const sessionRef = React.useRef<string | null>(null);
+  const viewRunRef = React.useRef(false);
+  const socketRef = React.useRef<Socket | null>(null);
+  // Live view: DEV pane input goes to the DEV browser of this tab's own session
+  const sendLiveInput = React.useCallback((input: LiveInput) => {
+    if (sessionRef.current) socketRef.current?.emit('live-input', { sessionId: sessionRef.current, ...input });
+  }, []);
   const [status, setStatus] = useState('QA Vision Master Ready — Load or create a comparison profile');
   const [lastReportMeta, setLastReportMeta] = useState<{
     id: string;
@@ -64,43 +80,102 @@ const QA_VISION = () => {
   } | null>(null);
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
+  useEffect(() => {
+    sessionRef.current = sessionId;
+    viewRunRef.current = viewRun !== null;
+  }, [sessionId, viewRun]);
   const currentProfile = profiles.find(p => p.id === selectedProfileId) || profiles[0];
 
   // Load profiles from API + Socket.IO
   useEffect(() => {
     fetchProfiles();
 
-    // Real-time Socket.IO connection
-    let socket: any = null;
-    const initSocket = () => {
-      if (typeof window !== 'undefined' && (window as any).io) {
-        socket = (window as any).io('http://localhost:3001', {
-          path: '/socket.io',
-          reconnection: true,
-          reconnectionAttempts: 5
-        });
-
-        socket.on('connect', () => console.log('🔌 QA Vision Master connected to real-time engine'));
-        socket.on('log', (data: any) => {
-          if (data?.log) setLogs(prev => [data.log, ...prev].slice(0, 1000));
-        });
-        socket.on('mismatch', (data: any) => {
-          if (data?.mismatch) setMismatches(prev => [data.mismatch, ...prev].slice(0, 500));
-        });
-        socket.on('mismatch-update', (data: any) => {
-          const m = data?.mismatch;
-          if (m?.id) setMismatches(prev => prev.map(x => (x.id === m.id ? { ...x, ...m } : x)));
-        });
-        socket.on('sync-state', (data: any) => {
-          if (data?.outOfSync) setStatus(`⚠️ OUT OF SYNC — ${data.detail}. Use RESYNCHRONIZE BROWSERS.`);
-        });
-      }
-    };
-
-    const timer = setTimeout(initSocket, 800);
+    // Real-time Socket.IO connection (same origin as the dashboard; server.js hosts both)
+    const socket: Socket = connectSocket({ path: '/socket.io', reconnection: true, reconnectionAttempts: 5 });
+    socketRef.current = socket;
+    // Live events only feed the live session; a stored run opened read-only is never touched
+    const mine = (data: any) => !viewRunRef.current && (!sessionRef.current || data?.sessionId === sessionRef.current);
+    socket.on('log', (data: any) => {
+      if (data?.log && mine(data)) setLogs(prev => [data.log, ...prev].slice(0, 1000));
+    });
+    socket.on('mismatch', (data: any) => {
+      if (data?.mismatch && mine(data)) setMismatches(prev => [data.mismatch, ...prev].slice(0, 500));
+    });
+    socket.on('mismatch-update', (data: any) => {
+      const m = data?.mismatch;
+      if (m?.id && mine(data)) setMismatches(prev => prev.map(x => (x.id === m.id ? { ...x, ...m } : x)));
+    });
+    socket.on('sync-state', (data: any) => {
+      if (!mine(data)) return;
+      setOutOfSync(Boolean(data?.outOfSync));
+      if (data?.outOfSync) setStatus(`⚠️ OUT OF SYNC — ${data.detail}. Use RESYNCHRONIZE BROWSERS.`);
+    });
+    socket.on('status', (data: any) => {
+      if (!mine(data) || !sessionRef.current) return;
+      if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
+    });
+    socket.on('frame', (data: any) => {
+      if (!sessionRef.current || data?.sessionId !== sessionRef.current || (data.side !== 'dev' && data.side !== 'prod')) return;
+      setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || '') } }));
+    });
     return () => {
-      clearTimeout(timer);
-      if (socket) socket.disconnect();
+      socketRef.current = null;
+      socket.disconnect();
+    };
+  }, []);
+
+  // Reconnect on load: a reload must not orphan the engine session's DEV/PROD browsers.
+  // The server is the source of truth; sessionStorage only says which session this tab last owned.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/session');
+        const data = await res.json();
+        if (cancelled || !res.ok || sessionRef.current) return;
+        const live: any[] = Array.isArray(data?.sessions) ? data.sessions : [];
+        let hint: string | null = null;
+        try {
+          hint = sessionStorage.getItem(SESSION_HINT_KEY);
+        } catch {
+          /* storage unavailable */
+        }
+        const s = live.find(x => x.sessionId === hint) || live[0];
+        if (!s) {
+          try {
+            sessionStorage.removeItem(SESSION_HINT_KEY);
+          } catch {
+            /* ignore */
+          }
+          return;
+        }
+        sessionRef.current = s.sessionId; // live socket events (frames, logs) now flow into this tab
+        setSessionId(s.sessionId);
+        setEvidenceSessionId(s.sessionId);
+        setIsRunning(true);
+        setPhase(s.phase === 'paused' ? 'paused' : s.phase === 'running' ? 'running' : 'ready');
+        if (s.profileId) setSelectedProfileId(s.profileId);
+        // Live events that raced the fetch are already in state: keep them, drop duplicates by id
+        const merge = <T extends { id?: string }>(fetched: T[], current: T[]) => {
+          const seen = new Set<string>();
+          return [...current, ...fetched].filter(x => !x.id || (!seen.has(x.id) && !!seen.add(x.id)));
+        };
+        setLogs(prev => merge<LogEntry>(Array.isArray(s.logs) ? s.logs : [], prev).slice(0, 1000));
+        setMismatches(prev => merge<Mismatch>(Array.isArray(s.mismatches) ? s.mismatches : [], prev).slice(0, 500));
+        setOutOfSync(Boolean(s.outOfSync));
+        try {
+          sessionStorage.setItem(SESSION_HINT_KEY, s.sessionId);
+        } catch {
+          /* ignore */
+        }
+        setActiveTab('dashboard');
+        setStatus('Reconnected to running session');
+      } catch {
+        /* server unreachable: stay idle */
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -120,19 +195,23 @@ const QA_VISION = () => {
   };
 
   // Real synchronized session with recorder
-  const startComparison = async () => {
+  const launchSession = async () => {
     if (isRunning || isStopping || !currentProfile) return;
 
     setStatus('🚀 Launching Playwright DEV + PROD browsers and installing recorder...');
     setLogs([]);
     setMismatches([]);
     setSelectedMismatch(null);
+    setViewRun(null);
+    setFrames({});
+    setOutOfSync(false);
+    setSelectedStep(null);
     addLog('Launching real session with recorder', 'Launching', 'Launching', 'info');
 
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({
           action: 'create',
           devUrl: currentProfile.urlA,
@@ -141,6 +220,7 @@ const QA_VISION = () => {
           safetyPolicy: currentProfile.safetyPolicy || 'read-only',
           safetyAllowlist: currentProfile.safetyAllowlist || [],
           ignoreRules: currentProfile.ignoreRules || [],
+          profileId: currentProfile.id,
         }),
       });
 
@@ -148,11 +228,18 @@ const QA_VISION = () => {
 
       if (res.ok && data.success && data.sessionId) {
         setSessionId(data.sessionId);
+        sessionRef.current = data.sessionId;
+        try {
+          sessionStorage.setItem(SESSION_HINT_KEY, data.sessionId);
+        } catch {
+          /* ignore */
+        }
+        setEvidenceSessionId(data.sessionId);
         setIsRunning(true);
-        setIsPaused(false);
+        setPhase('ready');
         setMismatches([]);
         setStatus(
-          '🎤 RECORDER ACTIVE — Use only the Playwright window titled "QA Vision DEV". Actions mirror to the PROD window. Do not use normal Chrome tabs.'
+          'READY — log in or navigate in the DEV pane of Live Comparison. Nothing is compared or replicated yet. Press START COMPARISON when DEV is where you want to begin.'
         );
         setActiveTab('dashboard');
       } else {
@@ -171,44 +258,100 @@ const QA_VISION = () => {
     }
   };
 
-  const pauseComparison = async () => {
-    if (!isRunning || isStopping) return;
-    const next = !isPaused;
-    setIsPaused(next);
-    setStatus(next ? 'Paused — replication suspended' : 'Synchronized — monitoring DEV actions');
+  const postSession = async (body: Record<string, unknown>) => {
+    const res = await fetch('/api/session', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+
+  // Ready -> running: aligns PROD to DEV's current page, then compares
+  const startComparison = async () => {
+    if (!isRunning || isStopping || busyRef.current || !sessionId) return;
+    busyRef.current = true;
+    const token = ++reqToken.current;
+    setIsBusy(true);
+    setStatus('Starting: aligning PROD to the DEV page and running the first comparison…');
     try {
-      if (sessionId) {
-        await fetch('/api/session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'pause', sessionId, paused: next }),
-        });
+      const { res, data } = await postSession({ action: 'start', sessionId });
+      if (token !== reqToken.current) return; // Stop was pressed meanwhile
+      if (res.ok && data.success) {
+        setPhase(data.phase === 'paused' ? 'paused' : data.phase === 'ready' ? 'ready' : 'running');
+        setStatus('COMPARING — DEV actions are replicated to PROD and compared. Work in the DEV pane of Live Comparison.');
+      } else {
+        if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
+        setStatus(`❌ Could not start: ${data?.error || data?.message || 'HTTP ' + res.status}`);
       }
-    } catch (e) {
-      console.warn('Pause API failed', e);
+    } catch (e: any) {
+      if (token === reqToken.current) setStatus(`❌ Could not start: ${e?.message || 'network error'}`);
+    } finally {
+      if (token === reqToken.current) {
+        busyRef.current = false;
+        setIsBusy(false);
+      }
+    }
+  };
+
+  // Running -> paused, and paused -> running ("START AGAIN": resyncs PROD, then compares)
+  const pauseComparison = async () => {
+    if (!isRunning || isStopping || busyRef.current || !sessionId) return;
+    const resuming = isPaused;
+    busyRef.current = true;
+    const token = ++reqToken.current;
+    setIsBusy(true);
+    setStatus(resuming ? 'Starting again: re-aligning PROD to DEV and comparing…' : 'Pausing…');
+    try {
+      const { res, data } = await postSession({ action: 'pause', sessionId, paused: !resuming });
+      if (token !== reqToken.current) return;
+      if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
+      if (res.ok && data.success) {
+        setStatus(
+          data.phase === 'paused'
+            ? 'PAUSED — nothing is replicated or compared. Press START AGAIN to resync PROD and continue.'
+            : 'COMPARING — DEV actions are replicated to PROD and compared.'
+        );
+      } else {
+        setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${data?.error || 'HTTP ' + res.status}`);
+      }
+    } catch (e: any) {
+      if (token === reqToken.current) setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${e?.message || 'network error'}`);
+    } finally {
+      if (token === reqToken.current) {
+        busyRef.current = false;
+        setIsBusy(false);
+      }
     }
   };
 
   const stopComparison = async () => {
     if (!isRunning || isStopping) return;
 
+    reqToken.current++; // invalidate any in-flight start/pause response
+    busyRef.current = false;
+    setIsBusy(false);
     setIsStopping(true);
-    setIsPaused(false);
     setStatus('🛑 Stopping real browser sessions and cleaning up...');
 
     try {
       await fetch('/api/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'stop', sessionId })
       });
     } catch (e) {
       console.warn('Backend stop request failed (normal if in demo)');
     }
 
+    try {
+      sessionStorage.removeItem(SESSION_HINT_KEY);
+    } catch {
+      /* ignore */
+    }
     setIsRunning(false);
     setIsStopping(false);
+    setPhase('ready');
     setSessionId(null);
+    setFrames({});
+    setHistoryKey(k => k + 1);
     setStatus('✅ Session stopped. Results below are kept — click Export PDF Report for the consolidated report.');
   };
 
@@ -220,7 +363,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/session', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'resync', sessionId }),
       });
       const data = await res.json().catch(() => ({}));
@@ -253,7 +396,7 @@ const QA_VISION = () => {
       return;
     }
 
-    await startComparison();
+    await launchSession();
   };
 
   const loadProfile = (id: string) => {
@@ -269,7 +412,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/profiles', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'save', profile: currentProfile })
       });
       const data = await res.json();
@@ -286,7 +429,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/profiles', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'save', profile: newProfile })
       });
       const data = await res.json();
@@ -309,7 +452,7 @@ const QA_VISION = () => {
     try {
       await fetch('/api/profiles', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({ action: 'delete', id })
       });
       await fetchProfiles();
@@ -317,6 +460,42 @@ const QA_VISION = () => {
       setStatus('Profile deleted');
     } catch (err) {
       setStatus('Failed to delete profile');
+    }
+  };
+
+  // Duplicate: new id, name "<name> (copy)"; secrets are never copied, so the user must re-enter passwords
+  const duplicateProfile = async (id: string) => {
+    const src = profiles.find(p => p.id === id);
+    if (!src) return;
+    const { id: _id, createdAt: _c, updatedAt: _u, credentialsA, credentialsB, ...rest } = src;
+    const strip = (c?: ComparisonProfile['credentialsA']) => (c ? { username: c.username } : undefined);
+    try {
+      const res = await fetch('/api/profiles', {
+        method: 'POST',
+        headers: jsonHeaders,
+        body: JSON.stringify({ action: 'save', profile: { ...rest, name: `${src.name} (copy)`, credentialsA: strip(credentialsA), credentialsB: strip(credentialsB) } }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        await fetchProfiles();
+        setSelectedProfileId(data.profile.id);
+        setStatus(`Duplicated as "${data.profile.name}". Re-enter any passwords: secrets are not copied.`);
+      } else setStatus(`Duplicate failed: ${data.error || 'unknown error'}`);
+    } catch {
+      setStatus('Failed to duplicate profile');
+    }
+  };
+
+  const exportAs = async (fmt: ExportFormat) => {
+    const ref = viewRun || !isRunning ? { runId: viewRun?.id || evidenceSessionId || undefined } : { sessionId: sessionId || undefined };
+    if (!ref.runId && !ref.sessionId) {
+      setExportNote('Nothing to export yet: run a session or open a stored run first.');
+      return;
+    }
+    try {
+      setExportNote(`Exported ${await downloadReport(fmt, ref)}`);
+    } catch (e: any) {
+      setExportNote(`Export failed: ${e?.message || 'unknown error'}`);
     }
   };
 
@@ -341,7 +520,7 @@ const QA_VISION = () => {
     try {
       const res = await fetch('/api/report', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders,
         body: JSON.stringify({
           sessionId,
           projectName: currentProfile?.name || 'QA Vision Comparison',
@@ -439,13 +618,15 @@ const QA_VISION = () => {
         </div>
 
         <div className="flex items-center gap-3">
-          <button
-            onClick={launchEnvironments}
-            className="flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-all bg-violet-600 hover:bg-violet-500 text-white"
-          >
-            <Power className="h-4 w-4" />
-            LAUNCH ENVIRONMENTS
-          </button>
+          {!isRunning && !isStopping && (
+            <button
+              onClick={launchEnvironments}
+              className="flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-all bg-violet-600 hover:bg-violet-500 text-white"
+            >
+              <Power className="h-4 w-4" />
+              LAUNCH ENVIRONMENTS
+            </button>
+          )}
 
           <button
             onClick={() => setActiveTab('profiles')}
@@ -474,19 +655,45 @@ const QA_VISION = () => {
             <div className="space-y-3">
               {isRunning ? (
                 <>
-                  <div className="w-full py-3 px-4 bg-emerald-900/50 border border-emerald-500 rounded-2xl text-center text-emerald-400 text-sm font-medium">
-                    {isPaused ? '⏸ SESSION PAUSED' : '🔄 REAL SYNCHRONIZED SESSION ACTIVE'}
+                  <div
+                    data-testid="phase-banner"
+                    data-phase={phase}
+                    className={`w-full py-3 px-4 border rounded-2xl text-center text-sm font-medium ${
+                      phase === 'ready'
+                        ? 'bg-sky-900/40 border-sky-500 text-sky-300'
+                        : phase === 'paused'
+                          ? 'bg-amber-900/40 border-amber-500 text-amber-300'
+                          : 'bg-emerald-900/50 border-emerald-500 text-emerald-400'
+                    }`}
+                  >
+                    {phase === 'ready'
+                      ? 'READY — log in or navigate, then press Start'
+                      : phase === 'paused'
+                        ? '⏸ PAUSED — nothing is compared'
+                        : '🔄 COMPARING — DEV actions mirror to PROD'}
                   </div>
                   <div className="grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={pauseComparison}
-                      disabled={isStopping}
-                      className={`flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isPaused ? 'bg-amber-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}
-                    >
-                      {isPaused ? <Play className="h-5 w-5" /> : <Pause className="h-5 w-5" />}
-                      {isPaused ? 'RESUME' : 'PAUSE'}
-                    </button>
+                    {phase === 'running' ? (
+                      <button
+                        type="button"
+                        onClick={pauseComparison}
+                        disabled={isStopping || isBusy}
+                        className="flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-zinc-800 hover:bg-zinc-700"
+                      >
+                        <Pause className="h-5 w-5" />
+                        ⏸ PAUSE
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={phase === 'ready' ? startComparison : pauseComparison}
+                        disabled={isStopping || isBusy}
+                        className="flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-emerald-600 hover:bg-emerald-500 text-white"
+                      >
+                        <Play className="h-5 w-5" />
+                        {isBusy ? 'STARTING…' : phase === 'ready' ? '▶ START COMPARISON' : '▶ START AGAIN'}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={stopComparison}
@@ -494,18 +701,20 @@ const QA_VISION = () => {
                       className="flex items-center justify-center gap-2 bg-red-600 hover:bg-red-500 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Square className="h-5 w-5" />
-                      {isStopping ? 'STOPPING…' : 'STOP'}
+                      {isStopping ? 'STOPPING…' : '■ STOP'}
                     </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={resync}
-                    disabled={isStopping || isPaused || isResyncing}
-                    className="w-full flex items-center justify-center gap-2 border border-zinc-700 hover:bg-zinc-800 py-3.5 rounded-2xl text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                    {isResyncing ? 'RESYNCHRONIZING…' : 'RESYNCHRONIZE BROWSERS'}
-                  </button>
+                  {phase === 'running' && (
+                    <button
+                      type="button"
+                      onClick={resync}
+                      disabled={isStopping || isBusy || isResyncing}
+                      className="w-full flex items-center justify-center gap-2 border border-zinc-700 hover:bg-zinc-800 py-3.5 rounded-2xl text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {isResyncing ? 'RESYNCHRONIZING…' : 'Resync'}
+                    </button>
+                  )}
                 </>
               ) : (
                 <div className="w-full py-4 px-6 bg-zinc-800/60 border border-zinc-700 rounded-2xl text-center text-zinc-400 text-sm font-medium">
@@ -538,7 +747,12 @@ const QA_VISION = () => {
               </div>
 
               <div className="mt-8 pt-6 border-t border-zinc-800 text-center">
-                {isRunning && !isPaused ? (
+                {isRunning && phase === 'ready' ? (
+                  <div className="inline-flex items-center gap-2 px-6 py-2 rounded-2xl text-sm font-medium bg-sky-500/10 text-sky-300">
+                    <div className="h-2 w-2 bg-sky-400 rounded-full"></div>
+                    READY — NOT COMPARING
+                  </div>
+                ) : isRunning && !isPaused ? (
                   <div className="inline-flex items-center gap-2 px-6 py-2 rounded-2xl text-sm font-medium bg-emerald-500/10 text-emerald-400">
                     <div className="h-2 w-2 bg-emerald-400 rounded-full animate-pulse"></div>
                     LIVE SYNCHRONIZED (DEV → PROD)
@@ -591,6 +805,7 @@ const QA_VISION = () => {
                 { id: 'profiles', label: 'Profiles' },
                 { id: 'dashboard', label: 'Live Comparison' },
                 { id: 'logs', label: 'Execution Log' },
+                { id: 'history', label: 'History' },
                 { id: 'report', label: 'Reports' },
               ].map((tab) => (
                 <button
@@ -610,133 +825,42 @@ const QA_VISION = () => {
 
           {/* Live Dashboard View */}
           {activeTab === 'dashboard' && (
-            <div className="flex-1 flex flex-col p-8 overflow-hidden">
-              <div className="flex-1 grid grid-cols-2 gap-6 min-h-0">
-                {/* DEV Browser Window */}
-                <div className="flex flex-col border border-zinc-700 rounded-3xl overflow-hidden bg-zinc-950">
-                  <div className="bg-zinc-900 px-6 py-3 flex items-center justify-between border-b border-zinc-800">
-                    <div className="flex items-center gap-3">
-                      <div className="text-emerald-400">
-                        <span className="font-mono text-xs">DEV</span>
-                      </div>
-                      <div className="text-xs text-zinc-400 font-mono truncate max-w-[260px]">{currentProfile?.urlA || 'http://localhost:3002'}</div>
-                    </div>
-                    <div className="text-[10px] px-3 py-0.5 bg-emerald-900/60 text-emerald-400 rounded">PRIMARY REFERENCE</div>
-                  </div>
-
-                  <div className="flex-1 bg-zinc-950 flex items-center justify-center relative">
-                    <div className="text-center">
-                      <div className="mx-auto w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-500 to-cyan-400 flex items-center justify-center mb-6">
-                        <Eye className="h-8 w-8 text-white" />
-                      </div>
-                      <div className="text-zinc-400 text-sm">DEV Environment</div>
-                      <div className="text-xs text-emerald-400 mt-1 font-mono">DEV is the Master Control Environment</div>
-                      {isRunning && <div className="mt-8 text-emerald-400 text-xs flex items-center gap-2 justify-center">
-                        <div className="h-1.5 w-1.5 bg-current rounded-full animate-ping"></div>
-                        REAL SYNC ACTIVE — Actions performed here are replicated in PRODUCTION
-                      </div>}
-                    </div>
-
-                    {/* Simulated overlay hint */}
-                    {isRunning && (
-                      <div className="absolute bottom-8 left-8 bg-black/80 text-[10px] px-4 py-2 rounded-2xl border border-emerald-500/30 font-mono">
-                        Click anywhere in this window → replicated in PRODUCTION
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="bg-zinc-900 px-6 py-4 text-xs text-zinc-400 flex items-center justify-between font-mono border-t border-zinc-800">
-                    <div>Current URL: /dashboard</div>
-                    <div className={isRunning && !isPaused ? 'text-emerald-400' : 'text-zinc-500'}>
-                      {isRunning && !isPaused ? 'Synced ✓' : isPaused ? 'Paused' : 'Idle'}
-                    </div>
-                  </div>
+            <div className="flex-1 flex flex-col gap-4 p-6 overflow-auto">
+              {viewRun && (
+                <div data-testid="readonly-banner" className="flex items-center justify-between rounded-xl border border-amber-700/50 bg-amber-950/30 px-4 py-2 text-sm text-amber-200">
+                  <span>Stored run &quot;{viewRun.projectName}&quot; (read-only)</span>
+                  <button type="button" onClick={() => { setViewRun(null); setMismatches([]); setLogs([]); setSelectedMismatch(null); setEvidenceSessionId(sessionId); }} className="underline">Close run</button>
                 </div>
-
-                {/* PRODUCTION Browser Window */}
-                <div className="flex flex-col border border-zinc-700 rounded-3xl overflow-hidden bg-zinc-950">
-                  <div className="bg-zinc-900 px-6 py-3 flex items-center justify-between border-b border-zinc-800">
-                    <div className="flex items-center gap-3">
-                      <div className="text-rose-400">
-                        <span className="font-mono text-xs">PROD</span>
-                      </div>
-                      <div className="text-xs text-zinc-400 font-mono truncate max-w-[260px]">{currentProfile?.urlB || 'http://localhost:3003'}</div>
-                    </div>
-                  </div>
-
-                  <div className="flex-1 bg-zinc-950 flex items-center justify-center relative">
-                    <div className="text-center">
-                      <div className="mx-auto w-16 h-16 rounded-2xl bg-gradient-to-br from-rose-500 to-orange-400 flex items-center justify-center mb-6">
-                        <Eye className="h-8 w-8 text-white" />
-                      </div>
-                      <div className="text-zinc-400 text-sm">PRODUCTION Environment</div>
-                      <div className="text-xs text-rose-400 mt-1 font-mono">PRODUCTION — Mirrored from DEV in real-time</div>
-                    </div>
-                  </div>
-
-                  <div className="bg-zinc-900 px-6 py-4 text-xs text-zinc-400 flex items-center justify-between font-mono border-t border-zinc-800">
-                    <div>Current URL: /dashboard</div>
-                    <div className={isRunning && !isPaused ? 'text-emerald-400' : 'text-zinc-500'}>
-                      {isRunning && !isPaused ? 'Synced ✓' : isPaused ? 'Paused' : 'Idle'}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Real-time Mismatches Panel */}
-              <div className="mt-8">
-                <div className="flex items-center justify-between mb-4 px-1">
-                  <div className="flex items-center gap-3">
-                    <AlertTriangle className="h-5 w-5 text-amber-400" />
-                    <h3 className="font-semibold text-lg">Detected Differences (Live)</h3>
-                  </div>
-                  <div className="text-xs text-zinc-400 font-mono">
-                    {mismatches.filter(m => m.severity === 'high' || m.severity === 'critical').length} high-severity • {mismatches.filter(m => m.severity === 'medium').length} medium
-                  </div>
-                </div>
-
-                <div className="bg-zinc-900 rounded-3xl border border-zinc-800 overflow-hidden">
-                  <table className="w-full">
-                    <thead>
-                      <tr className="border-b border-zinc-800 text-left text-xs text-zinc-400">
-                        <th className="py-4 px-8 font-normal">PAGE</th>
-                        <th className="py-4 px-6 font-normal">COMPONENT</th>
-                        <th className="py-4 px-6 font-normal">TYPE</th>
-                        <th className="py-4 px-6 font-normal">DEV</th>
-                        <th className="py-4 px-6 font-normal">PROD</th>
-                        <th className="py-4 px-6 font-normal">SEVERITY</th>
-                        <th className="py-4 px-6 font-normal w-8"></th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-zinc-800 text-sm">
-                      {mismatches.map((mismatch) => (
-                        <tr 
-                          key={mismatch.id}
-                          onClick={() => setSelectedMismatch(mismatch)}
-                          className="hover:bg-zinc-800/70 cursor-pointer transition-colors group"
-                        >
-                          <td className="py-5 px-8 font-mono text-xs text-zinc-400">{mismatch.page}</td>
-                          <td className="py-5 px-6 font-medium">{mismatch.component}</td>
-                          <td className="py-5 px-6">
-                            <span className="inline-block px-3 py-1 text-xs rounded-full bg-zinc-800 text-zinc-400">{mismatch.type}</span>
-                          </td>
-                          <td className="py-5 px-6 font-mono text-emerald-400">{mismatch.devValue}</td>
-                          <td className="py-5 px-6 font-mono text-rose-400">{mismatch.prodValue}</td>
-                          <td className="py-5 px-6">
-                            <span className={`inline-block px-4 py-1 text-xs font-medium rounded-2xl ${severityColor(mismatch.severity)}`}>
-                              {mismatch.severity.toUpperCase()}
-                            </span>
-                          </td>
-                          <td className="py-5 px-6 opacity-0 group-hover:opacity-100">
-                            <Eye className="h-4 w-4 text-zinc-400" />
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
+              )}
+              {!viewRun && (
+                <LiveView
+                  labelA={currentProfile?.labelA || 'DEV'}
+                  labelB={currentProfile?.labelB || 'PROD'}
+                  frames={frames}
+                  isRunning={isRunning}
+                  isPaused={isPaused}
+                  outOfSync={outOfSync}
+                  onInput={sendLiveInput}
+                />
+              )}
+              <Timeline logs={logs} findings={mismatches} selectedStep={selectedStep} onSelectStep={setSelectedStep} />
+              <FindingsPanel findings={mismatches} selectedId={selectedMismatch?.id || null} stepFilter={selectedStep} onSelect={setSelectedMismatch} />
             </div>
+          )}
+
+          {activeTab === 'history' && (
+            <HistoryTab
+              refreshKey={historyKey}
+              onOpen={(run) => {
+                setViewRun({ id: run.id, projectName: run.projectName });
+                setEvidenceSessionId(run.id);
+                setMismatches(run.mismatches);
+                setLogs(run.logs);
+                setSelectedMismatch(null);
+                setSelectedStep(null);
+                setActiveTab('dashboard');
+              }}
+            />
           )}
 
           {/* Profiles Tab - Dynamic UI (Main Feature) */}
@@ -790,7 +914,7 @@ const QA_VISION = () => {
                       >
                         <div className="flex items-start justify-between gap-4">
                           <div>
-                            <div className="text-xl font-semibold">{profile.name}</div>
+                            <div data-testid="profile-name" className="text-xl font-semibold">{profile.name}</div>
                             <div className="text-sm text-zinc-400 mt-1">
                               {profile.labelA} → {profile.labelB} · Safety: {profile.safetyPolicy}
                             </div>
@@ -814,6 +938,14 @@ const QA_VISION = () => {
                               }`}
                             >
                               {isSelected ? 'Selected' : 'Select'}
+                            </button>
+                            <button
+                              type="button"
+                              data-testid="profile-duplicate"
+                              onClick={() => duplicateProfile(profile.id)}
+                              className="px-4 py-2 rounded-xl text-sm bg-zinc-800 hover:bg-zinc-700"
+                            >
+                              Duplicate
                             </button>
                             {profile.id !== 'default' && (
                               <button
@@ -998,6 +1130,13 @@ const QA_VISION = () => {
                       </p>
                     </div>
 
+                    <ProfileSettings
+                      profile={currentProfile}
+                      onChange={(patch) =>
+                        setProfiles((prev) => prev.map((p) => (p.id === currentProfile.id ? { ...p, ...patch } : p)))
+                      }
+                    />
+
                     <div className="flex flex-col sm:flex-row gap-3 pt-2">
                       <button
                         type="button"
@@ -1181,6 +1320,21 @@ const QA_VISION = () => {
                   {isGeneratingReport ? 'GENERATING PDF…' : 'DOWNLOAD PDF WITH ACTUAL DIFFERENCES'}
                 </button>
 
+                <div className="mt-6 grid grid-cols-5 gap-2" data-testid="export-buttons">
+                  {EXPORT_FORMATS.map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      data-testid={`export-${f}`}
+                      onClick={() => void exportAs(f)}
+                      className="py-3 rounded-2xl bg-zinc-800 hover:bg-zinc-700 text-sm font-medium uppercase"
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+                {exportNote && <div data-testid="export-note" className="mt-3 text-center text-xs text-zinc-400">{exportNote}</div>}
+
                 <p className="text-center text-xs text-zinc-500 mt-8">
                   The PDF opens in a new tab and downloads. It includes summary, each difference
                   (DEV vs PROD), severity, and visual DIFF images when the session recorded them.
@@ -1190,35 +1344,18 @@ const QA_VISION = () => {
           )}
         </div>
 
-        {/* Detail Sidebar */}
-        {selectedMismatch && (
-          <div className="w-96 border-l border-zinc-700 bg-zinc-900 p-8 overflow-auto">
-            <button onClick={() => setSelectedMismatch(null)} className="float-right text-zinc-400 hover:text-white">✕</button>
-
-            <div className="uppercase tracking-[2px] text-xs text-rose-400 mb-2">MISMATCH DETAIL</div>
-            <h3 className="text-2xl font-semibold leading-tight mb-6">{selectedMismatch.component}</h3>
-
-            <div className="space-y-8">
-              <div>
-                <div className="text-xs text-zinc-400 mb-3">AI ROOT CAUSE ANALYSIS</div>
-                <div className="bg-zinc-950 p-6 rounded-3xl text-sm leading-relaxed border border-zinc-800">
-                  {selectedMismatch.aiAnalysis}
-                </div>
-              </div>
-
-              <div>
-                <div className="text-xs text-zinc-400 mb-4">VISUAL EVIDENCE</div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="aspect-video bg-zinc-800 rounded-2xl flex items-center justify-center text-xs text-zinc-500 border border-dashed">DEV Screenshot</div>
-                  <div className="aspect-video bg-zinc-800 rounded-2xl flex items-center justify-center text-xs text-zinc-500 border border-dashed">PROD Screenshot</div>
-                </div>
-              </div>
-
-              <div className="pt-4">
-                <button className="w-full py-4 bg-white text-black rounded-2xl font-medium">HIGHLIGHT IN BOTH BROWSERS</button>
-              </div>
-            </div>
-          </div>
+        {/* Evidence viewer */}
+        {selectedMismatch && activeTab === 'dashboard' && evidenceSessionId && (
+          <EvidenceViewer
+            key={selectedMismatch.id}
+            finding={selectedMismatch}
+            target={{ evidenceId: viewRun?.id || evidenceSessionId, live: !viewRun && isRunning && sessionId === evidenceSessionId }}
+            onUpdate={(f) => {
+              setSelectedMismatch(f);
+              setMismatches(prev => prev.map(x => (x.id === f.id ? { ...x, ...f } : x)));
+            }}
+            onClose={() => setSelectedMismatch(null)}
+          />
         )}
       </div>
     </div>

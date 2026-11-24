@@ -1,5 +1,6 @@
 // Synchronization & findings: ordered queue (no skipped comparisons), de-duplication,
 // out-of-sync detection + resync, Stop draining in-flight work, ignore rules.
+const { openStore } = require('../../engine-dist/engine/store.js');
 const { engine, DEV_URL, PROD_URL, SAMPLE_EMAIL, SAMPLE_PASSWORD, idle, waitForLoginForm, runSuite } = require('./helpers');
 
 const compareLogs = (s) => s.logs.filter((l) => l.action.startsWith('Compared after'));
@@ -19,7 +20,7 @@ const replayedSteps = (logs) => logs.map((l) => (l.action.match(/^\[(step-\d+)\]
 
 runSuite('Synchronization & findings', async ({ check }) => {
   // ---------- Session A: no ignore rules ----------
-  const a = await engine.createSession(DEV_URL, PROD_URL, 'sync-A');
+  const a = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-A' });
   const A = engine.getSession(a);
   await waitForLoginForm(A);
   await idle(A);
@@ -52,7 +53,7 @@ runSuite('Synchronization & findings', async ({ check }) => {
     await A.devPage.click('h1');
     await idle(A);
   }
-  const fps = A.mismatches.map((m) => [m.page, m.type, m.component, m.devValue, m.prodValue].join('|'));
+  const fps = A.mismatches.map((m) => [m.page, m.type, m.component, m.property, m.devValue, m.prodValue].join('|'));
   const dupes = fps.length - new Set(fps).size;
   const repeated = A.mismatches.find((m) => (m.occurrences || 1) > 1);
   check('no duplicate findings after repeated actions', dupes === 0, `findings ${before} -> ${A.mismatches.length}`);
@@ -76,9 +77,11 @@ runSuite('Synchronization & findings', async ({ check }) => {
   const lastStep = replayedSteps(snap.logs)[0];
   check('Stop waits for the last action and its comparison', !!lastStep && coveredSteps(snap.logs).has(lastStep), `last=${lastStep}`);
   check('Stop is logged in the archived run', snap.logs.some((l) => l.action === 'Session stopped by user'));
+  const stored = openStore().getRun(a);
+  check('stopped session is persisted to run history', !!stored && !!stored.endedAt && stored.logs.length === snap.logs.length, stored ? `logs=${stored.logs.length}` : 'missing');
 
   // ---------- Session B: ignore rules ----------
-  const b = await engine.createSession(DEV_URL, PROD_URL, 'sync-B', 'read-only', [], ['numbers', 'text:environment']);
+  const b = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-B', ignoreRules: ['numbers', 'text:environment'] });
   const B = engine.getSession(b);
   await waitForLoginForm(B);
   await idle(B);
@@ -91,4 +94,15 @@ runSuite('Synchronization & findings', async ({ check }) => {
   check('numbers rule suppresses number-only differences', !numberOnlyB);
   check('suppressions are logged, not silent', B.logs.some((l) => /suppressed by ignore rules/.test(l.action)));
   await engine.closeSession(b);
+
+  // ---------- Session C: closing the DEV window still records the run ----------
+  const c = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'sync-C' });
+  const C = engine.getSession(c);
+  await waitForLoginForm(C);
+  await C.devBrowser.close();
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline && !openStore().getRun(c)) await new Promise((r) => setTimeout(r, 200));
+  const closedRun = openStore().getRun(c);
+  check('closing the DEV browser persists the run row', !!closedRun && closedRun.projectName === 'sync-C' && !!closedRun.endedAt);
+  await engine.closeSession(c);
 });

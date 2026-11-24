@@ -2,7 +2,7 @@
 const { engine, DEV_URL, PROD_URL, sleep, idle, waitForLoginForm, runSuite } = require('./helpers');
 
 runSuite('Allowlist', async ({ check }) => {
-  const id = await engine.createSession(DEV_URL, PROD_URL, 'allowlist-e2e', 'read-only', ['refresh data']);
+  const id = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'allowlist-e2e', safetyPolicy: 'read-only', safetyAllowlist: ['refresh data'] });
   const s = engine.getSession(id);
   await waitForLoginForm(s);
 

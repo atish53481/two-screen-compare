@@ -1,0 +1,149 @@
+import type { Finding } from '../types';
+import type { SessionSnapshot } from '../../playwright';
+import { redactSecrets } from '../runtime-diff';
+
+export interface ReportModel {
+  meta: { projectName: string; devUrl: string; prodUrl: string; runId: string; startedAt: string; endedAt: string; generatedAt: string };
+  summary: {
+    pagesTested: number;
+    interactions: number;
+    comparisons: number;
+    totalFindings: number;
+    bySeverity: Record<string, number>;
+    byType: Record<string, number>;
+    byClassification: Record<string, number>;
+    expected: number;
+    replayIssues: number;
+    skippedUnsafe: number;
+  };
+  timeline: Array<{ stepId: string; action: string; devResult: string; prodResult: string; status: string; findingIds: string[] }>;
+  /** Skipped-action log lines not already represented by a SKIPPED_BY_SAFETY_POLICY finding. */
+  skippedActions: Array<{ action: string; findingId?: string }>;
+  findings: Finding[];
+}
+
+const baseName = (p: unknown): string | undefined =>
+  typeof p === 'string' && p ? (p.split(/[\\/]/).pop() as string) : undefined;
+
+const tally = (values: string[]): Record<string, number> => {
+  const out: Record<string, number> = {};
+  for (const v of values) out[v] = (out[v] || 0) + 1;
+  return out;
+};
+
+/** Strips userinfo, query and fragment from a URL; non-URLs are redacted as text. */
+export function sanitizeUrl(u: unknown): string {
+  const raw = String(u ?? '');
+  try {
+    const x = new URL(raw);
+    return `${x.origin}${x.pathname}`;
+  } catch {
+    return redactSecrets(raw);
+  }
+}
+
+const pathOf = (u: string): string => {
+  try {
+    return new URL(u).pathname || '/';
+  } catch {
+    return u;
+  }
+};
+
+function redactAi(ai: any) {
+  if (!ai) return ai;
+  const arr = (v: unknown) => (Array.isArray(v) ? v.map((x) => redactSecrets(String(x))) : v);
+  return {
+    ...ai,
+    explanation: redactSecrets(ai.explanation),
+    observedFacts: arr(ai.observedFacts),
+    hypotheses: arr(ai.hypotheses),
+    suggestedInvestigation: arr(ai.suggestedInvestigation),
+    additionalTests: arr(ai.additionalTests),
+    ...(ai.error ? { error: redactSecrets(ai.error) } : {}),
+  };
+}
+
+/** Screenshot references are reduced to file names so no server path can reach an export. */
+function sanitizeFinding(f: any): Finding {
+  const out = { ...f };
+  for (const k of ['devScreenshotPath', 'prodScreenshotPath', 'diffScreenshotPath']) {
+    if (k in out) {
+      const b = baseName(out[k]);
+      if (b) out[k] = b;
+      else delete out[k];
+    }
+  }
+  if (out.ai) out.ai = redactAi(out.ai);
+  return out as Finding;
+}
+
+export function buildReportModel(snap: SessionSnapshot): ReportModel {
+  const findings: Finding[] = (snap.mismatches || []).map(sanitizeFinding);
+  // Engine logs are newest-first; reports read chronologically.
+  const logs = [...(snap.logs || [])].sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+  const count = (c: string) => findings.filter((f) => f.classification === c).length;
+  // Pages actually visited: PROD navigations/resyncs the engine logged, plus pages that produced findings.
+  const pages = new Set<string>();
+  for (const l of logs) {
+    const m = /(?:Navigated PROD to|PROD navigated to|PROD aligned to) (\S+?)\.?(?:\s|$)/.exec(String(l.action));
+    if (m) pages.add(pathOf(m[1]));
+  }
+  for (const f of findings) if (f.page) pages.add(pathOf(f.page));
+  const skippedFindings = findings.filter((f) => f.classification === 'SKIPPED_BY_SAFETY_POLICY');
+  // Every skipped/blocked log is listed. It links to a skipped finding only by a stable key: the [step-N] id, or an
+  // exact request signature (method + path). Text containment is deliberately not used (generic values would hide logs).
+  const requestSig = (text: string): string => {
+    const m = /\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)/.exec(text);
+    return m ? `${m[1]} ${pathOf(m[2])}` : '';
+  };
+  const skippedActions = logs
+    .filter((l) => l.status === 'skipped' || l.prodResult === 'Blocked')
+    .map((l) => {
+      const action = String(l.action ?? '');
+      const stepId = /\[(step-\d+)\]/.exec(action)?.[1];
+      const sig = requestSig(action);
+      const linked = skippedFindings.find(
+        (f) => (stepId && f.stepIds?.includes(stepId)) || (sig && requestSig(String(f.component)) === sig)
+      );
+      return { action: redactSecrets(action), ...(linked ? { findingId: linked.id } : {}) };
+    });
+  const comparisons = logs.filter((l) => String(l.action).startsWith('Compared after')).length;
+
+  return {
+    meta: {
+      projectName: snap.projectName,
+      devUrl: sanitizeUrl(snap.devUrl),
+      prodUrl: sanitizeUrl(snap.prodUrl),
+      runId: snap.id,
+      startedAt: snap.startedAt,
+      endedAt: snap.endedAt || '',
+      generatedAt: new Date().toISOString(),
+    },
+    summary: {
+      pagesTested: pages.size || (comparisons ? 1 : 0),
+      interactions: logs.filter((l) => /^\[step-\d+\] Replicating/.test(String(l.action))).length,
+      comparisons,
+      totalFindings: findings.length,
+      bySeverity: tally(findings.map((f) => f.severity)),
+      byType: tally(findings.map((f) => f.type)),
+      byClassification: tally(findings.map((f) => f.classification)),
+      expected: count('EXPECTED_DIFFERENCE'),
+      replayIssues: count('REPLAY_FAILURE'),
+      skippedUnsafe: skippedFindings.length + skippedActions.filter((a) => !a.findingId).length,
+    },
+    timeline: logs.map((l) => {
+      const stepId = /\[(step-\d+)\]/.exec(String(l.action))?.[1] ?? '';
+      return {
+        stepId,
+        action: redactSecrets(String(l.action ?? '')),
+        devResult: redactSecrets(String(l.devResult ?? '')),
+        prodResult: redactSecrets(String(l.prodResult ?? '')),
+        status: String(l.status ?? ''),
+        findingIds: stepId ? findings.filter((f) => f.stepIds?.includes(stepId)).map((f) => f.id) : [],
+      };
+    }),
+    skippedActions,
+    findings,
+  };
+}

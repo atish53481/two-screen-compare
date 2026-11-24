@@ -2,9 +2,9 @@
 
 Compare two environments of the same web application (typically **DEV** vs **PROD**) by using one and watching the other follow.
 
-You click and type in a DEV browser window. QA Vision captures each action, finds the equivalent element in PROD, replays it there **safely**, and compares both screens after every step. Differences are streamed to a dashboard and collected into a PDF report.
+You click and type in a DEV browser window. QA Vision captures each action, finds the equivalent element in PROD, replays it there **safely**, and compares both screens after every step. Differences are streamed to a dashboard, stored in a run history, and exported as HTML, PDF, Excel, CSV or JSON reports.
 
-> **Status: working core, not feature-complete.** See [What works today](#what-works-today) and [Known limitations](#known-limitations) before relying on it. The full target specification is in [`QA_Vision_Dynamic_Two_App_Comparison_Grok.md`](QA_Vision_Dynamic_Two_App_Comparison_Grok.md) and [`Master Prompt AI-Powered DEV vs PRO.md`](Master%20Prompt%20AI-Powered%20DEV%20vs%20PRO.md).
+> **Status: full-spec implementation with the documented gaps.** See [What works today](#what-works-today) and [Known limitations](#known-limitations) before relying on it. The full target specification is in [`QA_Vision_Dynamic_Two_App_Comparison_Grok.md`](QA_Vision_Dynamic_Two_App_Comparison_Grok.md) and [`Master Prompt AI-Powered DEV vs PRO.md`](Master%20Prompt%20AI-Powered%20DEV%20vs%20PRO.md).
 
 ---
 
@@ -15,6 +15,7 @@ You click and type in a DEV browser window. QA Vision captures each action, find
 - [What works today](#what-works-today)
 - [PROD safety](#prod-safety)
 - [Ignore rules](#ignore-rules)
+- [Configuration (environment variables)](#configuration-environment-variables)
 - [Tests](#tests)
 - [Project structure](#project-structure)
 - [Development notes](#development-notes)
@@ -24,7 +25,7 @@ You click and type in a DEV browser window. QA Vision captures each action, find
 
 ## Quick start
 
-**Requirements:** Node.js 20+ and npm. Windows, macOS or Linux.
+**Requirements:** Node.js 22.13+ (the store uses the built-in `node:sqlite`) and npm. Windows, macOS or Linux.
 
 ```bash
 git clone https://github.com/atish53481/two-screen-compare.git
@@ -45,6 +46,8 @@ Start everything:
 | Sample PROD app (port 3003) | `Start PROD.bat` | `cd sample-prod && npm run dev` |
 
 Then open **http://localhost:3001**.
+
+> The dashboard is unauthenticated and intended for localhost use only. Set `QA_VISION_HOST` only on a trusted network.
 
 > Use `npm run start:real` (custom server with Socket.IO), not `npm run dev`. Without it, the dashboard gets no live updates.
 
@@ -67,23 +70,39 @@ The sample apps are optional **test fixtures** with deliberate differences (bann
 
 ## What works today
 
-| Area | Status |
-|---|---|
-| Runtime-configurable DEV/PROD URL pairs, saved profiles | ✅ |
-| Two isolated Playwright browsers, DEV action recorder | ✅ click, input, change, select, back/forward |
-| Element matching on PROD | ✅ test id → id → role + name → label → name → placeholder → aria-label → input type. Used **only when exactly one element matches**; ambiguous or missing matches are reported, never guessed |
-| PROD safety (read-only default, network write guard, allowlist) | ✅ [details](#prod-safety) |
-| Ordered replay queue; every step covered by a comparison | ✅ |
-| Text comparison + pixel diff (pixelmatch) + side-by-side evidence (sharp) | ✅ |
-| Finding de-duplication with occurrence counts and step references | ✅ |
-| Ignore rules (normalize / exclude), suppression counts logged | ✅ [details](#ignore-rules) |
-| Out-of-sync detection, real Resync, closed-window detection | ✅ |
-| Live log + findings over Socket.IO | ✅ |
-| PDF report from the full server-side run | ✅ |
-| Password / secret-field redaction in all evidence | ✅ |
-| Unit + end-to-end tests | ✅ [details](#tests) |
+Each row names the test that proves it. Paths are relative to `qa-vision/`. "Implemented, not verified in CI" means the code and its mocked unit tests exist, but it was never exercised against the real service.
 
-Every finding has a `classification`: `UNMAPPED_OR_MISSING_FEATURE`, `REPLAY_FAILURE`, `SKIPPED_BY_SAFETY_POLICY` or `NOT_COMPARABLE`. Content differences carry no classification yet.
+| Area | Status | Proven by |
+|---|---|---|
+| Runtime-configurable DEV/PROD URL pairs, saved profiles, duplicate | ✅ | `tests/ui/dashboard.ui.js` (profile duplicate), `tests/unit/store.test.js` |
+| Two isolated Playwright browsers, DEV action recorder (click, input, change, select, back/forward) | ✅ | `tests/e2e/sync.e2e.js` |
+| Double-click, hover and keyboard capture and replay | ✅ | `tests/e2e/actions.e2e.js` |
+| Element matching on PROD (test id, id, role + name, label, name, placeholder, aria-label, input type); only when exactly one element matches, never guessed | ✅ | `tests/e2e/safety.e2e.js` |
+| PROD safety (read-only default, network write guard, allowlist) | ✅ [details](#prod-safety) | `tests/e2e/safety.e2e.js`, `tests/e2e/allowlist.e2e.js` |
+| Ordered replay queue; every step covered by a comparison; out-of-sync + Resync; Stop draining | ✅ | `tests/e2e/sync.e2e.js` |
+| Launch → Start Comparison → Pause / Start again → Stop flow: Launch opens DEV + PROD in a Ready phase (nothing replicated or compared, live frames and PROD guard active); Start syncs PROD to DEV's page and compares; Start again resyncs; Stop works from any phase | ✅ | `tests/e2e/start-flow.e2e.js`, `tests/ui/dashboard.ui.js` (button flow, `start` route 404/409) |
+| Configurable capture: viewport, thresholds, masking, scope | ✅ | `tests/unit/capture-settings.test.js`, `tests/e2e/capture.e2e.js` |
+| Structured in-page snapshot extraction (with sensitive-field redaction) | ✅ | `tests/e2e/extract.e2e.js` |
+| DOM structure and form-constraint diff | ✅ | `tests/unit/dom-diff.test.js`, `tests/e2e/comparisons.e2e.js` |
+| Computed CSS and layout diff | ✅ | `tests/unit/css-diff.test.js`, `tests/e2e/comparisons.e2e.js` |
+| Accessibility checks | ✅ | `tests/unit/a11y-diff.test.js`, `tests/e2e/comparisons.e2e.js` |
+| Configurable data rules (numeric tolerance, date/currency, null = empty, table diff) | ✅ | `tests/unit/data-rules.test.js`, `tests/e2e/comparisons.e2e.js` |
+| Network/API and console/page-error comparison (secrets redacted) | ✅ | `tests/unit/runtime-diff.test.js`, `tests/e2e/comparisons.e2e.js` |
+| Text comparison + pixel diff + side-by-side evidence; de-duplication with occurrence counts | ✅ | `tests/e2e/sync.e2e.js` |
+| Ignore rules (normalize / exclude), suppression counts logged | ✅ [details](#ignore-rules) | `tests/unit/engine-utils.test.js`, `tests/e2e/sync.e2e.js` |
+| Finding classification, confidence, provenance, stable fingerprints | ✅ | `tests/unit/findings.test.js` |
+| Mark expected differences (persisted per profile); highlight a finding's element in both browsers | ✅ | `tests/e2e/expected-highlight.e2e.js`, `tests/ui/dashboard.ui.js` |
+| Encrypted secret store and profile auto-login, bound to the profile's origins | ✅ | `tests/unit/secrets.test.js`, `tests/unit/login-origin.test.js`, `tests/e2e/login.e2e.js` |
+| SQLite store: profiles, run history, findings, expectations, secrets; legacy JSON migration | ✅ | `tests/unit/store.test.js` |
+| Reports: HTML, JSON, Excel, CSV and PDF (summary, severity breakdown, evidence, redacted URLs and log text) | ✅ | `tests/unit/reports.test.js`, `tests/unit/reports-hardening.test.js`, `tests/ui/dashboard.ui.js` (HTML export) |
+| Dashboard: live mirror view, timeline, finding filters, evidence viewer, history tab, profile settings | ✅ | `tests/ui/dashboard.ui.js` |
+| Evidence route rejects path traversal; saved passwords never returned by the API | ✅ | `tests/ui/dashboard.ui.js` |
+| API endpoint checks (GET-only, JSON path assertions) | ✅ | `tests/unit/data-sources.test.js`, `tests/unit/data-sources-wiring.test.js` |
+| Read-only SQL guard for database checks | ✅ | `tests/unit/data-sources.test.js` |
+| PostgreSQL read-only database comparison | **Implemented, not verified in CI.** Unit tests use an injected fake client; no QA_TEST_PG_URL was available, so nothing ran against a real server | `tests/unit/data-sources.test.js` (the real-server case is skipped without QA_TEST_PG_URL) |
+| AI analysis (Anthropic, or any OpenAI-compatible API): grounded prompt, redaction, graceful failure, results merged into the stored run | **Implemented, not verified in CI.** No API key was available, so no real provider call was made. Redaction, prompt building, parsing and fallbacks are covered with mocks | `tests/unit/ai.test.js`, `tests/e2e/ai-race.e2e.js` |
+
+Every finding has a `classification`: `EXPECTED_DIFFERENCE`, `UNMAPPED_OR_MISSING_FEATURE`, `REPLAY_FAILURE`, `SKIPPED_BY_SAFETY_POLICY`, `NOT_COMPARABLE` or an unclassified content difference, plus a confidence and the rule that produced it (see `lib/engine/findings.ts`).
 
 ---
 
@@ -129,24 +148,64 @@ Nothing is hidden silently. Each comparison logs how many differences the rules 
 
 ---
 
+## Configuration (environment variables)
+
+All variables are optional and server-side only. `qa-vision/.env.example` holds placeholders; never commit real values.
+
+| Variable | Purpose |
+|---|---|
+| `QA_VISION_SECRET_KEY` | Key that encrypts stored login credentials. If unset, a key file is generated in the data directory. A wrong key means saved credentials cannot be decrypted and login falls back to manual |
+| `QA_VISION_DATA_DIR` | Where the SQLite database and key file live. Default `qa-vision/data` |
+| `QA_VISION_COMPARE_BUDGET_MS` | Per-comparison time budget. A comparison that exceeds it is cut short and logged. Mainly used by tests |
+| `QA_VISION_AI_PROVIDER` | `anthropic` or `openai-compatible`. Unset disables AI analysis |
+| `ANTHROPIC_API_KEY` | API key for the `anthropic` provider |
+| `QA_VISION_AI_BASE_URL`, `QA_VISION_AI_API_KEY` | Endpoint and key for the `openai-compatible` provider (for example Grok) |
+| `QA_VISION_AI_MODEL` | Model override. Anthropic default: `claude-opus-5-5` |
+| `QA_VISION_PORT` | Dashboard port for `server.js`. Default 3001 |
+| `QA_VISION_HOST` | Interface `server.js` binds to. Default `127.0.0.1` (loopback only). Requests are accepted when the Host header is `localhost`, `127.0.0.1` or `[::1]` (always), or equals this value when set; anything else gets 403. Set it to the address other machines use to reach you (not `0.0.0.0`), and only on a trusted network |
+| `QA_VISION_DIST_DIR` | Next.js `distDir` override. `test:ui` sets `.next-ui` so it never clobbers a running dashboard's build |
+| `QA_VISION_ALLOWED_HOSTS` | Restrict target hosts (suffix match) |
+| `QA_VISION_HEADLESS` | `1` launches comparison browsers headless |
+| `QA_VISION_ORPHAN_TIMEOUT_MS` | Milliseconds with no dashboard connected before the engine closes all running sessions (their runs are saved). Default `600000` (10 minutes). Reloading the dashboard reconnects to the running session instead |
+| `QA_DEV_URL`, `QA_PROD_URL` | Point the test suites at other deployments |
+| `QA_TEST_PG_URL` | Test only: a PostgreSQL connection string that enables the real-server database-check test |
+
+---
+
 ## Tests
 
 Run from `qa-vision/` (or `npm test` at the repo root):
 
 ```bash
-npm run test:unit   # pure helpers (URL validation, URL mapping, ignore rules), no browsers
+npm run test:unit   # pure modules, no browsers
 npm run test:e2e    # real headless Chromium against the sample apps
-npm test            # both
+npm run test:ui     # dashboard UI test on its own server (port 3101)
+npm test            # unit + e2e
 ```
 
-`test:e2e` starts the sample apps if they aren't running and stops them afterwards. Run a single suite with `npm run test:e2e -- safety`. To point the suites at other deployments, set `QA_DEV_URL` and `QA_PROD_URL`.
+`test:e2e` starts the sample apps if they aren't running and stops them afterwards. Run a single suite with `npm run test:e2e -- safety`. `test:ui` starts its own server with a temporary data directory and refuses to run if port 3101 is taken.
 
 | Suite | Covers |
 |---|---|
-| `tests/unit/engine-utils.test.js` | URL validation, DEV→PROD URL mapping, ignore-rule normalization/exclusion |
-| `tests/e2e/safety.e2e.js` | Read-only default; destructive/submit blocking; network write guard; ambiguous & missing element handling; navigation mapping; password redaction; URL rejection |
+| `tests/unit/engine-utils.test.js` | URL validation, DEV to PROD URL mapping, ignore-rule normalization/exclusion |
+| `tests/unit/findings.test.js`, `capture-settings.test.js` | Fingerprints, classification, capture settings normalization |
+| `tests/unit/dom-diff.test.js`, `css-diff.test.js`, `a11y-diff.test.js` | DOM, CSS/layout and accessibility diffs |
+| `tests/unit/data-rules.test.js`, `runtime-diff.test.js` | Data rules and table diff; network/console diff and redaction |
+| `tests/unit/data-sources.test.js`, `data-sources-wiring.test.js` | API checks, read-only SQL guard, DB runner (fake client; real Postgres only with QA_TEST_PG_URL) |
+| `tests/unit/secrets.test.js`, `login-origin.test.js` | Secret encryption, origin-bound credentials |
+| `tests/unit/store.test.js` | SQLite store, migration |
+| `tests/unit/ai.test.js` | AI redaction, prompt, parsing, fallbacks (mocked) |
+| `tests/unit/reports.test.js`, `reports-hardening.test.js` | Report exports and their hardening |
+| `tests/e2e/safety.e2e.js` | Read-only default; destructive/submit blocking; network write guard; ambiguous and missing element handling; navigation mapping; password redaction; URL rejection |
 | `tests/e2e/allowlist.e2e.js` | Allowlisted writes pass and are audited; others stay blocked |
 | `tests/e2e/sync.e2e.js` | Ordered queue, no skipped comparisons, de-duplication, out-of-sync + resync, Stop draining, ignore rules |
+| `tests/e2e/actions.e2e.js` | Double-click, hover and keyboard capture and replay |
+| `tests/e2e/capture.e2e.js`, `extract.e2e.js` | Viewport/masking/scope; in-page snapshot extraction |
+| `tests/e2e/comparisons.e2e.js` | DOM, CSS, a11y, data, network and console comparisons end to end; ignore rules; budget path |
+| `tests/e2e/login.e2e.js` | Auto-login, secrets never logged or recorded, wrong-key fallback |
+| `tests/e2e/expected-highlight.e2e.js` | Expected differences and element highlighting |
+| `tests/e2e/ai-race.e2e.js` | Background AI result merges into the stored run, runs once |
+| `tests/ui/dashboard.ui.js` | Live frames, filters, evidence viewer, mark expected, history export, profile duplicate, evidence traversal and password-leak checks |
 
 ---
 
@@ -155,13 +214,13 @@ npm test            # both
 ```
 .
 ├── qa-vision/                  QA Vision dashboard + engine (Next.js 16, port 3001)
-│   ├── app/page.tsx            Dashboard UI (profiles, controls, live log, findings, report export)
+│   ├── app/page.tsx            Dashboard UI (profiles, controls, live view, timeline, findings, history)
 │   ├── app/api/session/        create / pause / resync / stop / replicate
-│   ├── app/api/profiles/       profile CRUD (stored in qa-vision/data/profiles.json)
-│   ├── app/api/report/         PDF report generation
-│   ├── lib/playwright.ts       ★ Engine: browsers, recorder, safety, matching, queue, comparison
-│   ├── lib/report-generator.ts PDF builder (pdf-lib)
-│   ├── playwright.js           Generated CommonJS copy of the engine (loaded by server.js)
+│   ├── app/api/profiles/       profile CRUD (SQLite store)
+│   ├── app/api/findings, runs, evidence, report/   finding actions, run history, evidence files, report exports
+│   ├── lib/playwright.ts       ★ Engine orchestrator: browsers, recorder, safety, matching, queue
+│   ├── lib/engine/*.ts         Pure modules: diffs, data rules, store, secrets, AI, data sources, reports
+│   ├── engine-dist/, playwright.js   Generated CommonJS build (loaded by server.js and the tests)
 │   ├── server.js               Custom server: Next.js + Socket.IO
 │   ├── scripts/build-engine.js Rebuilds playwright.js
 │   └── tests/                  unit/, e2e/, run-e2e.js
@@ -173,13 +232,13 @@ npm test            # both
 
 Runtime output stays local and is git-ignored:
 - `qa-vision/reports/`: evidence screenshots, session snapshots, PDFs
-- `qa-vision/data/`: saved profiles
+- `qa-vision/data/`: SQLite database (profiles, runs, findings, secrets) and key file
 
 ---
 
 ## Development notes
 
-- **After any change to `lib/playwright.ts`, run `npm run build:engine`.** `server.js` loads the compiled `playwright.js`, not the TypeScript, so a stale copy means stale behavior.
+- **After any change to `lib/playwright.ts` or `lib/engine/**`, run `npm run build:engine`** and commit the generated `engine-dist/` and `playwright.js`. `server.js` and the tests load the compiled output, so a stale copy means stale behavior.
 - Type-check with `npx tsc --noEmit -p .` (in `qa-vision/`).
 - Set `QA_VISION_HEADLESS=1` to launch the comparison browsers headless (used by the tests).
 - The DEV recorder is injected with Playwright's `addInitScript` and `exposeFunction`. It only sees actions in the **Playwright-managed DEV window**, not your normal browser.
@@ -188,20 +247,16 @@ Runtime output stays local and is git-ignored:
 
 ## Known limitations
 
-These are planned and **not implemented yet**:
+Deliberate gaps against the full specification, and known weaknesses:
 
-- **Comparison depth:**
-  - No computed-CSS comparison
-  - No DOM-structure comparison
-  - No network/API or console-error capture
-  - No accessibility checks
-  - No configurable data-comparison rules (numeric tolerance etc.)
-- **Recording:** hover, double-click and keyboard shortcuts are not captured. SPA route changes via `pushState` are not replayed directly; they replay through the click that caused them.
-- **Dashboard:**
-  - The "live dual view" panels are placeholders; the real browsers are separate windows.
-  - Clicking a finding does not highlight the element in the browsers.
-  - Findings can't be marked as expected differences.
-- **No AI analysis.** The `aiAnalysis` field is not produced by a model.
-- **Storage:** no database. Profiles live in a JSON file, and the current/last run is kept in memory and in `reports/evidence/<session>/session-snapshot.json`.
-- **Reports:** PDF only, no HTML / Excel / JSON export from the UI.
+- **SQLite instead of PostgreSQL as the primary store.** Profiles, runs, findings, expectations and secrets live in a local SQLite file (`node:sqlite`, hence Node 22.13+). PostgreSQL is supported only as a read-only *comparison data source*, not as the app's own storage.
+- **The live view is a mirror, not an interactive embedded browser.** The dashboard shows streamed frames of both browsers; you still work in the separate DEV window. Frames stop while the run is paused.
+- **No app-version capture.** There is no generic way to read an application's version, so none is recorded.
+- **AI analysis and Postgres checks are not verified in CI** (see [What works today](#what-works-today)).
+- **The SQL guard is a denylist, not an allowlist.** It rejects write/DDL/transaction keywords, multiple statements and dangerous functions. It also rejects quoted identifiers that equal a keyword, such as `"end"` or `"set"`. Use a read-only database role as the real protection.
+- **DB connection strings are not origin-bound.** Unlike login credentials, a stored database connection string is not tied to the profile's URLs.
+- **API checks are GET-only** and do not go through the PROD safety evaluator.
+- **The e2e suites write run records into the default data directory** (`qa-vision/data/qa-vision.db`) unless they set a temporary `QA_VISION_DATA_DIR`. The file can grow; it is git-ignored and safe to delete.
+- **Recording tradeoffs:** native buttons are not click-delayed, so a React `onDoubleClick` on a native button is not detected; Enter-to-submit can log two skipped entries. SPA route changes via `pushState` replay only through the click that caused them.
 - **Text matching heuristics** in `diffPageContent` were tuned on the sample apps. Use `data-testid` attributes in both environments for the most reliable matching.
+- **No dashboard authentication** and no CSRF protection beyond JSON content-type checks. Run it locally.

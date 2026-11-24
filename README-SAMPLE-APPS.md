@@ -1,6 +1,6 @@
 # Sample DEV and PROD Test Applications
 
-Two separate Next.js applications have been created to demonstrate realistic differences that QA Vision AI can detect:
+Two separate Next.js applications are included as test fixtures with deliberate differences that QA Vision detects. The e2e and UI suites run against them (see the Tests table in README.md).
 
 ## Applications Created
 
@@ -45,12 +45,10 @@ This starts **all three applications simultaneously**:
 
 The `start:all` script uses `concurrently` so one terminal window runs everything.
 
-After the servers start, open http://localhost:3001 and click **START SAMPLE APPS** (if not already running) then **START COMPARISON**.
+After the servers start, open http://localhost:3001, select a profile and click **Launch Environments**. Sample login: `test@acme.com` / `password123`.
 
-**Default URLs in QA Vision are already set to 3002 and 3003.**
+The sample profile URLs point at ports 3002 and 3003.
 
-When you perform actions in DEV (login, click buttons, increment counter), the Playwright backend will replicate them in PROD and QA Vision will automatically detect and report the mismatches with AI analysis.
+When you perform actions in DEV (login, click buttons, increment counter), the Playwright backend replicates them in PROD and QA Vision detects and reports the mismatches. AI analysis is optional and needs an API key (see README.md, Configuration).
 
-These apps are intentionally built to trigger the full range of comparison capabilities in the master prompt.
-
-The sample applications are ready. Would you like me to start both servers now or update the QA Vision default URLs to point to them?
+These apps are intentionally built to trigger the comparison types described in README.md: DOM, CSS/layout, accessibility, data, network, console and safety.

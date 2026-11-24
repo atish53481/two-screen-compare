@@ -1,14 +1,29 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 
 export default function DevApp() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [showModal, setShowModal] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [showTip, setShowTip] = useState(false);
   const [users, setUsers] = useState(1250);
   const [revenue] = useState(1248000);
+
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    fetch('/api/stats').catch(() => {});
+  }, [isLoggedIn]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowModal(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   const handleLogin = () => {
     if (email === 'test@acme.com' && password === 'password123') {
@@ -36,7 +51,8 @@ export default function DevApp() {
           </div>
           <div className="flex gap-6 text-sm">
             <div className="text-center">
-              <div className="text-3xl font-mono text-emerald-400">{users.toLocaleString()}</div>
+              {/* deliberate fixture difference: 1,250 (DEV) vs 1,248 (PROD) */}
+              <div data-testid="stat-active-users" className="text-3xl font-mono text-emerald-400">{users.toLocaleString()}</div>
               <div className="text-xs uppercase tracking-widest text-emerald-500">Active Users</div>
             </div>
             <div className="text-center">
@@ -93,6 +109,35 @@ export default function DevApp() {
           </div>
         ) : (
           <div className="space-y-8">
+            <img data-testid="logo" width={48} height={48} src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48'%3E%3Crect width='48' height='48' fill='%23888'/%3E%3C/svg%3E" />
+            {/* deliberate fixture difference: 3 order rows on DEV (DEV 3, PROD 2) */}
+            <table data-testid="orders" className="text-sm text-zinc-300">
+              <thead>
+                <tr><th>Order</th><th>Customer</th><th>Total</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>1001</td><td>Acme Co</td><td>$120</td></tr>
+                <tr><td>1002</td><td>Globex</td><td>$340</td></tr>
+                <tr><td>1003</td><td>Initech</td><td>$99</td></tr>
+              </tbody>
+            </table>
+            <div data-testid="row-dbl" onDoubleClick={() => setShowDetails(true)} className="text-sm text-zinc-300 cursor-pointer select-none">
+              Order 1001 (double-click for details)
+            </div>
+            {showDetails && <div data-testid="row-details" className="text-sm text-zinc-400">Details for order 1001</div>}
+            <div className="relative inline-block">
+              <button
+                type="button"
+                data-testid="help-hover"
+                aria-describedby="help-tip"
+                onMouseEnter={() => setShowTip(true)}
+                onMouseLeave={() => setShowTip(false)}
+                className="text-zinc-400 text-sm underline"
+              >
+                Help
+              </button>
+              {showTip && <div id="help-tip" role="tooltip" data-testid="help-tooltip" className="text-xs text-zinc-300">Contact support any time</div>}
+            </div>
             <div className="bg-zinc-900 rounded-3xl p-10">
               <div className="flex items-center gap-4 mb-8">
                 <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center text-2xl">🚀</div>
@@ -121,7 +166,7 @@ export default function DevApp() {
                     setUsers(users + 12);
                     alert('New user registered in DEV database');
                   }}
-                  className="bg-zinc-800 hover:bg-zinc-700 p-8 rounded-3xl text-left transition-all border border-emerald-900 hover:border-emerald-500 group"
+                  className="bg-zinc-800 hover:bg-zinc-700 p-8 px-6 rounded-3xl text-left transition-all border border-emerald-900 hover:border-emerald-500 group" // deliberate fixture difference: px-6 vs PROD px-4
                 >
                   <div className="text-emerald-400 text-sm mb-2 group-hover:underline">ADD TEST USER →</div>
                   <div className="text-2xl font-semibold">Simulate Traffic</div>
@@ -142,7 +187,7 @@ export default function DevApp() {
         )}
 
         {showModal && (
-          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
+          <div data-testid="modal" className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
             <div className="bg-zinc-900 rounded-3xl p-10 max-w-md text-center border border-emerald-500">
               <div className="text-6xl mb-6">🎉</div>
               <h3 className="text-3xl font-bold mb-4 text-emerald-400">Welcome to DEV</h3>
