@@ -1,5 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
 import comparisonEngine from '@/lib/playwright';
+import path from 'path';
+import fs from 'fs';
+import { requireJson } from '@/lib/http-guards';
+import { openStore } from '@/lib/engine/store';
+import { getDataDir } from '@/lib/engine/secrets';
+import { buildReportModel } from '@/lib/engine/reports/model';
+import { renderHtml, loadEvidenceImages } from '@/lib/engine/reports/html';
+import { renderJson } from '@/lib/engine/reports/json';
+import { renderXlsx } from '@/lib/engine/reports/xlsx';
+import { renderCsv } from '@/lib/engine/reports/csv';
 import { generateComparisonPdf, type ReportInput, type ReportLog, type ReportMismatch } from '@/lib/report-generator';
 
 export async function POST(request: NextRequest) {
@@ -110,7 +120,7 @@ export async function POST(request: NextRequest) {
 export async function GET() {
   return NextResponse.json({
     status: 'QA Vision Report API',
-    usage: 'POST JSON with optional sessionId, projectName, devUrl, prodUrl, logs, mismatches',
+    usage: 'POST JSON {format: pdf|html|json|xlsx|csv, sessionId?, runId?} (PDF also accepts projectName, devUrl, prodUrl, logs, mismatches)',
     output: 'application/pdf attachment with actual differences and evidence images',
   });
 }

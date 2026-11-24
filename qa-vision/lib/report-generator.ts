@@ -2,6 +2,7 @@ import 'server-only';
 import fs from 'fs';
 import path from 'path';
 import { PDFDocument, StandardFonts, rgb, PDFImage, PDFPage, RGB } from 'pdf-lib';
+import type { AiAnalysis } from './engine/types';
 
 export type ReportLog = {
   id?: string;
@@ -30,6 +31,11 @@ export type ReportMismatch = {
   classification?: string;
   occurrences?: number;
   stepIds?: string[];
+  property?: string;
+  devSelector?: string;
+  prodSelector?: string;
+  ruleApplied?: string | null;
+  ai?: AiAnalysis;
 };
 
 export type ReportInput = {
@@ -246,6 +252,19 @@ export async function generateComparisonPdf(rawInput: ReportInput): Promise<Uint
       severity: pdfSafe(m.severity) || 'medium',
       description: pdfSafe(m.description || ''),
       aiAnalysis: pdfSafe(m.aiAnalysis || ''),
+      property: m.property ? pdfSafe(m.property) : undefined,
+      devSelector: m.devSelector ? pdfSafe(m.devSelector) : undefined,
+      prodSelector: m.prodSelector ? pdfSafe(m.prodSelector) : undefined,
+      ruleApplied: m.ruleApplied ? pdfSafe(m.ruleApplied) : m.ruleApplied,
+      ai:
+        m.ai && m.ai.status === 'ok'
+          ? {
+              ...m.ai,
+              explanation: pdfSafe(m.ai.explanation),
+              observedFacts: (m.ai.observedFacts || []).map(pdfSafe),
+              hypotheses: (m.ai.hypotheses || []).map(pdfSafe),
+            }
+          : undefined,
     })),
   };
 
@@ -427,6 +446,42 @@ export async function generateComparisonPdf(rawInput: ReportInput): Promise<Uint
   for (const line of wrapText(summaryNote, 90)) {
     page.drawText(line, { x: 40, y, size: 9, font, color: rgb(0.25, 0.25, 0.25) });
     y -= 12;
+  }
+
+  // ---------- Breakdown by type + expected differences ----------
+  page = pdfDoc.addPage([612, 792]);
+  y = 740;
+  page.drawText('Differences by Type', { x: 40, y, size: 16, font: fontBold });
+  y -= 22;
+  const typeCounts = new Map<string, number>();
+  for (const m of input.mismatches) typeCounts.set(m.type || 'Difference', (typeCounts.get(m.type || 'Difference') || 0) + 1);
+  if (typeCounts.size === 0) {
+    page.drawText('No differences recorded.', { x: 50, y, size: 10, font, color: rgb(0.35, 0.35, 0.35) });
+    y -= 14;
+  }
+  for (const [t, n] of typeCounts) {
+    page.drawText(`${t}: ${n}`, { x: 50, y, size: 10, font, color: rgb(0.15, 0.15, 0.15) });
+    y -= 14;
+  }
+  y -= 18;
+  page.drawText('Expected Differences', { x: 40, y, size: 16, font: fontBold });
+  y -= 20;
+  const expectedList = input.mismatches.filter((m) => m.classification === 'EXPECTED_DIFFERENCE');
+  if (expectedList.length === 0) {
+    page.drawText('None.', { x: 50, y, size: 10, font, color: rgb(0.35, 0.35, 0.35) });
+  }
+  for (const m of expectedList) {
+    const line = `${m.type} / ${m.component}: DEV "${String(m.devValue).slice(0, 40)}" vs PROD "${String(m.prodValue).slice(0, 40)}"${m.ruleApplied ? ` (rule: ${m.ruleApplied})` : ''}`;
+    for (const l of wrapText(line, 95)) {
+      if (y < 60) {
+        page = pdfDoc.addPage([612, 792]);
+        y = 740;
+        page.drawText('Expected Differences (continued)', { x: 40, y, size: 14, font: fontBold });
+        y -= 24;
+      }
+      page.drawText(l, { x: 50, y, size: 9, font, color: rgb(0.2, 0.2, 0.2) });
+      y -= 12;
+    }
   }
 
   // ---------- Exact text differences table ----------
@@ -659,7 +714,32 @@ export async function generateComparisonPdf(rawInput: ReportInput): Promise<Uint
         y -= 12;
       }
 
-      if (m.aiAnalysis) {
+      const where = [
+        m.property ? `Property: ${m.property}` : '',
+        m.devSelector ? `DEV selector: ${m.devSelector}` : '',
+        m.prodSelector && m.prodSelector !== m.devSelector ? `PROD selector: ${m.prodSelector}` : '',
+      ].filter(Boolean);
+      for (const w of where) {
+        for (const line of wrapText(w, 105).slice(0, 2)) {
+          page.drawText(line, { x: 40, y, size: 8, font, color: rgb(0.3, 0.3, 0.4) });
+          y -= 10;
+        }
+      }
+      if (where.length) y -= 4;
+
+      if (m.ai && m.ai.status === 'ok') {
+        const aiLines: Array<{ text: string; bold?: boolean }> = [{ text: 'AI analysis (advisory)', bold: true }];
+        if (m.ai.explanation) aiLines.push(...wrapText(m.ai.explanation, 95).slice(0, 3).map((text) => ({ text })));
+        aiLines.push({ text: 'Observed facts:', bold: true });
+        for (const f of (m.ai.observedFacts || []).slice(0, 3)) aiLines.push(...wrapText(`- ${f}`, 95).slice(0, 2).map((text) => ({ text })));
+        aiLines.push({ text: 'Hypotheses (unverified):', bold: true });
+        for (const h of (m.ai.hypotheses || []).slice(0, 3)) aiLines.push(...wrapText(`- ${h}`, 95).slice(0, 2).map((text) => ({ text })));
+        for (const l of aiLines) {
+          page.drawText(l.text, { x: 40, y, size: 8, font: l.bold ? fontBold : font, color: rgb(0.2, 0.2, 0.3) });
+          y -= 10;
+        }
+        y -= 6;
+      } else if (m.aiAnalysis) {
         for (const line of wrapText(`Analysis: ${m.aiAnalysis}`, 95)) {
           page.drawText(line, { x: 40, y, size: 9, font, color: rgb(0.25, 0.25, 0.3) });
           y -= 11;
