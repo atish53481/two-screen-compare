@@ -1,8 +1,9 @@
 // Encrypted secret store: AES-256-GCM blobs; keys from env or a local key file.
-// Blobs live in <dataDir>/secrets.json (ref -> blob). Never plaintext.
+// Blobs live in the Store's secrets table (<dataDir>/qa-vision.db). Never plaintext.
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { openStore } from './store';
 
 export class SecretError extends Error {
   constructor(message: string) {
@@ -59,40 +60,20 @@ export function decryptSecret(blob: string, key: Buffer): string {
   }
 }
 
-// ---- blob persistence (secrets.json; Task 12 migrates these into the Store) ----
+// ---- blob persistence (Store.secrets; legacy secrets.json is imported on first open) ----
 
-const secretsPath = (dataDir: string) => path.join(dataDir, 'secrets.json');
-
-function readMap(dataDir: string): Record<string, string> {
-  try {
-    return JSON.parse(fs.readFileSync(secretsPath(dataDir), 'utf-8')) || {};
-  } catch {
-    return {};
-  }
-}
-
-function writeMap(dataDir: string, map: Record<string, string>) {
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(secretsPath(dataDir), JSON.stringify(map, null, 2), { mode: 0o600 });
-}
+const storeFor = (dataDir: string) => openStore(path.join(dataDir, 'qa-vision.db'));
 
 export function putSecretFile(dataDir: string, ref: string, blob: string) {
-  const map = readMap(dataDir);
-  map[ref] = blob;
-  writeMap(dataDir, map);
+  storeFor(dataDir).putSecret(ref, blob);
 }
 
 export function getSecretFile(dataDir: string, ref: string): string | null {
-  const v = readMap(dataDir)[ref];
-  return typeof v === 'string' ? v : null;
+  return storeFor(dataDir).getSecret(ref);
 }
 
 export function deleteSecretFile(dataDir: string, ref: string) {
-  const map = readMap(dataDir);
-  if (ref in map) {
-    delete map[ref];
-    writeMap(dataDir, map);
-  }
+  storeFor(dataDir).deleteSecret(ref);
 }
 
 // ---- profile helpers ----

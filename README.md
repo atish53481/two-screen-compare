@@ -24,7 +24,7 @@ You click and type in a DEV browser window. QA Vision captures each action, find
 
 ## Quick start
 
-**Requirements:** Node.js 20+ and npm. Windows, macOS or Linux.
+**Requirements:** Node.js 22.13+ (the store uses the built-in `node:sqlite`) and npm. Windows, macOS or Linux.
 
 ```bash
 git clone https://github.com/atish53481/two-screen-compare.git

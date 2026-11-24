@@ -1,81 +1,51 @@
 import 'server-only';
-import fs from 'fs';
 import path from 'path';
 import { ComparisonProfile, ProfileCredentialsInput } from './types';
-import { getDataDir, storeProfileSecrets, safeStoreProfileSecrets, deleteSecretFile } from './engine/secrets';
+import { getDataDir, storeProfileSecrets, deleteSecretFile } from './engine/secrets';
+import { openStore } from './engine/store';
 
 const dataDir = () => getDataDir();
-const profilesFile = () => path.join(dataDir(), 'profiles.json');
+// Secrets and profiles share one db; getDataDir() honours QA_VISION_DATA_DIR
+const store = () => openStore(path.join(dataDir(), 'qa-vision.db'));
 
 export class ProfileManager {
-  private profiles: ComparisonProfile[] = [];
   private currentProfileId: string | null = null;
 
   constructor() {
-    this.loadProfiles();
+    this.seedDefault();
   }
 
-  private ensureDataDir() {
-    const dir = dataDir();
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  }
-
-  private loadProfiles() {
-    this.ensureDataDir();
-    if (fs.existsSync(profilesFile())) {
-      try {
-        this.profiles = JSON.parse(fs.readFileSync(profilesFile(), 'utf-8'));
-      } catch (e) {
-        this.profiles = [];
-      }
-      // Migrate any legacy plaintext passwords into the encrypted store
-      let migrated = false;
-      this.profiles = this.profiles.map((p) => {
-        const hasPlain = [(p as any).credentialsA, (p as any).credentialsB].some((c) => c && 'password' in c);
-        if (!hasPlain) return p;
-        migrated = true;
-        const r = safeStoreProfileSecrets(p, dataDir());
-        if (r.error) console.error(`Profile "${p.id}": could not encrypt legacy password (${r.error}); it was removed from profiles.json`);
-        return r.profile;
-      });
-      if (migrated) this.saveProfiles();
-    } else {
-      // Create default profile
-      this.profiles = [{
-        id: 'default',
-        name: 'Sample DEV vs PROD',
-        labelA: 'DEV',
-        labelB: 'PROD',
-        urlA: 'http://localhost:3002',
-        urlB: 'http://localhost:3003',
-        safetyPolicy: 'read-only',
-        safetyAllowlist: [],
-        ignoreRules: ['timestamp', 'session-id', 'random-id'],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      }];
-      this.saveProfiles();
-    }
-  }
-
-  private saveProfiles() {
-    this.ensureDataDir();
-    fs.writeFileSync(profilesFile(), JSON.stringify(this.profiles, null, 2));
+  // openStore also imports legacy profiles.json / secrets.json on first open
+  private seedDefault() {
+    if (store().listProfiles().length > 0) return;
+    const now = new Date().toISOString();
+    store().saveProfile({
+      id: 'default',
+      name: 'Sample DEV vs PROD',
+      labelA: 'DEV',
+      labelB: 'PROD',
+      urlA: 'http://localhost:3002',
+      urlB: 'http://localhost:3003',
+      safetyPolicy: 'read-only',
+      safetyAllowlist: [],
+      ignoreRules: ['timestamp', 'session-id', 'random-id'],
+      createdAt: now,
+      updatedAt: now,
+    });
   }
 
   getAllProfiles(): ComparisonProfile[] {
-    return this.profiles;
+    return store().listProfiles();
   }
 
   getProfile(id: string): ComparisonProfile | undefined {
-    return this.profiles.find(p => p.id === id);
+    return store().getProfile(id);
   }
 
   getCurrentProfile(): ComparisonProfile | null {
-    if (!this.currentProfileId) return this.profiles[0] || null;
-    return this.getProfile(this.currentProfileId) || this.profiles[0] || null;
+    const first = store().listProfiles()[0] || null;
+    if (!this.currentProfileId) return first;
+    return this.getProfile(this.currentProfileId) || first;
   }
 
   saveProfile(
@@ -91,27 +61,12 @@ export class ProfileManager {
     const withId: any = { ...profile, id };
     profile = storeProfileSecrets(withId, dataDir(), process.env, this.getProfile(id));
 
-    if (profile.id && this.getProfile(profile.id)) {
-      // Update existing
-      const index = this.profiles.findIndex(p => p.id === profile.id);
-      this.profiles[index] = {
-        ...this.profiles[index],
-        ...profile,
-        updatedAt: now,
-      };
-    } else {
-      // Create new
-      const newProfile: ComparisonProfile = {
-        ...profile as any,
-        id: profile.id || 'profile_' + Date.now(),
-        createdAt: now,
-        updatedAt: now,
-      };
-      this.profiles.push(newProfile);
-    }
-    
-    this.saveProfiles();
-    return this.getProfile(profile.id || this.profiles[this.profiles.length - 1].id)!;
+    const existing = this.getProfile(id);
+    const saved: ComparisonProfile = existing
+      ? { ...existing, ...(profile as any), updatedAt: now }
+      : { ...(profile as any), id, createdAt: now, updatedAt: now };
+    store().saveProfile(saved);
+    return saved;
   }
 
   setCurrentProfile(id: string) {
@@ -122,12 +77,9 @@ export class ProfileManager {
 
   deleteProfile(id: string): boolean {
     if (id === 'default') return false; // Protect default
-    const index = this.profiles.findIndex(p => p.id === id);
-    if (index === -1) return false;
-    this.profiles.splice(index, 1);
+    if (!store().deleteProfile(id)) return false;
     deleteSecretFile(dataDir(), `profile:${id}:A`);
     deleteSecretFile(dataDir(), `profile:${id}:B`);
-    this.saveProfiles();
     return true;
   }
 }

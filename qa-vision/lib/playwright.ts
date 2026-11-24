@@ -11,7 +11,8 @@ import { diffCss } from './engine/css-diff';
 import { diffA11y } from './engine/a11y-diff';
 import { diffData } from './engine/data-rules';
 import { diffNetwork, diffRuntime, toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
-import { originOf, resolveLoginUrl } from './engine/secrets';
+import { originOf, resolveLoginUrl, getDataDir } from './engine/secrets';
+import { openStore } from './engine/store';
 import type { FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
 
 /**
@@ -195,6 +196,7 @@ export interface SessionOptions {
 
 export interface ComparisonSession {
   id: string;
+  profileId?: string;
   capture: CaptureSettings;
   projectName: string;
   devBrowser: Browser;
@@ -243,6 +245,7 @@ export interface ComparisonSession {
 
 export type SessionSnapshot = {
   id: string;
+  profileId?: string;
   projectName: string;
   devUrl: string;
   prodUrl: string;
@@ -444,6 +447,7 @@ class QAComparisonEngine {
 
     const session: ComparisonSession = {
       id: sessionId,
+      profileId: opts.profileId,
       capture,
       projectName,
       devBrowser,
@@ -2087,6 +2091,7 @@ class QAComparisonEngine {
   private archiveSession(session: ComparisonSession) {
     this.lastSnapshot = {
       id: session.id,
+      profileId: session.profileId,
       projectName: session.projectName,
       devUrl: session.devUrl,
       prodUrl: session.prodUrl,
@@ -2101,6 +2106,13 @@ class QAComparisonEngine {
       fs.writeFileSync(snapPath, JSON.stringify(this.lastSnapshot, null, 2));
     } catch {
       /* ignore */
+    }
+
+    // Persist to run history; a storage failure must never break session teardown
+    try {
+      openStore(path.join(getDataDir(), 'qa-vision.db')).saveRun(this.lastSnapshot as SessionSnapshot);
+    } catch (e) {
+      console.error('Could not persist run history:', (e as Error).message);
     }
   }
 

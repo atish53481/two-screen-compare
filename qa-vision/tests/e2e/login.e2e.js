@@ -48,7 +48,7 @@ runSuite('Profile auto-login', async ({ check }) => {
     !logText.includes(SAMPLE_PASSWORD) &&
       !JSON.stringify(s.mismatches).includes(SAMPLE_PASSWORD) &&
       !JSON.stringify(profile).includes(SAMPLE_PASSWORD) &&
-      !fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8').includes(SAMPLE_PASSWORD));
+      !['qa-vision.db', 'qa-vision.db-wal'].some((f) => fs.existsSync(path.join(dir, f)) && fs.readFileSync(path.join(dir, f)).includes(SAMPLE_PASSWORD)));
   await engine.closeSession(id);
 
   // Wrong key: decrypt fails -> manual fallback is logged, session still starts

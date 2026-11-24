@@ -53,6 +53,7 @@ const a11y_diff_1 = require("./engine/a11y-diff");
 const data_rules_1 = require("./engine/data-rules");
 const runtime_diff_1 = require("./engine/runtime-diff");
 const secrets_1 = require("./engine/secrets");
+const store_1 = require("./engine/store");
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
@@ -337,6 +338,7 @@ class QAComparisonEngine {
         });
         const session = {
             id: sessionId,
+            profileId: opts.profileId,
             capture,
             projectName,
             devBrowser,
@@ -1864,6 +1866,7 @@ class QAComparisonEngine {
     archiveSession(session) {
         this.lastSnapshot = {
             id: session.id,
+            profileId: session.profileId,
             projectName: session.projectName,
             devUrl: session.devUrl,
             prodUrl: session.prodUrl,
@@ -1878,6 +1881,13 @@ class QAComparisonEngine {
         }
         catch {
             /* ignore */
+        }
+        // Persist to run history; a storage failure must never break session teardown
+        try {
+            (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db')).saveRun(this.lastSnapshot);
+        }
+        catch (e) {
+            console.error('Could not persist run history:', e.message);
         }
     }
     async closeSession(sessionId) {

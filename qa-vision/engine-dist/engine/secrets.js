@@ -17,10 +17,11 @@ exports.safeStoreProfileSecrets = safeStoreProfileSecrets;
 exports.resolveSessionLogin = resolveSessionLogin;
 exports.resolveProfileCredentials = resolveProfileCredentials;
 // Encrypted secret store: AES-256-GCM blobs; keys from env or a local key file.
-// Blobs live in <dataDir>/secrets.json (ref -> blob). Never plaintext.
+// Blobs live in the Store's secrets table (<dataDir>/qa-vision.db). Never plaintext.
 const crypto_1 = __importDefault(require("crypto"));
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
+const store_1 = require("./store");
 class SecretError extends Error {
     constructor(message) {
         super(message);
@@ -76,35 +77,16 @@ function decryptSecret(blob, key) {
         throw new SecretError(exports.DECRYPT_FAILED);
     }
 }
-// ---- blob persistence (secrets.json; Task 12 migrates these into the Store) ----
-const secretsPath = (dataDir) => path_1.default.join(dataDir, 'secrets.json');
-function readMap(dataDir) {
-    try {
-        return JSON.parse(fs_1.default.readFileSync(secretsPath(dataDir), 'utf-8')) || {};
-    }
-    catch {
-        return {};
-    }
-}
-function writeMap(dataDir, map) {
-    fs_1.default.mkdirSync(dataDir, { recursive: true });
-    fs_1.default.writeFileSync(secretsPath(dataDir), JSON.stringify(map, null, 2), { mode: 0o600 });
-}
+// ---- blob persistence (Store.secrets; legacy secrets.json is imported on first open) ----
+const storeFor = (dataDir) => (0, store_1.openStore)(path_1.default.join(dataDir, 'qa-vision.db'));
 function putSecretFile(dataDir, ref, blob) {
-    const map = readMap(dataDir);
-    map[ref] = blob;
-    writeMap(dataDir, map);
+    storeFor(dataDir).putSecret(ref, blob);
 }
 function getSecretFile(dataDir, ref) {
-    const v = readMap(dataDir)[ref];
-    return typeof v === 'string' ? v : null;
+    return storeFor(dataDir).getSecret(ref);
 }
 function deleteSecretFile(dataDir, ref) {
-    const map = readMap(dataDir);
-    if (ref in map) {
-        delete map[ref];
-        writeMap(dataDir, map);
-    }
+    storeFor(dataDir).deleteSecret(ref);
 }
 // ---- profile helpers ----
 const originOf = (u, base) => {

@@ -47,7 +47,7 @@ test('secret file helpers store blobs only', () => {
   S.putSecretFile(dir, 'profile:a:A', blob);
   assert.equal(S.getSecretFile(dir, 'profile:a:A'), blob);
   assert.equal(S.getSecretFile(dir, 'nope'), null);
-  assert.ok(!fs.readFileSync(path.join(dir, 'secrets.json'), 'utf8').includes('topsecret'));
+  assert.ok(!fs.readFileSync(path.join(dir, 'qa-vision.db')).includes('topsecret'));
   S.deleteSecretFile(dir, 'profile:a:A');
   assert.equal(S.getSecretFile(dir, 'profile:a:A'), null);
 });
