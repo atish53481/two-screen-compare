@@ -4,6 +4,14 @@ import React, { useMemo } from 'react';
 import { format } from 'date-fns';
 import type { Finding, LogEntry } from './types';
 
+function safeFormat(t: string | number | Date, fmt: string): string {
+  try {
+    return format(new Date(t), fmt);
+  } catch {
+    return '—';
+  }
+}
+
 interface Props {
   logs: LogEntry[];
   findings: Finding[];
@@ -51,7 +59,7 @@ export default function Timeline({ logs, findings, selectedStep, onSelectStep }:
               onClick={() => onSelectStep(selectedStep === r.id ? null : r.id)}
               className={`w-full flex items-center gap-4 px-4 py-2 text-left hover:bg-zinc-800 ${selectedStep === r.id ? 'bg-sky-950/40' : ''}`}
             >
-              <span className="font-mono text-xs text-zinc-500 w-20 shrink-0">{format(new Date(r.time), 'HH:mm:ss')}</span>
+              <span className="font-mono text-xs text-zinc-500 w-20 shrink-0">{safeFormat(r.time, 'HH:mm:ss')}</span>
               <span className="font-mono text-xs text-zinc-400 w-24 shrink-0">{r.id}</span>
               <span className="flex-1 truncate">{r.label}</span>
               <span data-testid="timeline-count" className={`text-xs rounded-full px-2 py-0.5 ${r.count ? 'bg-rose-900 text-rose-300' : 'bg-zinc-800 text-zinc-500'}`}>

@@ -2,7 +2,15 @@
 
 import React, { useEffect, useState } from 'react';
 import { format } from 'date-fns';
-import { downloadReport, EXPORT_FORMATS, type ExportFormat, type Finding } from './types';
+import { downloadReport, EXPORT_FORMATS, type ExportFormat, type Finding } from './types';
+
+function safeFormat(t: string | number | Date, fmt: string): string {
+  try {
+    return format(new Date(t), fmt);
+  } catch {
+    return '—';
+  }
+}
 
 export interface RunSummary {
   id: string;
@@ -75,7 +83,7 @@ export default function HistoryTab({ refreshKey, onOpen }: Props) {
             <div key={r.id} data-testid="history-run" data-run-id={r.id} className="rounded-2xl border border-zinc-800 bg-zinc-900 px-6 py-4 flex flex-wrap items-center gap-4">
               <div className="flex-1 min-w-48">
                 <div className="font-medium">{r.projectName}</div>
-                <div className="text-xs text-zinc-500 font-mono">{format(new Date(r.startedAt), 'yyyy-MM-dd HH:mm:ss')} · {r.counts.total} findings · {r.counts.expected} expected</div>
+                <div className="text-xs text-zinc-500 font-mono">{safeFormat(r.startedAt, 'yyyy-MM-dd HH:mm:ss')} · {r.counts.total} findings · {r.counts.expected} expected</div>
               </div>
               <button type="button" data-testid="history-open" onClick={() => open(r.id)} className="px-3 py-2 rounded-xl text-sm bg-sky-600 hover:bg-sky-500">Open</button>
               <div className="flex gap-1">

@@ -57,6 +57,18 @@ const secrets_1 = require("./engine/secrets");
 const data_sources_1 = require("./engine/data-sources");
 const store_1 = require("./engine/store");
 const ai_1 = require("./engine/ai");
+/** Copy of v with every *ScreenshotPath value reduced to its base name (socket payloads must not leak disk paths). */
+function stripShotPaths(v) {
+    if (Array.isArray(v))
+        return v.map(stripShotPaths);
+    if (v && typeof v === 'object') {
+        return Object.fromEntries(Object.entries(v).map(([k, x]) => [
+            k,
+            /ScreenshotPath$/.test(k) ? (typeof x === 'string' && x ? path.basename(x) : x) : stripShotPaths(x),
+        ]));
+    }
+    return v;
+}
 const INFO_RESULTS = new Set(['Replaying', 'Info', 'Active', 'Permitted', 'Requested']);
 const SAFE_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 /** How long PROD writes stay permitted after an allowlisted action is replayed. */
@@ -1880,7 +1892,7 @@ class QAComparisonEngine {
                         : 'mismatch',
         };
         session.logs.unshift(entry);
-        this.io?.emit('log', { sessionId, log: entry });
+        this.io?.emit('log', { sessionId, log: stripShotPaths(entry) });
     }
     /**
      * Record a finding. A finding identical to one already reported is not added again;
@@ -1907,7 +1919,7 @@ class QAComparisonEngine {
             if (Array.isArray(mismatch.stepIds)) {
                 existing.stepIds = Array.from(new Set([...(existing.stepIds || []), ...mismatch.stepIds])).slice(-100);
             }
-            this.io?.emit('mismatch-update', { sessionId, mismatch: existing });
+            this.io?.emit('mismatch-update', { sessionId, mismatch: stripShotPaths(existing) });
             return false;
         }
         const fullMismatch = {
@@ -1923,7 +1935,7 @@ class QAComparisonEngine {
         };
         session.findingIndex.set(fp, fullMismatch);
         session.mismatches.unshift(fullMismatch);
-        this.io?.emit('mismatch', { sessionId, mismatch: fullMismatch });
+        this.io?.emit('mismatch', { sessionId, mismatch: stripShotPaths(fullMismatch) });
         return true;
     }
     loadExpectations(profileId) {
@@ -1980,7 +1992,7 @@ class QAComparisonEngine {
             const finding = apply(session.mismatches, session.profileId, session.expected);
             if (!finding)
                 return { ok: false };
-            this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: finding });
+            this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stripShotPaths(finding) });
             return { ok: true, finding };
         }
         if (ref.runId) {
@@ -2104,7 +2116,7 @@ class QAComparisonEngine {
                     const stored = run?.mismatches.find((m) => m.id === f.id);
                     if (stored)
                         stored.ai = ai;
-                    this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stored ?? f });
+                    this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stripShotPaths(stored ?? f) });
                 }
                 if (run)
                     store.saveRun(run);
@@ -2129,7 +2141,7 @@ class QAComparisonEngine {
                 return { ok: false };
             finding.ai = ai;
             if (session)
-                this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: finding });
+                this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stripShotPaths(finding) });
             else if (run)
                 store.saveRun(run);
             return { ok: true, finding, ai };
