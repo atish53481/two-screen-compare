@@ -145,14 +145,21 @@ function storeProfileSecrets(profile, dataDir, env = process.env, existing) {
     for (const side of ['A', 'B']) {
         const field = `credentials${side}`;
         const c = profile[field];
-        if (!c)
-            continue;
-        const { password, secretRef: _ignored, ...rest } = c;
         const ref = `profile:${profile.id}:${side}`;
-        // A stored password is bound to the origin it was saved for: moving the URL/login page drops it
-        if (existing && sideBinding(existing, side) !== sideBinding(profile, side)) {
+        // A stored password is bound to the origin it was saved for: moving the URL/login page drops it,
+        // even when this save omits the credentials (the caller's merge would otherwise keep the old ref)
+        const moved = !!existing && sideBinding(existing, side) !== sideBinding(profile, side);
+        if (moved)
             deleteSecretFile(dataDir, ref);
+        if (!c) {
+            const old = existing?.[field];
+            if (moved && old) {
+                const { password: _p, secretRef: _r, ...oldRest } = old;
+                out[field] = oldRest;
+            }
+            continue;
         }
+        const { password, secretRef: _ignored, ...rest } = c;
         if (typeof password === 'string' && password.length > 0) {
             putSecretFile(dataDir, ref, encryptSecret(password, loadKey(env, dataDir)));
             out[field] = { ...rest, secretRef: ref };

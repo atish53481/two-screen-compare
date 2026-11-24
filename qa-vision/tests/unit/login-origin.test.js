@@ -104,3 +104,24 @@ test('resolveSessionLogin fails closed on odd URLs', () => {
   assert.equal(S.resolveSessionLogin(mk('http://localhost:3002'), 12345, 'http://localhost:3003', dir, e).ok, false);
   assert.equal(S.resolveSessionLogin(mk('http://localhost:3002'), undefined, null, dir, e).ok, false);
 });
+
+test('urlA changed with credentialsA omitted: no blob, no secretRef after merge', () => {
+  const dir = tmp();
+  const base = { id: 'p', urlA: 'http://a.example', urlB: 'http://b.example', login: { loginPath: '/login' } };
+  const saved = S.storeProfileSecrets({ ...base, credentialsA: { username: 'u', password: 'pw' } }, dir, env());
+  const { credentialsA, ...incoming } = saved;
+  const out = S.storeProfileSecrets({ ...incoming, urlA: 'http://evil.example' }, dir, env(), saved);
+  const merged = { ...saved, ...out }; // profile-manager merge semantics
+  assert.equal(S.getSecretFile(dir, 'profile:p:A'), null);
+  assert.equal(merged.credentialsA.secretRef, undefined);
+  assert.equal(merged.credentialsA.username, 'u');
+});
+
+test('isJsonContentType', () => {
+  const { isJsonContentType } = require('../../engine-dist/engine/content-type.js');
+  assert.equal(isJsonContentType('application/json; charset=utf-8'), true);
+  assert.equal(isJsonContentType('application/json'), true);
+  assert.equal(isJsonContentType('text/plain;application/json'), false);
+  assert.equal(isJsonContentType('application/jsonp'), false);
+  assert.equal(isJsonContentType(null), false);
+});

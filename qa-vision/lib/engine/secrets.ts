@@ -138,19 +138,26 @@ export function storeProfileSecrets<T extends { id: string; credentialsA?: any; 
   profile: T,
   dataDir: string,
   env: NodeJS.ProcessEnv = process.env,
-  existing?: { urlA?: string; urlB?: string; login?: any }
+  existing?: { urlA?: string; urlB?: string; login?: any; credentialsA?: any; credentialsB?: any }
 ): T {
   const out: any = { ...profile };
   for (const side of ['A', 'B'] as const) {
     const field = `credentials${side}`;
     const c = (profile as any)[field];
-    if (!c) continue;
-    const { password, secretRef: _ignored, ...rest } = c;
     const ref = `profile:${profile.id}:${side}`;
-    // A stored password is bound to the origin it was saved for: moving the URL/login page drops it
-    if (existing && sideBinding(existing, side) !== sideBinding(profile, side)) {
-      deleteSecretFile(dataDir, ref);
+    // A stored password is bound to the origin it was saved for: moving the URL/login page drops it,
+    // even when this save omits the credentials (the caller's merge would otherwise keep the old ref)
+    const moved = !!existing && sideBinding(existing, side) !== sideBinding(profile, side);
+    if (moved) deleteSecretFile(dataDir, ref);
+    if (!c) {
+      const old = (existing as any)?.[field];
+      if (moved && old) {
+        const { password: _p, secretRef: _r, ...oldRest } = old;
+        out[field] = oldRest;
+      }
+      continue;
     }
+    const { password, secretRef: _ignored, ...rest } = c;
     if (typeof password === 'string' && password.length > 0) {
       putSecretFile(dataDir, ref, encryptSecret(password, loadKey(env, dataDir)));
       out[field] = { ...rest, secretRef: ref };
