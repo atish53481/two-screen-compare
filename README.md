@@ -161,7 +161,7 @@ All variables are optional and server-side only. `qa-vision/.env.example` holds 
 | `QA_VISION_AI_BASE_URL`, `QA_VISION_AI_API_KEY` | Endpoint and key for the `openai-compatible` provider (for example Grok) |
 | `QA_VISION_AI_MODEL` | Model override. Anthropic default: `claude-opus-5-5` |
 | `QA_VISION_PORT` | Dashboard port for `server.js`. Default 3001 |
-| `QA_VISION_HOST` | Interface `server.js` binds to. Default `127.0.0.1` (loopback only). The Host header must be `localhost`, `127.0.0.1` or `[::1]`, or equal this value when set. Set it only on a trusted network |
+| `QA_VISION_HOST` | Interface `server.js` binds to. Default `127.0.0.1` (loopback only). Requests are accepted when the Host header is `localhost`, `127.0.0.1` or `[::1]` (always), or equals this value when set; anything else gets 403. Set it to the address other machines use to reach you (not `0.0.0.0`), and only on a trusted network |
 | `QA_VISION_DIST_DIR` | Next.js `distDir` override. `test:ui` sets `.next-ui` so it never clobbers a running dashboard's build |
 | `QA_VISION_ALLOWED_HOSTS` | Restrict target hosts (suffix match) |
 | `QA_VISION_HEADLESS` | `1` launches comparison browsers headless |

@@ -18,9 +18,11 @@ function hostAllowed(hostHeader) {
   } catch {
     return false;
   }
+  // Loopback names are always allowed, so the dashboard stays reachable on this machine
+  // even when QA_VISION_HOST opens it to a trusted network.
+  if (LOOPBACK_HOSTS.has(name)) return true;
   const configured = process.env.QA_VISION_HOST && process.env.QA_VISION_HOST.toLowerCase().replace(/^\[|\]$/g, '');
-  if (configured) return name.replace(/^\[|\]$/g, '') === configured;
-  return LOOPBACK_HOSTS.has(name);
+  return !!configured && name.replace(/^\[|\]$/g, '') === configured;
 }
 const port = Number(process.env.QA_VISION_PORT) || 3001;
 
