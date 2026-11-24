@@ -47,11 +47,17 @@ app.prepare().then(() => {
     }
   });
 
+  // Only the QA Vision dashboard itself may connect: the socket carries live logs out and live-view input in.
+  const allowedOrigins = [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`, `http://${hostname}:${port}`];
   const io = new Server(httpServer, {
     path: '/socket.io',
-    allowRequest: (req, cb) => cb(null, hostAllowed(req.headers.host)),
-    // Only the QA Vision dashboard itself may subscribe to live logs/mismatches
-    cors: { origin: [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://${hostname}:${port}`] }
+    // CORS does not cover WebSocket upgrades, so check Origin here too. Browsers always send it;
+    // non-browser clients (tests) send none and are already limited to loopback by the Host check.
+    allowRequest: (req, cb) => {
+      const origin = req.headers.origin;
+      cb(null, hostAllowed(req.headers.host) && (!origin || allowedOrigins.includes(origin)));
+    },
+    cors: { origin: allowedOrigins }
   });
 
   // Attach Socket.IO to the comparison engine
@@ -60,6 +66,10 @@ app.prepare().then(() => {
   io.on('connection', (socket) => {
     console.log('✅ QA Vision client connected for real-time updates');
     socket.emit('status', { message: 'Real-time synchronization active' });
+    // Live view: mouse/keyboard input from the dashboard's DEV pane, applied to the DEV browser
+    socket.on('live-input', (data) => {
+      if (data && typeof data.sessionId === 'string') comparisonEngine.handleLiveInput(data.sessionId, data);
+    });
   });
 
   httpServer.listen(port, hostname, () => {

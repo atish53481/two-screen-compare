@@ -271,6 +271,10 @@ export interface ComparisonSession {
   frameBusy?: boolean;
   /** Live-view input from the dashboard, applied to DEV one at a time in arrival order. */
   liveInputQueue?: Promise<void>;
+  /** Epoch ms of the last Live-view click/key/wheel (mouse moves excluded); comparisons wait for a quiet gap. */
+  lastLiveInputAt?: number;
+  /** A frame refresh was requested while a grab was in flight: run one more when it finishes. */
+  frameAgain?: boolean;
   startedAt: string;
   evidenceDir: string;
   /** Network/API entries seen since the last comparison (capped at 500 each). */
@@ -523,6 +527,24 @@ class QAComparisonEngine {
     const devPage = await devContext.newPage();
     const prodPage = await prodContext.newPage();
 
+    // Headless browsers show no dialogs: an unhandled alert() would look like "nothing happened". Report each one
+    // in the log and on the dashboard, then answer it: alert/beforeunload are accepted, confirm/prompt dismissed
+    // (the safe answer: nothing is approved on the user's behalf).
+    for (const [side, page] of [['DEV', devPage], ['PROD', prodPage]] as const) {
+      page.on('dialog', async (dialog) => {
+        const kind = dialog.type();
+        const accept = kind === 'alert' || kind === 'beforeunload';
+        const message = dialog.message().replace(/\s+/g, ' ').trim().slice(0, 300);
+        try {
+          this.log(sessionId, `${side} ${kind}: "${message}" (${accept ? 'closed' : 'dismissed'} automatically)`, side === 'DEV' ? 'Info' : '', side === 'PROD' ? 'Info' : '');
+          this.io?.emit('page-dialog', { sessionId, side, kind, message });
+        } catch {
+          /* reporting must never leave the dialog open */
+        }
+        await (accept ? dialog.accept() : dialog.dismiss()).catch(() => {});
+      });
+    }
+
     // Title the windows so the user can tell them apart
     devPage.on('load', async () => {
       try {
@@ -651,7 +673,7 @@ class QAComparisonEngine {
         this.log(sessionId, `Ignore rule "${r}" is not a valid regular expression and was skipped`, 'Info', 'Error');
       }
     }
-    this.log(sessionId, 'Action recorder active on DEV — interact only in the QA Vision DEV window', 'Active', 'Active');
+    this.log(sessionId, 'Action recorder active on DEV — interact in the DEV pane of Live Comparison', 'Active', 'Active');
 
     if (startImmediately) {
       // Baseline comparison of the landing pages (runs on the queue, does not block the API)
@@ -659,7 +681,7 @@ class QAComparisonEngine {
         await this.compareAfterAction(sessionId, ['initial']);
       });
     } else {
-      this.log(sessionId, 'Ready — log in or navigate in the DEV window, then press Start Comparison to begin', 'Ready', 'Ready');
+      this.log(sessionId, 'Ready — log in or navigate in the DEV pane, then press Start Comparison to begin', 'Ready', 'Ready');
       this.io?.emit('status', { sessionId, phase: session.phase, message: 'Ready' });
     }
 
@@ -1176,9 +1198,12 @@ class QAComparisonEngine {
         current.pendingActions = Math.max(0, current.pendingActions - 1);
       }
       if (executed) current.uncomparedSteps.push(stepId);
-      if (current.pendingActions === 0 && current.uncomparedSteps.length && current.isRunning && current.phase === 'running') {
-        const steps = current.uncomparedSteps.splice(0);
-        await this.compareAfterAction(sessionId, steps);
+      const due = () => current.pendingActions === 0 && current.uncomparedSteps.length > 0 && current.isRunning && current.phase === 'running';
+      if (due()) {
+        // Live-view input arrives in bursts; comparing mid-typing would catch DEV ahead of PROD ("test@ac" vs "test@a").
+        // If more actions get queued while we wait, the last of them runs the comparison instead.
+        await this.waitForLiveInputQuiet(current);
+        if (due()) await this.compareAfterAction(sessionId, current.uncomparedSteps.splice(0));
       }
     });
   }
@@ -2563,13 +2588,20 @@ class QAComparisonEngine {
   }
 
   /** One frame per requested side (skipped while a previous grab is in flight or nobody is watching). */
-  private async emitFrames(session: ComparisonSession, sides: Array<'dev' | 'prod'>) {
+  private async emitFrames(session: ComparisonSession, sides: Array<'dev' | 'prod'>, urgent = false) {
     const io = this.io;
-    if (session.frameBusy || !session.isRunning || !io || io.sockets.sockets.size < 1) return;
+    if (!session.isRunning || !io || io.sockets.sockets.size < 1) return;
+    if (session.frameBusy) {
+      if (urgent) session.frameAgain = true; // input feedback must not be dropped; refresh DEV right after
+      return;
+    }
     const grab = async (page: Page): Promise<string | null> => {
       try {
-        const masks = ['input[type="password"]', ...session.capture.maskSelectors].map((sel) => page.locator(sel));
-        const buf = await page.screenshot({ type: 'jpeg', quality: 50, mask: masks, maskColor: '#000000', timeout: 4000 });
+        // Password inputs already render as dots, so they stay visible (the user must see typing land there), as in
+        // evidence screenshots. The profile's mask selectors are still blacked out.
+        const masks = session.capture.maskSelectors.map((sel) => page.locator(sel));
+        // caret: 'initial' keeps the text cursor visible, so the user can see which field has focus
+        const buf = await page.screenshot({ type: 'jpeg', quality: 50, mask: masks, maskColor: '#000000', caret: 'initial', timeout: 4000 });
         return buf.toString('base64');
       } catch {
         return null;
@@ -2580,10 +2612,46 @@ class QAComparisonEngine {
       for (const side of sides) {
         const page = side === 'dev' ? session.devPage : session.prodPage;
         const data = await grab(page);
-        if (data && session.isRunning) io.emit('frame', { sessionId: session.id, side, data, url: urlForLog(page.url()) });
+        // DEV only: name the focused field, so focus stays visible even on a masked password input. Never its value.
+        const focus =
+          side === 'dev'
+            ? await page
+                .evaluate(() => {
+                  const el = document.activeElement as HTMLElement | null;
+                  if (!el || el === document.body || el === document.documentElement) return '';
+                  const tag = el.tagName.toLowerCase();
+                  const type = el.getAttribute('type');
+                  const name =
+                    el.getAttribute('aria-label') || el.getAttribute('name') || el.getAttribute('placeholder') || el.id ||
+                    (tag === 'button' || tag === 'a' ? (el.innerText || '').trim().slice(0, 40) : ''); // never editable content
+                  return `${tag}${type ? `[${type}]` : ''}${name ? ` "${name}"` : ''}`.slice(0, 80);
+                })
+                .catch(() => '')
+            : undefined;
+        if (data && session.isRunning) io.emit('frame', { sessionId: session.id, side, data, url: urlForLog(page.url()), focus });
       }
     } finally {
       session.frameBusy = false;
+    }
+    if (session.frameAgain) {
+      session.frameAgain = false;
+      void this.emitFrames(session, ['dev']);
+    }
+  }
+
+  /**
+   * Wait (max 4 s) until no Live-view input arrived for 700 ms (longer than the recorder's 120 ms fill debounce).
+   * Ends early when another action gets queued: that action's task runs the comparison, so replays never stall here.
+   */
+  private async waitForLiveInputQuiet(session: ComparisonSession) {
+    const start = Date.now();
+    while (
+      Date.now() - start < 4000 &&
+      session.pendingActions === 0 &&
+      session.lastLiveInputAt &&
+      Date.now() - session.lastLiveInputAt < 700
+    ) {
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
 
@@ -2603,6 +2671,7 @@ class QAComparisonEngine {
       return Number.isFinite(n) ? Math.min(Math.max(n, 0), max - 1) : null;
     };
     const str = (v: unknown, max: number) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : null);
+    if (i.kind !== 'move') session.lastLiveInputAt = Date.now();
     const apply = async () => {
       if (!session.isRunning || session.stopRequested || session.suppressCapture) return;
       const page = session.devPage;
@@ -2610,15 +2679,21 @@ class QAComparisonEngine {
       switch (i.kind) {
         case 'move':
         case 'click':
+        case 'down':
+        case 'up':
         case 'wheel': {
           const x = coord(i.x, width);
           const y = coord(i.y, height);
           if (x === null || y === null) return;
           await mouse.move(x, y);
+          const button = i.button === 'right' ? 'right' : 'left';
+          const clickCount = i.count === 3 ? 3 : i.count === 2 ? 2 : 1; // 2 = word, 3 = line selection
           if (i.kind === 'click') {
-            const button = i.button === 'right' ? 'right' : 'left';
-            const clickCount = i.count === 2 ? 2 : 1;
             await mouse.down({ button, clickCount });
+            await mouse.up({ button, clickCount });
+          } else if (i.kind === 'down') {
+            await mouse.down({ button, clickCount }); // separate down/move/up: drag-to-select works
+          } else if (i.kind === 'up') {
             await mouse.up({ button, clickCount });
           } else if (i.kind === 'wheel') {
             const dy = Math.max(-3000, Math.min(3000, Number(i.deltaY) || 0));
@@ -2643,7 +2718,10 @@ class QAComparisonEngine {
           return;
       }
       // Refresh DEV now (mouse moves excluded) so the pane responds without waiting for the 1 s tick
-      if (i.kind !== 'move') setTimeout(() => void this.emitFrames(session, ['dev']), 120);
+      if (i.kind !== 'move') {
+        session.lastLiveInputAt = Date.now(); // the quiet gap starts once the input has actually been applied
+        setTimeout(() => void this.emitFrames(session, ['dev'], true), 80);
+      }
     };
     session.liveInputQueue = (session.liveInputQueue ?? Promise.resolve())
       .then(() => Promise.race([apply(), new Promise<void>((r) => setTimeout(r, 5000))]))

@@ -105,6 +105,11 @@ const QA_VISION = () => {
       const m = data?.mismatch;
       if (m?.id && mine(data)) setMismatches(prev => prev.map(x => (x.id === m.id ? { ...x, ...m } : x)));
     });
+    // The comparison browsers are headless, so their alert()/confirm() popups are shown here instead
+    socket.on('page-dialog', (data: any) => {
+      if (!mine(data) || typeof data?.message !== 'string') return;
+      setStatus(`💬 ${data.side} ${data.kind}: "${data.message}"`);
+    });
     socket.on('sync-state', (data: any) => {
       if (!mine(data)) return;
       setOutOfSync(Boolean(data?.outOfSync));
@@ -116,7 +121,7 @@ const QA_VISION = () => {
     });
     socket.on('frame', (data: any) => {
       if (!sessionRef.current || data?.sessionId !== sessionRef.current || (data.side !== 'dev' && data.side !== 'prod')) return;
-      setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || '') } }));
+      setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || ''), focus: typeof data.focus === 'string' ? data.focus : undefined } }));
     });
     return () => {
       socketRef.current = null;

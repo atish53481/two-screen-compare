@@ -58,8 +58,8 @@ The sample apps are optional **test fixtures** with deliberate differences (bann
 ## How a comparison works
 
 1. **Profiles tab.** Create or select a profile with a DEV URL, PROD URL, labels, PROD safety policy, safety allowlist and ignore rules. Click **Save Profile**.
-2. **Launch Environments.** Two separate Chromium windows open, titled *QA Vision DEV* and *QA Vision PROD*. Cookies, storage and logins are fully isolated between them. A baseline comparison of the landing pages runs immediately.
-3. **Work only in the DEV window.** Each click, typed value, dropdown change and back/forward navigation is replayed in PROD, in order.
+2. **Launch Environments.** QA Vision starts two isolated Chromium browsers (headless, no extra windows) and streams both into the **Live Comparison** tab. Cookies, storage and logins are fully isolated between them.
+3. **Work in the DEV pane of Live Comparison.** Click it to focus, then click, scroll and type as in a normal page (paste works too). Your input goes to the DEV browser; once you press **Start Comparison**, each click, typed value, dropdown change and navigation is replayed in PROD, in order. The PROD pane is view-only.
 4. After each step (or burst of steps), QA Vision captures both screens. It compares visible text and screenshot pixels, then records findings with evidence: DEV, PROD and diff screenshots.
 5. **Pause / Resume, Resynchronize Browsers, Stop** in the sidebar.
    - *Resync* moves PROD to the page matching DEV's current URL and re-runs the comparison. It does not copy in-page state such as typed values or open dialogs.
@@ -165,7 +165,8 @@ All variables are optional and server-side only. `qa-vision/.env.example` holds 
 | `QA_VISION_HOST` | Interface `server.js` binds to. Default `127.0.0.1` (loopback only). Requests are accepted when the Host header is `localhost`, `127.0.0.1` or `[::1]` (always), or equals this value when set; anything else gets 403. Set it to the address other machines use to reach you (not `0.0.0.0`), and only on a trusted network |
 | `QA_VISION_DIST_DIR` | Next.js `distDir` override. `test:ui` sets `.next-ui` so it never clobbers a running dashboard's build |
 | `QA_VISION_ALLOWED_HOSTS` | Restrict target hosts (suffix match) |
-| `QA_VISION_HEADLESS` | `1` launches comparison browsers headless |
+| `QA_VISION_SHOW_BROWSERS` | `1` shows the DEV/PROD browsers as separate visible windows (default: headless, driven from the Live view) |
+| `QA_VISION_HEADLESS` | `1` forces headless even when `QA_VISION_SHOW_BROWSERS=1` (used by the tests) |
 | `QA_VISION_ORPHAN_TIMEOUT_MS` | Milliseconds with no dashboard connected before the engine closes all running sessions (their runs are saved). Default `600000` (10 minutes). Reloading the dashboard reconnects to the running session instead |
 | `QA_DEV_URL`, `QA_PROD_URL` | Point the test suites at other deployments |
 | `QA_TEST_PG_URL` | Test only: a PostgreSQL connection string that enables the real-server database-check test |
@@ -240,8 +241,8 @@ Runtime output stays local and is git-ignored:
 
 - **After any change to `lib/playwright.ts` or `lib/engine/**`, run `npm run build:engine`** and commit the generated `engine-dist/` and `playwright.js`. `server.js` and the tests load the compiled output, so a stale copy means stale behavior.
 - Type-check with `npx tsc --noEmit -p .` (in `qa-vision/`).
-- Set `QA_VISION_HEADLESS=1` to launch the comparison browsers headless (used by the tests).
-- The DEV recorder is injected with Playwright's `addInitScript` and `exposeFunction`. It only sees actions in the **Playwright-managed DEV window**, not your normal browser.
+- Comparison browsers are headless by default; set `QA_VISION_SHOW_BROWSERS=1` to get visible windows for debugging.
+- The DEV recorder is injected with Playwright's `addInitScript` and `exposeFunction`. It sees input in the **Playwright-managed DEV browser**: Live-view input (socket event `live-input`, dispatched with `page.mouse`/`page.keyboard`), or the visible DEV window when `QA_VISION_SHOW_BROWSERS=1`. It never sees your normal browser tabs.
 
 ---
 
@@ -250,7 +251,7 @@ Runtime output stays local and is git-ignored:
 Deliberate gaps against the full specification, and known weaknesses:
 
 - **SQLite instead of PostgreSQL as the primary store.** Profiles, runs, findings, expectations and secrets live in a local SQLite file (`node:sqlite`, hence Node 22.13+). PostgreSQL is supported only as a read-only *comparison data source*, not as the app's own storage.
-- **The live view is a mirror, not an interactive embedded browser.** The dashboard shows streamed frames of both browsers; you still work in the separate DEV window. Frames stop while the run is paused.
+- **The live view is streamed screenshots, not an embedded browser.** It refreshes about once a second (immediately after your input), so it feels slower than a real tab. Native `<select>` popups and file pickers do not render headless: use the keyboard (focus the select, then arrow keys) or set `QA_VISION_SHOW_BROWSERS=1`.
 - **No app-version capture.** There is no generic way to read an application's version, so none is recorded.
 - **AI analysis and Postgres checks are not verified in CI** (see [What works today](#what-works-today)).
 - **The SQL guard is a denylist, not an allowlist.** It rejects write/DDL/transaction keywords, multiple statements and dangerous functions. It also rejects quoted identifiers that equal a keyword, such as `"end"` or `"set"`. Use a read-only database role as the real protection.

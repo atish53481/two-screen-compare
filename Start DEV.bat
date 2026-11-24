@@ -8,7 +8,7 @@ echo.
 echo URL: http://localhost:3002
 echo.
 echo Starting Next.js dev server in new window...
-cd ..\sample-dev
+cd /d "%~dp0sample-dev"
 echo.
 echo Please wait while the server starts...
 npm run dev

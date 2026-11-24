@@ -175,7 +175,7 @@ const postJson = (p, body) =>
       assert(w > 0, 'DEV frame did not decode');
       assert((await page.textContent('[data-testid="live-url-dev"]')).includes('localhost'), 'URL bar empty');
       assert(Date.now() - t < 5000, 'frames took too long');
-      assert(await page.getByText('Live view: interact in the QA Vision DEV window').isVisible(), 'label missing');
+      assert((await page.textContent('[data-testid="live-hint"]')).includes('click, scroll and type'), 'live-view hint missing');
     });
 
     const btn = (name) => page.getByRole('button', { name });
@@ -188,6 +188,53 @@ const postJson = (p, body) =>
       assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'ready', 'phase banner not ready');
       await sleep(1500);
       assert((await page.locator('[data-testid="finding-row"]').count()) === 0, 'findings appeared before Start');
+    });
+
+    await test('DEV pane is interactive: click + typing reach the DEV browser; PROD untouched while READY', async () => {
+      // Where the email field sits in the DEV viewport (same app, same default 1280x800 viewport)
+      const probe = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      await probe.goto(DEV_URL);
+      const box = await probe.locator('input').first().boundingBox();
+      await probe.close();
+      assert(box, 'email input not found on DEV');
+      const img = page.locator('[data-testid="live-frame-dev"]');
+      const natural = await img.evaluate((i) => ({ w: i.naturalWidth, h: i.naturalHeight }));
+      const shown = await img.boundingBox();
+      const frameOf = (side) => page.getAttribute(`[data-testid="live-frame-${side}"]`, 'src');
+      const devBefore = await frameOf('dev');
+      const prodBefore = await frameOf('prod');
+      await page.mouse.click(
+        shown.x + ((box.x + box.width / 2) / natural.w) * shown.width,
+        shown.y + ((box.y + box.height / 2) / natural.h) * shown.height
+      );
+      await page.keyboard.press('Control+a');
+      await page.keyboard.type('WWWWWWWWWWWWWWWWWWWW');
+      let changed = false;
+      for (let t = Date.now(); Date.now() - t < 6000 && !changed; ) {
+        await sleep(300);
+        changed = (await frameOf('dev')) !== devBefore;
+      }
+      assert(changed, 'DEV frame did not change after click + typing in the pane');
+      // Focus is reported (never values): email first, then Tab moves it to the masked password field
+      await page.waitForFunction(() => /input/.test(document.querySelector('[data-testid="live-focus"]')?.textContent || ''), null, { timeout: 6000 });
+      await page.keyboard.press('Tab');
+      await page.waitForFunction(() => /password/i.test(document.querySelector('[data-testid="live-focus"]')?.textContent || ''), null, { timeout: 6000 });
+      assert(!(await page.textContent('[data-testid="live-focus"]')).includes('WWWW'), 'focus label leaked a typed value');
+      // Nothing is replicated before START COMPARISON: PROD keeps showing the untouched login form
+      assert((await page.locator('[data-testid="finding-row"]').count()) === 0, 'typing in READY produced findings');
+      assert(prodBefore, 'no PROD frame');
+    });
+
+    await test('socket from a foreign Origin is refused; the dashboard origin connects', async () => {
+      const { io: ioc } = require('socket.io-client');
+      const tryConnect = (origin) =>
+        new Promise((resolve) => {
+          const s = ioc(BASE, { path: '/socket.io', transports: ['websocket'], reconnection: false, extraHeaders: { Origin: origin }, timeout: 5000 });
+          s.on('connect', () => (s.close(), resolve(true)));
+          s.on('connect_error', () => (s.close(), resolve(false)));
+        });
+      assert((await tryConnect('http://evil.example')) === false, 'foreign origin connected (could drive the DEV browser)');
+      assert((await tryConnect(`http://localhost:${PORT}`)) === true, 'dashboard origin refused');
     });
 
     // Reload the page and wait for the dashboard to come back (reconnect-on-load)
@@ -232,6 +279,37 @@ const postJson = (p, body) =>
 
     // The baseline comparison runs at Start; wait for findings to arrive
     await page.waitForSelector('[data-testid="finding-row"]', { timeout: 60000 }).catch(() => {});
+
+    await test('while COMPARING, typing in the DEV pane is replicated to PROD', async () => {
+      const probe = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      await probe.goto(DEV_URL);
+      const box = await probe.locator('input').first().boundingBox();
+      await probe.close();
+      assert(box, 'email input not found on DEV');
+      const img = page.locator('[data-testid="live-frame-dev"]');
+      const natural = await img.evaluate((i) => ({ w: i.naturalWidth, h: i.naturalHeight }));
+      const shown = await img.boundingBox();
+      const prodFrame = () => page.getAttribute('[data-testid="live-frame-prod"]', 'src');
+      await sleep(2500); // let the post-Start comparison settle so PROD frames are steady
+      const prodBefore = await prodFrame();
+      const fillSteps = () => page.locator('[data-testid="timeline-step"]', { hasText: /fill/i }).count();
+      const fillsBefore = await fillSteps();
+      await page.mouse.click(
+        shown.x + ((box.x + box.width / 2) / natural.w) * shown.width,
+        shown.y + ((box.y + box.height / 2) / natural.h) * shown.height
+      );
+      await page.keyboard.press('Control+a');
+      await page.keyboard.type('replica-check-MMMMMMMMMMMM');
+      let changed = false;
+      for (let t = Date.now(); Date.now() - t < 20000 && !changed; ) {
+        await sleep(500);
+        changed = (await prodFrame()) !== prodBefore;
+      }
+      assert(changed, 'PROD frame never changed: DEV-pane typing was not replicated');
+      await sleep(2000);
+      const added = (await fillSteps()) - fillsBefore;
+      assert(added >= 1 && added <= 2, `typing one word made ${added} fill steps (expected 1-2, not one per keystroke)`);
+    });
 
     await test('PAUSE shows START AGAIN; START AGAIN shows PAUSE again', async () => {
       await btn(/PAUSE/).click();
