@@ -8,7 +8,7 @@ const EXACT: DataRule = { target: '*', mode: 'exact' };
 function getPath(obj: unknown, path: string): { found: boolean; value: string } {
   let cur: any = obj;
   for (const k of path.split('.')) {
-    if (cur === null || cur === undefined || typeof cur !== 'object' || !(k in cur)) return { found: false, value: '' };
+    if (cur === null || cur === undefined || typeof cur !== 'object' || !Object.prototype.hasOwnProperty.call(cur, k)) return { found: false, value: '' };
     cur = cur[k];
   }
   return { found: true, value: cur !== null && typeof cur === 'object' ? JSON.stringify(cur) : String(cur) };
@@ -66,10 +66,18 @@ export async function runApiCheck(
   return out;
 }
 
-const FORBIDDEN = /\b(insert|update|delete|merge|alter|drop|create|truncate|grant|revoke|copy|call|do|vacuum|lock|set|into|pg_sleep|pg_sleep_for|pg_sleep_until|pg_terminate_backend|pg_cancel_backend|pg_read_file|pg_read_binary_file|pg_ls_dir|lo_import|lo_export|dblink|dblink_exec|set_config|nextval|setval|pg_advisory_lock|pg_advisory_xact_lock)\b/i;
+const FORBIDDEN = new RegExp(
+  '\\b(' + [
+    'insert', 'update', 'delete', 'merge', 'alter', 'drop', 'create', 'truncate', 'grant', 'revoke', 'copy', 'call', 'do', 'vacuum', 'lock', 'set', 'into',
+    // transaction control and session state
+    'commit', 'rollback', 'begin', 'end', 'abort', 'savepoint', 'release', 'prepare', 'deallocate', 'listen', 'notify', 'discard', 'reset', 'load', 'security', 'checkpoint',
+    // side-effecting functions
+    'pg_sleep\\w*', 'pg_terminate_backend', 'pg_cancel_backend', 'pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'pg_reload_conf', 'pg_rotate_logfile',
+    'pg_(?:try_)?advisory_\\w+', 'query_to_xml\\w*', 'lo_\\w+', 'dblink\\w*', 'set_config', 'nextval', 'setval',
+  ].join('|') + ')\\b', 'i');
 
 /** Removes comments (nesting block comments) and blanks string literals / quoted identifiers. Throws on dollar quoting and E-strings. */
-function sanitize(sql: string): string {
+function sanitize(sql: string, keepStrings = false): string {
   let out = '';
   let i = 0;
   const n = sql.length;
@@ -97,9 +105,11 @@ function sanitize(sql: string): string {
         if (sql[j] === c) { if (sql[j + 1] === c) { j += 2; continue; } break; }
         j++;
       }
-      out += c + c;
+      if (/(^|[^\w$])u&$/i.test(out)) throw new Error('U& escapes are not allowed in read-only SQL');
+      if (c === '"' && /^\s*\(/.test(sql.slice(j + 1))) throw new Error('Quoted function names are not allowed in read-only SQL');
+      out += keepStrings ? sql.slice(i, j + 1) : c + c;
       i = j + 1;
-    } else if (c === '$' && /^\$[A-Za-z_\u0080-￿]*\$/.test(sql.slice(i))) {
+    } else if (c === '$' && /^\$[A-Za-z0-9_\u0080-￿]*\$/.test(sql.slice(i))) {
       throw new Error('Dollar-quoted strings are not allowed in read-only SQL');
     } else {
       out += c;
@@ -119,18 +129,19 @@ export function assertReadOnlySql(sql: string): void {
 
 interface PgClientLike {
   connect(): Promise<void>;
-  query(q: string): Promise<{ rows: Record<string, unknown>[] }>;
+  query(q: string | { name?: string; text: string; values: unknown[] }): Promise<{ rows: Record<string, unknown>[] }>;
   end(): Promise<void>;
 }
 type PgClientCtor = new (o: object) => PgClientLike;
 
 async function runQuery(connStr: string, sql: string, Client: PgClientCtor): Promise<Record<string, unknown>[]> {
   const client = new Client({ connectionString: connStr, connectionTimeoutMillis: 8000 });
-  await client.connect();
   try {
+    await client.connect();
     await client.query('BEGIN READ ONLY');
     await client.query('SET LOCAL statement_timeout = 5000');
-    const res = await client.query(sql);
+    // Named statement forces the extended protocol, so Postgres itself refuses multiple statements.
+    const res = await client.query({ name: 'qa_ro', text: sql, values: [] });
     return res.rows;
   } finally {
     try { await client.query('ROLLBACK'); } catch { /* connection may be gone */ }
@@ -138,7 +149,7 @@ async function runQuery(connStr: string, sql: string, Client: PgClientCtor): Pro
   }
 }
 
-export async function runDbCheck(check: DbCheck, getSecret: (ref: string) => string | null): Promise<FindingDraft[]> {
+export async function runDbCheck(check: DbCheck, getSecret: (ref: string) => string | null, ClientOverride?: PgClientCtor): Promise<FindingDraft[]> {
   const component = `db:${check.name}`;
   const draft = (severity: FindingDraft['severity'], description: string, devValue = '', prodValue = ''): FindingDraft =>
     ({ type: 'Data', component, devValue, prodValue, severity, description });
@@ -148,7 +159,8 @@ export async function runDbCheck(check: DbCheck, getSecret: (ref: string) => str
     return [draft('high', `DB check "${check.name}" rejected: ${(e as Error).message}`)];
   }
   let Client: PgClientCtor;
-  try {
+  if (ClientOverride) Client = ClientOverride;
+  else try {
     // Lazy: pg is optional until the dependency is wired in.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     Client = require('pg').Client;
@@ -159,8 +171,8 @@ export async function runDbCheck(check: DbCheck, getSecret: (ref: string) => str
   const prodConn = getSecret(check.prodConnRef);
   if (!devConn || !prodConn) return [draft('low', `NOT_COMPARABLE: connection secret missing for ${!devConn ? 'DEV' : 'PROD'}`)];
 
-  const base = check.sql.trim().replace(/;\s*$/, '');
-  const sql = /\blimit\b/i.test(sanitize(base)) ? base : `${base} LIMIT 500`;
+  const base = sanitize(check.sql, true).trim().replace(/;\s*$/, '').trim();
+  const sql = `select * from (\n${base}\n) q limit 500`;
   const scrub = (e: unknown) => {
     let m = e instanceof Error ? e.message : String(e);
     for (const s of [devConn, prodConn]) m = m.split(s).join('[redacted]');

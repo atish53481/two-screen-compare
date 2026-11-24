@@ -9,7 +9,7 @@ const EXACT = { target: '*', mode: 'exact' };
 function getPath(obj, path) {
     let cur = obj;
     for (const k of path.split('.')) {
-        if (cur === null || cur === undefined || typeof cur !== 'object' || !(k in cur))
+        if (cur === null || cur === undefined || typeof cur !== 'object' || !Object.prototype.hasOwnProperty.call(cur, k))
             return { found: false, value: '' };
         cur = cur[k];
     }
@@ -62,9 +62,16 @@ async function runApiCheck(check, devCtx, prodCtx, devBase, prodBase) {
     }
     return out;
 }
-const FORBIDDEN = /\b(insert|update|delete|merge|alter|drop|create|truncate|grant|revoke|copy|call|do|vacuum|lock|set|into|pg_sleep|pg_sleep_for|pg_sleep_until|pg_terminate_backend|pg_cancel_backend|pg_read_file|pg_read_binary_file|pg_ls_dir|lo_import|lo_export|dblink|dblink_exec|set_config|nextval|setval|pg_advisory_lock|pg_advisory_xact_lock)\b/i;
+const FORBIDDEN = new RegExp('\\b(' + [
+    'insert', 'update', 'delete', 'merge', 'alter', 'drop', 'create', 'truncate', 'grant', 'revoke', 'copy', 'call', 'do', 'vacuum', 'lock', 'set', 'into',
+    // transaction control and session state
+    'commit', 'rollback', 'begin', 'end', 'abort', 'savepoint', 'release', 'prepare', 'deallocate', 'listen', 'notify', 'discard', 'reset', 'load', 'security', 'checkpoint',
+    // side-effecting functions
+    'pg_sleep\\w*', 'pg_terminate_backend', 'pg_cancel_backend', 'pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'pg_reload_conf', 'pg_rotate_logfile',
+    'pg_(?:try_)?advisory_\\w+', 'query_to_xml\\w*', 'lo_\\w+', 'dblink\\w*', 'set_config', 'nextval', 'setval',
+].join('|') + ')\\b', 'i');
 /** Removes comments (nesting block comments) and blanks string literals / quoted identifiers. Throws on dollar quoting and E-strings. */
-function sanitize(sql) {
+function sanitize(sql, keepStrings = false) {
     let out = '';
     let i = 0;
     const n = sql.length;
@@ -111,10 +118,14 @@ function sanitize(sql) {
                 }
                 j++;
             }
-            out += c + c;
+            if (/(^|[^\w$])u&$/i.test(out))
+                throw new Error('U& escapes are not allowed in read-only SQL');
+            if (c === '"' && /^\s*\(/.test(sql.slice(j + 1)))
+                throw new Error('Quoted function names are not allowed in read-only SQL');
+            out += keepStrings ? sql.slice(i, j + 1) : c + c;
             i = j + 1;
         }
-        else if (c === '$' && /^\$[A-Za-z_\u0080-￿]*\$/.test(sql.slice(i))) {
+        else if (c === '$' && /^\$[A-Za-z0-9_\u0080-￿]*\$/.test(sql.slice(i))) {
             throw new Error('Dollar-quoted strings are not allowed in read-only SQL');
         }
         else {
@@ -136,11 +147,12 @@ function assertReadOnlySql(sql) {
 }
 async function runQuery(connStr, sql, Client) {
     const client = new Client({ connectionString: connStr, connectionTimeoutMillis: 8000 });
-    await client.connect();
     try {
+        await client.connect();
         await client.query('BEGIN READ ONLY');
         await client.query('SET LOCAL statement_timeout = 5000');
-        const res = await client.query(sql);
+        // Named statement forces the extended protocol, so Postgres itself refuses multiple statements.
+        const res = await client.query({ name: 'qa_ro', text: sql, values: [] });
         return res.rows;
     }
     finally {
@@ -154,7 +166,7 @@ async function runQuery(connStr, sql, Client) {
         catch { /* ignore */ }
     }
 }
-async function runDbCheck(check, getSecret) {
+async function runDbCheck(check, getSecret, ClientOverride) {
     const component = `db:${check.name}`;
     const draft = (severity, description, devValue = '', prodValue = '') => ({ type: 'Data', component, devValue, prodValue, severity, description });
     try {
@@ -164,20 +176,23 @@ async function runDbCheck(check, getSecret) {
         return [draft('high', `DB check "${check.name}" rejected: ${e.message}`)];
     }
     let Client;
-    try {
-        // Lazy: pg is optional until the dependency is wired in.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        Client = require('pg').Client;
-    }
-    catch {
-        return [draft('low', 'NOT_COMPARABLE: pg driver not installed')];
-    }
+    if (ClientOverride)
+        Client = ClientOverride;
+    else
+        try {
+            // Lazy: pg is optional until the dependency is wired in.
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            Client = require('pg').Client;
+        }
+        catch {
+            return [draft('low', 'NOT_COMPARABLE: pg driver not installed')];
+        }
     const devConn = getSecret(check.devConnRef);
     const prodConn = getSecret(check.prodConnRef);
     if (!devConn || !prodConn)
         return [draft('low', `NOT_COMPARABLE: connection secret missing for ${!devConn ? 'DEV' : 'PROD'}`)];
-    const base = check.sql.trim().replace(/;\s*$/, '');
-    const sql = /\blimit\b/i.test(sanitize(base)) ? base : `${base} LIMIT 500`;
+    const base = sanitize(check.sql, true).trim().replace(/;\s*$/, '').trim();
+    const sql = `select * from (\n${base}\n) q limit 500`;
     const scrub = (e) => {
         let m = e instanceof Error ? e.message : String(e);
         for (const s of [devConn, prodConn])
