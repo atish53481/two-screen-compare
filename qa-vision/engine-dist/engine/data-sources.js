@@ -70,6 +70,38 @@ const FORBIDDEN = new RegExp('\\b(' + [
     'pg_sleep\\w*', 'pg_terminate_backend', 'pg_cancel_backend', 'pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'pg_reload_conf', 'pg_rotate_logfile',
     'pg_(?:try_)?advisory_\\w+', 'query_to_xml\\w*', 'lo_\\w+', 'dblink\\w*', 'set_config', 'nextval', 'setval',
 ].join('|') + ')\\b', 'i');
+/** First character at/after pos that is not whitespace or inside a comment ('' at end). */
+function nextSignificant(sql, pos) {
+    let i = pos;
+    const n = sql.length;
+    while (i < n) {
+        if (/\s/.test(sql[i]))
+            i++;
+        else if (sql[i] === '-' && sql[i + 1] === '-') {
+            while (i < n && sql[i] !== '\n')
+                i++;
+        }
+        else if (sql[i] === '/' && sql[i + 1] === '*') {
+            let depth = 1;
+            i += 2;
+            while (i < n && depth > 0) {
+                if (sql[i] === '/' && sql[i + 1] === '*') {
+                    depth++;
+                    i += 2;
+                }
+                else if (sql[i] === '*' && sql[i + 1] === '/') {
+                    depth--;
+                    i += 2;
+                }
+                else
+                    i++;
+            }
+        }
+        else
+            return sql[i];
+    }
+    return '';
+}
 /** Removes comments (nesting block comments) and blanks string literals / quoted identifiers. Throws on dollar quoting and E-strings. */
 function sanitize(sql, keepStrings = false) {
     let out = '';
@@ -120,8 +152,12 @@ function sanitize(sql, keepStrings = false) {
             }
             if (/(^|[^\w$])u&$/i.test(out))
                 throw new Error('U& escapes are not allowed in read-only SQL');
-            if (c === '"' && /^\s*\(/.test(sql.slice(j + 1)))
-                throw new Error('Quoted function names are not allowed in read-only SQL');
+            if (c === '"') {
+                if (nextSignificant(sql, j + 1) === '(')
+                    throw new Error('Quoted function names are not allowed in read-only SQL');
+                if (FORBIDDEN.test(sql.slice(i + 1, j).replace(/""/g, '"')))
+                    throw new Error('Forbidden word inside quoted identifier');
+            }
             out += keepStrings ? sql.slice(i, j + 1) : c + c;
             i = j + 1;
         }
@@ -141,7 +177,20 @@ function assertReadOnlySql(sql) {
         throw new Error('Only SELECT/WITH statements are allowed');
     if (code.includes(';'))
         throw new Error('Multiple statements are not allowed');
-    const bad = FORBIDDEN.exec(code);
+    // `end` is allowed only when closing an open `case`.
+    let depth = 0;
+    const scanned = code.replace(/\b(case|end)\b/gi, (m) => {
+        if (m.toLowerCase() === 'case') {
+            depth++;
+            return m;
+        }
+        if (depth > 0) {
+            depth--;
+            return ' ';
+        }
+        return m;
+    });
+    const bad = FORBIDDEN.exec(scanned);
     if (bad)
         throw new Error(`Forbidden keyword in read-only SQL: ${bad[1].toLowerCase()}`);
 }

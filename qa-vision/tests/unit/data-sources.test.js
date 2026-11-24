@@ -109,3 +109,19 @@ test('runDbCheck rejects the bypass string before connecting', async () => {
   assert.equal(f[0].severity, 'high');
   assert.deepEqual(log, []);
 });
+
+test('assertReadOnlySql rejects quoted function names hidden behind comments', () => {
+  for (const s of [
+    `select "dblink_exec" /**/ ('c','delete from t')`,
+    'select "dblink_exec"\n-- c\n(\'c\',\'d\')',
+    `select "set_config" /* */ ('a','b',true)`,
+    'select "pg_sleep" from t',
+  ]) assert.throws(() => assertReadOnlySql(s), undefined, s);
+});
+
+test('assertReadOnlySql allows end only closing a case', () => {
+  assert.doesNotThrow(() => assertReadOnlySql('select case when a then 1 else 0 end from t'));
+  assert.doesNotThrow(() => assertReadOnlySql('select case when a then case when b then 1 end else 0 end from t'));
+  assert.throws(() => assertReadOnlySql('select 1 end'));
+  assert.throws(() => assertReadOnlySql('select case when a then 1 end end from t'));
+});
