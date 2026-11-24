@@ -108,9 +108,19 @@ export interface DataRule {
 export interface ApiCheck {
   name: string;
   path: string;
+  /** Dot paths into the JSON response. */
+  fields: string[];
+  rule?: DataRule;
+  /** Also run after a comparison whose DEV path starts with this. */
+  whenPathStartsWith?: string;
 }
 export interface DbCheck {
   name: string;
+  /** Secret refs (never the connection strings themselves). */
+  devConnRef: string;
+  prodConnRef: string;
+  sql: string;
+  rule?: DataRule;
 }
 
 /** One DOM element captured by in-page extraction (see extract.ts). */

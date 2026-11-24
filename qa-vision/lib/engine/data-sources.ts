@@ -1,0 +1,193 @@
+import type { APIRequestContext } from 'playwright';
+import type { ApiCheck, DbCheck, DataRule, FindingDraft } from './types';
+import { compareValues } from './data-rules';
+import { redactSecrets } from './runtime-diff';
+
+const EXACT: DataRule = { target: '*', mode: 'exact' };
+
+function getPath(obj: unknown, path: string): { found: boolean; value: string } {
+  let cur: any = obj;
+  for (const k of path.split('.')) {
+    if (cur === null || cur === undefined || typeof cur !== 'object' || !(k in cur)) return { found: false, value: '' };
+    cur = cur[k];
+  }
+  return { found: true, value: cur !== null && typeof cur === 'object' ? JSON.stringify(cur) : String(cur) };
+}
+
+async function fetchJson(ctx: APIRequestContext, url: string): Promise<{ json?: unknown; error?: string }> {
+  // GET only: this is the sole method ever touched on a context.
+  if (typeof (ctx as any)?.get !== 'function') return { error: 'context has no get()' };
+  try {
+    const res = await ctx.get(url);
+    if (!res.ok()) return { error: `HTTP ${res.status()}` };
+    return { json: await res.json() };
+  } catch (e) {
+    return { error: redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 200) };
+  }
+}
+
+export async function runApiCheck(
+  check: ApiCheck,
+  devCtx: APIRequestContext,
+  prodCtx: APIRequestContext,
+  devBase: string,
+  prodBase: string,
+): Promise<FindingDraft[]> {
+  const join = (b: string, p: string) => b.replace(/\/+$/, '') + (p.startsWith('/') ? p : '/' + p);
+  const [dev, prod] = await Promise.all([fetchJson(devCtx, join(devBase, check.path)), fetchJson(prodCtx, join(prodBase, check.path))]);
+  const out: FindingDraft[] = [];
+  if (dev.error || prod.error) {
+    out.push({
+      type: 'Data', component: `api:${check.name}`, devValue: dev.error ?? 'ok', prodValue: prod.error ?? 'ok', severity: 'high',
+      description: `API check "${check.name}" (GET ${check.path}) failed: DEV ${dev.error ?? 'ok'}, PROD ${prod.error ?? 'ok'}`,
+    });
+    return out;
+  }
+  const rule = check.rule ?? EXACT;
+  for (const field of check.fields) {
+    const d = getPath(dev.json, field);
+    const p = getPath(prod.json, field);
+    const component = `api:${check.name}.${field}`;
+    if (!d.found || !p.found) {
+      out.push({
+        type: 'Data', component, property: field, devValue: d.found ? d.value : '(missing)', prodValue: p.found ? p.value : '(missing)', severity: 'high',
+        description: `Field ${field} missing in ${!d.found && !p.found ? 'both' : !d.found ? 'DEV' : 'PROD'} response of ${check.path}`,
+      });
+      continue;
+    }
+    const r = compareValues(d.value, p.value, rule);
+    if (!r.match) {
+      out.push({
+        type: 'Data', component, property: field, devValue: d.value, prodValue: p.value, severity: 'medium',
+        description: `API ${check.path} field ${field} differs (${r.detail})`, ruleApplied: check.rule ? rule.mode : null,
+      });
+    }
+  }
+  return out;
+}
+
+const FORBIDDEN = /\b(insert|update|delete|merge|alter|drop|create|truncate|grant|revoke|copy|call|do|vacuum|lock|set|into|pg_sleep|pg_sleep_for|pg_sleep_until|pg_terminate_backend|pg_cancel_backend|pg_read_file|pg_read_binary_file|pg_ls_dir|lo_import|lo_export|dblink|dblink_exec|set_config|nextval|setval|pg_advisory_lock|pg_advisory_xact_lock)\b/i;
+
+/** Removes comments (nesting block comments) and blanks string literals / quoted identifiers. Throws on dollar quoting and E-strings. */
+function sanitize(sql: string): string {
+  let out = '';
+  let i = 0;
+  const n = sql.length;
+  while (i < n) {
+    const c = sql[i];
+    const c2 = sql[i + 1];
+    if (c === '-' && c2 === '-') {
+      while (i < n && sql[i] !== '\n') i++;
+      out += ' ';
+    } else if (c === '/' && c2 === '*') {
+      let depth = 1;
+      i += 2;
+      while (i < n && depth > 0) {
+        if (sql[i] === '/' && sql[i + 1] === '*') { depth++; i += 2; }
+        else if (sql[i] === '*' && sql[i + 1] === '/') { depth--; i += 2; }
+        else i++;
+      }
+      if (depth > 0) throw new Error('Unterminated comment in SQL');
+      out += ' ';
+    } else if (c === "'" || c === '"') {
+      if (c === "'" && /(^|[^\w$])[eE]$/.test(out)) throw new Error('E-strings are not allowed in read-only SQL');
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) throw new Error('Unterminated quoted string in SQL');
+        if (sql[j] === c) { if (sql[j + 1] === c) { j += 2; continue; } break; }
+        j++;
+      }
+      out += c + c;
+      i = j + 1;
+    } else if (c === '$' && /^\$[A-Za-z_\u0080-￿]*\$/.test(sql.slice(i))) {
+      throw new Error('Dollar-quoted strings are not allowed in read-only SQL');
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+export function assertReadOnlySql(sql: string): void {
+  const code = sanitize(String(sql ?? '')).trim().replace(/;\s*$/, '').trim();
+  if (!/^(select|with)\b/i.test(code)) throw new Error('Only SELECT/WITH statements are allowed');
+  if (code.includes(';')) throw new Error('Multiple statements are not allowed');
+  const bad = FORBIDDEN.exec(code);
+  if (bad) throw new Error(`Forbidden keyword in read-only SQL: ${bad[1].toLowerCase()}`);
+}
+
+interface PgClientLike {
+  connect(): Promise<void>;
+  query(q: string): Promise<{ rows: Record<string, unknown>[] }>;
+  end(): Promise<void>;
+}
+type PgClientCtor = new (o: object) => PgClientLike;
+
+async function runQuery(connStr: string, sql: string, Client: PgClientCtor): Promise<Record<string, unknown>[]> {
+  const client = new Client({ connectionString: connStr, connectionTimeoutMillis: 8000 });
+  await client.connect();
+  try {
+    await client.query('BEGIN READ ONLY');
+    await client.query('SET LOCAL statement_timeout = 5000');
+    const res = await client.query(sql);
+    return res.rows;
+  } finally {
+    try { await client.query('ROLLBACK'); } catch { /* connection may be gone */ }
+    try { await client.end(); } catch { /* ignore */ }
+  }
+}
+
+export async function runDbCheck(check: DbCheck, getSecret: (ref: string) => string | null): Promise<FindingDraft[]> {
+  const component = `db:${check.name}`;
+  const draft = (severity: FindingDraft['severity'], description: string, devValue = '', prodValue = ''): FindingDraft =>
+    ({ type: 'Data', component, devValue, prodValue, severity, description });
+  try {
+    assertReadOnlySql(check.sql);
+  } catch (e) {
+    return [draft('high', `DB check "${check.name}" rejected: ${(e as Error).message}`)];
+  }
+  let Client: PgClientCtor;
+  try {
+    // Lazy: pg is optional until the dependency is wired in.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    Client = require('pg').Client;
+  } catch {
+    return [draft('low', 'NOT_COMPARABLE: pg driver not installed')];
+  }
+  const devConn = getSecret(check.devConnRef);
+  const prodConn = getSecret(check.prodConnRef);
+  if (!devConn || !prodConn) return [draft('low', `NOT_COMPARABLE: connection secret missing for ${!devConn ? 'DEV' : 'PROD'}`)];
+
+  const base = check.sql.trim().replace(/;\s*$/, '');
+  const sql = /\blimit\b/i.test(sanitize(base)) ? base : `${base} LIMIT 500`;
+  const scrub = (e: unknown) => {
+    let m = e instanceof Error ? e.message : String(e);
+    for (const s of [devConn, prodConn]) m = m.split(s).join('[redacted]');
+    return redactSecrets(m).slice(0, 200);
+  };
+  let dev: Record<string, unknown>[];
+  let prod: Record<string, unknown>[];
+  try {
+    [dev, prod] = await Promise.all([runQuery(devConn, sql, Client), runQuery(prodConn, sql, Client)]);
+  } catch (e) {
+    return [draft('high', `DB check "${check.name}" failed: ${scrub(e)}`)];
+  }
+  const out: FindingDraft[] = [];
+  if (dev.length !== prod.length) {
+    out.push(draft('high', `DB check "${check.name}" row count differs`, String(dev.length), String(prod.length)));
+  }
+  const rule = check.rule ?? EXACT;
+  const str = (v: unknown) => (v === null || v === undefined ? '' : v instanceof Date ? v.toISOString() : typeof v === 'object' ? JSON.stringify(v) : String(v));
+  for (let i = 0; i < Math.min(dev.length, prod.length) && out.length < 50; i++) {
+    for (const col of Object.keys(dev[i])) {
+      const d = str(dev[i][col]);
+      const p = str(prod[i][col]);
+      const r = compareValues(d, p, rule);
+      if (!r.match) {
+        out.push({ ...draft('medium', `DB check "${check.name}" row ${i} column ${col} differs (${r.detail})`, d, p), component: `${component}.${i}.${col}`, property: col });
+      }
+    }
+  }
+  return out;
+}
