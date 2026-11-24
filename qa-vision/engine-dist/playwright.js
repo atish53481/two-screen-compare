@@ -295,6 +295,7 @@ class QAComparisonEngine {
         const safetyAllowlist = opts.safetyAllowlist || [];
         const ignoreRules = opts.ignoreRules || [];
         const capture = (0, findings_1.normalizeCaptureSettings)(opts.capture);
+        const startImmediately = opts.startImmediately !== false;
         const devCheck = validateTargetUrl(devUrl);
         if (!devCheck.ok)
             throw new Error(`DEV URL rejected: ${devCheck.error}`);
@@ -366,6 +367,7 @@ class QAComparisonEngine {
             prodUrl,
             isRunning: true,
             isPaused: false,
+            phase: startImmediately ? 'running' : 'ready',
             logs: [],
             mismatches: [],
             safetyPolicy,
@@ -424,7 +426,9 @@ class QAComparisonEngine {
                 await this.performLogin(sessionId, side, r?.creds ?? null, opts.login, r?.error);
             }
         }
-        await this.runDataChecks(sessionId);
+        // Dashboard sessions run the data checks at Start Comparison instead
+        if (startImmediately)
+            await this.runDataChecks(sessionId);
         this.log(sessionId, 'Session initialized', 'Success', 'Success');
         this.log(sessionId, `PROD safety policy: ${safetyPolicy}` +
             (session.safetyAllowlist.length ? ` (allowlist: ${session.safetyAllowlist.join(', ')})` : ' (no allowlist)') +
@@ -439,10 +443,16 @@ class QAComparisonEngine {
             }
         }
         this.log(sessionId, 'Action recorder active on DEV — interact only in the QA Vision DEV window', 'Active', 'Active');
-        // Baseline comparison of the landing pages (runs on the queue, does not block the API)
-        this.enqueueTask(sessionId, async () => {
-            await this.compareAfterAction(sessionId, ['initial']);
-        });
+        if (startImmediately) {
+            // Baseline comparison of the landing pages (runs on the queue, does not block the API)
+            this.enqueueTask(sessionId, async () => {
+                await this.compareAfterAction(sessionId, ['initial']);
+            });
+        }
+        else {
+            this.log(sessionId, 'Ready — log in or navigate in the DEV window, then press Start Comparison to begin', 'Ready', 'Ready');
+            this.io?.emit('status', { sessionId, phase: session.phase, message: 'Ready' });
+        }
         this.startFrameStream(sessionId);
         console.log(`✅ QA Vision session created: ${sessionId}`);
         console.log(`   DEV  → ${devUrl}`);
@@ -579,6 +589,9 @@ class QAComparisonEngine {
         await devPage.exposeFunction('__qaVisionOnAction', async (action) => {
             const current = this.sessions.get(sessionId);
             if (!current || !current.isRunning || current.isPaused || current.stopRequested)
+                return;
+            // Ready: nothing is recorded or replicated (the single "Ready" line was logged at launch)
+            if (current.phase === 'ready')
                 return;
             if (current.suppressCapture) {
                 this.log(sessionId, 'Action in DEV window ignored while auto-login was running', 'Info', 'Info');
@@ -921,7 +934,7 @@ class QAComparisonEngine {
      */
     enqueueAction(sessionId, action) {
         const session = this.sessions.get(sessionId);
-        if (!session)
+        if (!session || session.phase === 'ready')
             return Promise.resolve();
         session.pendingActions++;
         return this.enqueueTask(sessionId, async () => {
@@ -938,7 +951,7 @@ class QAComparisonEngine {
             }
             if (executed)
                 current.uncomparedSteps.push(stepId);
-            if (current.pendingActions === 0 && current.uncomparedSteps.length && current.isRunning && !current.isPaused) {
+            if (current.pendingActions === 0 && current.uncomparedSteps.length && current.isRunning && current.phase === 'running') {
                 const steps = current.uncomparedSteps.splice(0);
                 await this.compareAfterAction(sessionId, steps);
             }
@@ -959,7 +972,7 @@ class QAComparisonEngine {
      * Note: this aligns the page/route only; in-page state (typed values, open modals,
      * client-side login state) is not transferred.
      */
-    async resync(sessionId) {
+    async resync(sessionId, stepLabel = 'resync') {
         const session = this.sessions.get(sessionId);
         if (!session || !session.isRunning)
             return { ok: false, message: 'No active session' };
@@ -985,10 +998,10 @@ class QAComparisonEngine {
             const recorderOk = await this.injectRecorderScript(session.devPage);
             this.log(sessionId, `Resynchronized: PROD navigated to ${urlForLog(target)} (DEV at ${urlForLog(devHref)}); recorder ${recorderOk ? 'active' : 'NOT active'}`, 'Synced', recorderOk ? 'Synced' : 'Error');
             this.setSyncState(sessionId, false, 'resynchronized');
-            session.uncomparedSteps.push('resync');
+            session.uncomparedSteps.push(stepLabel);
             await this.enqueueTask(sessionId, async () => {
                 const steps = session.uncomparedSteps.splice(0);
-                await this.compareAfterAction(sessionId, steps.length ? steps : ['resync']);
+                await this.compareAfterAction(sessionId, steps.length ? steps : [stepLabel]);
             });
             return {
                 ok: recorderOk,
@@ -1005,17 +1018,61 @@ class QAComparisonEngine {
             return { ok: false, message };
         }
     }
+    getPhase(sessionId) {
+        return this.sessions.get(sessionId)?.phase;
+    }
+    setPhase(session, phase) {
+        session.phase = phase;
+        session.isPaused = phase === 'paused';
+        this.io?.emit('status', { sessionId: session.id, phase, message: phase });
+    }
+    /**
+     * Start Comparison (valid only from 'ready'): run the start-of-session data checks, align PROD to
+     * DEV's current page and run the baseline comparison, then begin replicating DEV actions.
+     */
+    async startComparison(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.isRunning)
+            return { ok: false, status: 'not-found', message: 'No active session' };
+        if (session.phase !== 'ready' || session.starting) {
+            return { ok: false, status: 'bad-phase', phase: session.phase, message: `Session is ${session.starting ? 'starting' : session.phase}, not ready` };
+        }
+        session.starting = true;
+        try {
+            this.setPhase(session, 'running'); // before resync, so its baseline comparison and DEV actions are live
+            await this.runDataChecks(sessionId);
+            const r = await this.resync(sessionId, 'initial');
+            if (!r.ok) {
+                this.setPhase(session, 'ready');
+                return { ok: false, status: 'failed', phase: 'ready', message: r.message };
+            }
+            this.log(sessionId, 'Comparison started', 'Started', 'Started');
+            return { ok: true, status: 'ok', phase: 'running', message: r.message };
+        }
+        finally {
+            session.starting = false;
+        }
+    }
+    /** Pause (running -> paused) or resume (paused -> running, with a resync + comparison so drift is caught). */
     async setPaused(sessionId, paused) {
         const session = this.sessions.get(sessionId);
         if (!session)
-            return;
-        session.isPaused = paused;
-        this.log(sessionId, paused ? 'Session paused' : 'Session resumed', 'OK', 'OK');
+            return undefined;
+        if (paused && session.phase === 'running') {
+            this.setPhase(session, 'paused');
+            this.log(sessionId, 'Session paused', 'OK', 'OK');
+        }
+        else if (!paused && session.phase === 'paused') {
+            this.setPhase(session, 'running');
+            this.log(sessionId, 'Session resumed', 'OK', 'OK');
+            await this.resync(sessionId, 'resume');
+        }
+        return session.phase;
     }
     /** Replay one DEV action on PROD. Returns true when the DEV action happened (so a comparison is due). */
     async replicateAction(sessionId, action, stepId = "manual") {
         const session = this.sessions.get(sessionId);
-        if (!session || !session.isRunning || session.isPaused)
+        if (!session || !session.isRunning || session.phase !== 'running')
             return false;
         const { prodPage } = session;
         const label = action.testId || action.ariaLabel || action.labelText || action.text || action.name || action.selector || action.type;

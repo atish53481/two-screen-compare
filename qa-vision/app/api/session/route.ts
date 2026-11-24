@@ -69,6 +69,7 @@ export async function POST(request: NextRequest) {
           devUrl,
           prodUrl,
           {
+            startImmediately: false, // dashboard sessions open 'ready'; the user presses Start Comparison
             projectName: projectName || 'QA Vision Session',
             safetyPolicy: policy,
             safetyAllowlist: allowlist,
@@ -88,8 +89,9 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({
           success: true,
           sessionId: newSessionId,
+          phase: comparisonEngine.getPhase(newSessionId) ?? 'ready',
           message:
-            'Real synchronized session started. Use only the Playwright DEV window — actions mirror to PROD.',
+            'DEV and PROD windows are ready. Log in or navigate in the DEV window, then press Start Comparison.',
         });
       }
 
@@ -111,8 +113,20 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        await comparisonEngine.setPaused(sessionId, Boolean(paused));
-        return NextResponse.json({ success: true, paused: Boolean(paused) });
+        if (!comparisonEngine.getSession(sessionId)) {
+          return NextResponse.json({ success: false, error: 'Unknown session' }, { status: 404 });
+        }
+        const phase = await comparisonEngine.setPaused(sessionId, Boolean(paused));
+        return NextResponse.json({ success: true, paused: phase === 'paused', phase });
+      }
+
+      case 'start': {
+        if (!sessionId) {
+          return NextResponse.json({ success: false, error: 'sessionId required' }, { status: 400 });
+        }
+        const r = await comparisonEngine.startComparison(sessionId);
+        const status = r.status === 'ok' ? 200 : r.status === 'not-found' ? 404 : 409;
+        return NextResponse.json({ ...r, success: r.ok, error: r.ok ? undefined : r.message }, { status });
       }
 
       case 'resync': {
@@ -150,7 +164,13 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const sid = request.nextUrl.searchParams.get('sessionId');
+  if (sid) {
+    const phase = comparisonEngine.getPhase(sid);
+    if (!phase) return NextResponse.json({ success: false, error: 'Unknown session' }, { status: 404 });
+    return NextResponse.json({ success: true, sessionId: sid, phase, paused: phase === 'paused' });
+  }
   return NextResponse.json({
     status: 'QA Vision Automation Engine Ready',
     capabilities: [

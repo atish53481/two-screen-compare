@@ -178,8 +178,46 @@ const postJson = (p, body) =>
       assert(await page.getByText('Live view: interact in the QA Vision DEV window').isVisible(), 'label missing');
     });
 
-    // The baseline comparison runs after launch; wait for findings to arrive
+    const btn = (name) => page.getByRole('button', { name });
+
+    await test('after Launch: START COMPARISON and STOP are visible, PAUSE is not; nothing is compared', async () => {
+      await btn(/START COMPARISON/).waitFor({ timeout: 10000 });
+      assert(await btn(/STOP/).first().isVisible(), 'STOP missing');
+      assert((await btn(/PAUSE/).count()) === 0, 'PAUSE must not show before Start');
+      assert((await btn(/LAUNCH ENVIRONMENTS/).count()) === 0, 'Launch still shown while a session is active');
+      assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'ready', 'phase banner not ready');
+      await sleep(1500);
+      assert((await page.locator('[data-testid="finding-row"]').count()) === 0, 'findings appeared before Start');
+    });
+
+    await test('start: unknown session -> 404', async () => {
+      const r = await postJson('/api/session', { action: 'start', sessionId: 'sess_nope' });
+      assert(r.status === 404, `status ${r.status}`);
+    });
+
+    await test('clicking START COMPARISON shows PAUSE; starting again via the route -> 409', async () => {
+      const responded = page.waitForResponse((r) => r.url().endsWith('/api/session') && r.request().method() === 'POST', { timeout: 60000 });
+      await btn(/START COMPARISON/).click();
+      assert((await responded).status() === 200, 'start did not return 200');
+      await btn(/PAUSE/).waitFor({ timeout: 10000 });
+      assert((await btn(/START COMPARISON/).count()) === 0, 'START COMPARISON still shown');
+      assert(await btn(/Resync/).isVisible(), 'Resync missing while running');
+      const second = await postJson('/api/session', { action: 'start', sessionId });
+      assert(second.status === 409, `second start -> ${second.status}`);
+    });
+
+    // The baseline comparison runs at Start; wait for findings to arrive
     await page.waitForSelector('[data-testid="finding-row"]', { timeout: 60000 }).catch(() => {});
+
+    await test('PAUSE shows START AGAIN; START AGAIN shows PAUSE again', async () => {
+      await btn(/PAUSE/).click();
+      await btn(/START AGAIN/).waitFor({ timeout: 10000 });
+      assert((await btn(/PAUSE/).count()) === 0, 'PAUSE still shown while paused');
+      assert(await btn(/STOP/).first().isVisible(), 'STOP missing while paused');
+      assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'paused', 'phase banner not paused');
+      await btn(/START AGAIN/).click();
+      await btn(/PAUSE/).waitFor({ timeout: 30000 });
+    });
 
     await test('finding filters narrow list', async () => {
       const count = async () => page.locator('[data-testid="finding-row"]').count();

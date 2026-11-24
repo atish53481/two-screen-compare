@@ -43,7 +43,10 @@ const QA_VISION = () => {
   });
 
   const [isRunning, setIsRunning] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
+  // Session phase: 'ready' (windows open, nothing compared) -> 'running' <-> 'paused'
+  const [phase, setPhase] = useState<'ready' | 'running' | 'paused'>('ready');
+  const isPaused = phase === 'paused';
+  const [isBusy, setIsBusy] = useState(false); // a session request is in flight
   const [isStopping, setIsStopping] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [mismatches, setMismatches] = useState<Mismatch[]>([]);
@@ -97,6 +100,10 @@ const QA_VISION = () => {
       setOutOfSync(Boolean(data?.outOfSync));
       if (data?.outOfSync) setStatus(`⚠️ OUT OF SYNC — ${data.detail}. Use RESYNCHRONIZE BROWSERS.`);
     });
+    socket.on('status', (data: any) => {
+      if (!mine(data) || !sessionRef.current) return;
+      if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
+    });
     socket.on('frame', (data: any) => {
       if (!sessionRef.current || data?.sessionId !== sessionRef.current || (data.side !== 'dev' && data.side !== 'prod')) return;
       setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || '') } }));
@@ -122,7 +129,7 @@ const QA_VISION = () => {
   };
 
   // Real synchronized session with recorder
-  const startComparison = async () => {
+  const launchSession = async () => {
     if (isRunning || isStopping || !currentProfile) return;
 
     setStatus('🚀 Launching Playwright DEV + PROD browsers and installing recorder...');
@@ -158,10 +165,10 @@ const QA_VISION = () => {
         sessionRef.current = data.sessionId;
         setEvidenceSessionId(data.sessionId);
         setIsRunning(true);
-        setIsPaused(false);
+        setPhase('ready');
         setMismatches([]);
         setStatus(
-          '🎤 RECORDER ACTIVE — Use only the Playwright window titled "QA Vision DEV". Actions mirror to the PROD window. Do not use normal Chrome tabs.'
+          'READY — log in or navigate in the "QA Vision DEV" window. Nothing is compared or replicated yet. Press START COMPARISON when DEV is where you want to begin.'
         );
         setActiveTab('dashboard');
       } else {
@@ -180,21 +187,54 @@ const QA_VISION = () => {
     }
   };
 
-  const pauseComparison = async () => {
-    if (!isRunning || isStopping) return;
-    const next = !isPaused;
-    setIsPaused(next);
-    setStatus(next ? 'Paused — replication suspended' : 'Synchronized — monitoring DEV actions');
+  const postSession = async (body: Record<string, unknown>) => {
+    const res = await fetch('/api/session', { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body) });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+
+  // Ready -> running: aligns PROD to DEV's current page, then compares
+  const startComparison = async () => {
+    if (!isRunning || isStopping || isBusy || !sessionId) return;
+    setIsBusy(true);
+    setStatus('Starting: aligning PROD to the DEV page and running the first comparison…');
     try {
-      if (sessionId) {
-        await fetch('/api/session', {
-          method: 'POST',
-          headers: jsonHeaders,
-          body: JSON.stringify({ action: 'pause', sessionId, paused: next }),
-        });
+      const { res, data } = await postSession({ action: 'start', sessionId });
+      if (res.ok && data.success) {
+        setPhase('running');
+        setStatus('COMPARING — DEV actions are replicated to PROD and compared. Use only the "QA Vision DEV" window.');
+      } else {
+        setStatus(`❌ Could not start: ${data?.error || data?.message || 'HTTP ' + res.status}`);
       }
-    } catch (e) {
-      console.warn('Pause API failed', e);
+    } catch (e: any) {
+      setStatus(`❌ Could not start: ${e?.message || 'network error'}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  // Running -> paused, and paused -> running ("START AGAIN": resyncs PROD, then compares)
+  const pauseComparison = async () => {
+    if (!isRunning || isStopping || isBusy || !sessionId) return;
+    const resuming = isPaused;
+    setIsBusy(true);
+    setStatus(resuming ? 'Starting again: re-aligning PROD to DEV and comparing…' : 'Pausing…');
+    try {
+      const { res, data } = await postSession({ action: 'pause', sessionId, paused: !resuming });
+      if (res.ok && data.success) {
+        setPhase(data.phase === 'paused' ? 'paused' : 'running');
+        setStatus(
+          data.phase === 'paused'
+            ? 'PAUSED — nothing is replicated or compared. Press START AGAIN to resync PROD and continue.'
+            : 'COMPARING — DEV actions are replicated to PROD and compared.'
+        );
+      } else {
+        setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${data?.error || 'HTTP ' + res.status}`);
+      }
+    } catch (e: any) {
+      setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${e?.message || 'network error'}`);
+    } finally {
+      setIsBusy(false);
     }
   };
 
@@ -202,7 +242,6 @@ const QA_VISION = () => {
     if (!isRunning || isStopping) return;
 
     setIsStopping(true);
-    setIsPaused(false);
     setStatus('🛑 Stopping real browser sessions and cleaning up...');
 
     try {
@@ -217,6 +256,7 @@ const QA_VISION = () => {
 
     setIsRunning(false);
     setIsStopping(false);
+    setPhase('ready');
     setSessionId(null);
     setFrames({});
     setHistoryKey(k => k + 1);
@@ -264,7 +304,7 @@ const QA_VISION = () => {
       return;
     }
 
-    await startComparison();
+    await launchSession();
   };
 
   const loadProfile = (id: string) => {
@@ -486,13 +526,15 @@ const QA_VISION = () => {
         </div>
 
         <div className="flex items-center gap-3">
-          <button
-            onClick={launchEnvironments}
-            className="flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-all bg-violet-600 hover:bg-violet-500 text-white"
-          >
-            <Power className="h-4 w-4" />
-            LAUNCH ENVIRONMENTS
-          </button>
+          {!isRunning && !isStopping && (
+            <button
+              onClick={launchEnvironments}
+              className="flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-all bg-violet-600 hover:bg-violet-500 text-white"
+            >
+              <Power className="h-4 w-4" />
+              LAUNCH ENVIRONMENTS
+            </button>
+          )}
 
           <button
             onClick={() => setActiveTab('profiles')}
@@ -521,38 +563,66 @@ const QA_VISION = () => {
             <div className="space-y-3">
               {isRunning ? (
                 <>
-                  <div className="w-full py-3 px-4 bg-emerald-900/50 border border-emerald-500 rounded-2xl text-center text-emerald-400 text-sm font-medium">
-                    {isPaused ? '⏸ SESSION PAUSED' : '🔄 REAL SYNCHRONIZED SESSION ACTIVE'}
+                  <div
+                    data-testid="phase-banner"
+                    data-phase={phase}
+                    className={`w-full py-3 px-4 border rounded-2xl text-center text-sm font-medium ${
+                      phase === 'ready'
+                        ? 'bg-sky-900/40 border-sky-500 text-sky-300'
+                        : phase === 'paused'
+                          ? 'bg-amber-900/40 border-amber-500 text-amber-300'
+                          : 'bg-emerald-900/50 border-emerald-500 text-emerald-400'
+                    }`}
+                  >
+                    {phase === 'ready'
+                      ? 'READY — log in or navigate, then press Start'
+                      : phase === 'paused'
+                        ? '⏸ PAUSED — nothing is compared'
+                        : '🔄 COMPARING — DEV actions mirror to PROD'}
                   </div>
                   <div className="grid grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={pauseComparison}
-                      disabled={isStopping}
-                      className={`flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed ${isPaused ? 'bg-amber-500 text-black' : 'bg-zinc-800 hover:bg-zinc-700'}`}
-                    >
-                      {isPaused ? <Play className="h-5 w-5" /> : <Pause className="h-5 w-5" />}
-                      {isPaused ? 'RESUME' : 'PAUSE'}
-                    </button>
+                    {phase === 'running' ? (
+                      <button
+                        type="button"
+                        onClick={pauseComparison}
+                        disabled={isStopping || isBusy}
+                        className="flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-zinc-800 hover:bg-zinc-700"
+                      >
+                        <Pause className="h-5 w-5" />
+                        ⏸ PAUSE
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={phase === 'ready' ? startComparison : pauseComparison}
+                        disabled={isStopping || isBusy}
+                        className="flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed bg-emerald-600 hover:bg-emerald-500 text-white"
+                      >
+                        <Play className="h-5 w-5" />
+                        {isBusy ? 'STARTING…' : phase === 'ready' ? '▶ START COMPARISON' : '▶ START AGAIN'}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={stopComparison}
-                      disabled={isStopping}
+                      disabled={isStopping || isBusy}
                       className="flex items-center justify-center gap-2 bg-red-600 hover:bg-red-500 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Square className="h-5 w-5" />
-                      {isStopping ? 'STOPPING…' : 'STOP'}
+                      {isStopping ? 'STOPPING…' : '■ STOP'}
                     </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={resync}
-                    disabled={isStopping || isPaused || isResyncing}
-                    className="w-full flex items-center justify-center gap-2 border border-zinc-700 hover:bg-zinc-800 py-3.5 rounded-2xl text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <RefreshCw className="h-4 w-4" />
-                    {isResyncing ? 'RESYNCHRONIZING…' : 'RESYNCHRONIZE BROWSERS'}
-                  </button>
+                  {phase === 'running' && (
+                    <button
+                      type="button"
+                      onClick={resync}
+                      disabled={isStopping || isBusy || isResyncing}
+                      className="w-full flex items-center justify-center gap-2 border border-zinc-700 hover:bg-zinc-800 py-3.5 rounded-2xl text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {isResyncing ? 'RESYNCHRONIZING…' : 'Resync'}
+                    </button>
+                  )}
                 </>
               ) : (
                 <div className="w-full py-4 px-6 bg-zinc-800/60 border border-zinc-700 rounded-2xl text-center text-zinc-400 text-sm font-medium">
@@ -585,7 +655,12 @@ const QA_VISION = () => {
               </div>
 
               <div className="mt-8 pt-6 border-t border-zinc-800 text-center">
-                {isRunning && !isPaused ? (
+                {isRunning && phase === 'ready' ? (
+                  <div className="inline-flex items-center gap-2 px-6 py-2 rounded-2xl text-sm font-medium bg-sky-500/10 text-sky-300">
+                    <div className="h-2 w-2 bg-sky-400 rounded-full"></div>
+                    READY — NOT COMPARING
+                  </div>
+                ) : isRunning && !isPaused ? (
                   <div className="inline-flex items-center gap-2 px-6 py-2 rounded-2xl text-sm font-medium bg-emerald-500/10 text-emerald-400">
                     <div className="h-2 w-2 bg-emerald-400 rounded-full animate-pulse"></div>
                     LIVE SYNCHRONIZED (DEV → PROD)

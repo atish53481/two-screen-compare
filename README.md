@@ -80,6 +80,7 @@ Each row names the test that proves it. Paths are relative to `qa-vision/`. "Imp
 | Element matching on PROD (test id, id, role + name, label, name, placeholder, aria-label, input type); only when exactly one element matches, never guessed | ✅ | `tests/e2e/safety.e2e.js` |
 | PROD safety (read-only default, network write guard, allowlist) | ✅ [details](#prod-safety) | `tests/e2e/safety.e2e.js`, `tests/e2e/allowlist.e2e.js` |
 | Ordered replay queue; every step covered by a comparison; out-of-sync + Resync; Stop draining | ✅ | `tests/e2e/sync.e2e.js` |
+| Launch → Start Comparison → Pause / Start again → Stop flow: Launch opens DEV + PROD in a Ready phase (nothing replicated or compared, live frames and PROD guard active); Start syncs PROD to DEV's page and compares; Start again resyncs; Stop works from any phase | ✅ | `tests/e2e/start-flow.e2e.js`, `tests/ui/dashboard.ui.js` (button flow, `start` route 404/409) |
 | Configurable capture: viewport, thresholds, masking, scope | ✅ | `tests/unit/capture-settings.test.js`, `tests/e2e/capture.e2e.js` |
 | Structured in-page snapshot extraction (with sensitive-field redaction) | ✅ | `tests/e2e/extract.e2e.js` |
 | DOM structure and form-constraint diff | ✅ | `tests/unit/dom-diff.test.js`, `tests/e2e/comparisons.e2e.js` |
