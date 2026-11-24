@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.originOf = exports.DECRYPT_FAILED = exports.SecretError = void 0;
+exports.dbSecretPrefix = exports.originOf = exports.DECRYPT_FAILED = exports.SecretError = void 0;
 exports.getDataDir = getDataDir;
 exports.loadKey = loadKey;
 exports.encryptSecret = encryptSecret;
@@ -12,6 +12,7 @@ exports.putSecretFile = putSecretFile;
 exports.getSecretFile = getSecretFile;
 exports.deleteSecretFile = deleteSecretFile;
 exports.resolveLoginUrl = resolveLoginUrl;
+exports.deleteDbCheckSecrets = deleteDbCheckSecrets;
 exports.storeProfileSecrets = storeProfileSecrets;
 exports.safeStoreProfileSecrets = safeStoreProfileSecrets;
 exports.resolveSessionLogin = resolveSessionLogin;
@@ -116,6 +117,57 @@ function sideBinding(profile, side) {
     const url = side === 'A' ? profile?.urlA : profile?.urlB;
     return `${(0, exports.originOf)(url)}|${(0, exports.originOf)(profile?.login?.loginPath || '/', url)}`;
 }
+/** All of a profile's DB connection refs start with this; the engine refuses refs outside it. */
+const dbSecretPrefix = (profileId) => `profile:${profileId}:db:`;
+exports.dbSecretPrefix = dbSecretPrefix;
+const dbRef = (profileId, name, side) => `${(0, exports.dbSecretPrefix)(profileId)}${encodeURIComponent(name)}:${side}`;
+/**
+ * DB check connection strings are write-only: `devConn`/`prodConn` (plaintext, input only) are encrypted under
+ * refs derived from profile id + check name; stored checks keep only devConnRef/prodConnRef, and a ref is kept
+ * only if its blob exists. Client-supplied refs are ignored. Secrets of removed or renamed checks are deleted.
+ */
+function storeDbCheckSecrets(profile, dataDir, env, existing) {
+    const checks = profile.dbChecks;
+    if (!Array.isArray(checks))
+        return undefined;
+    const seen = new Set();
+    const out = checks.map((raw) => {
+        const { devConn, prodConn, devConnRef: _d, prodConnRef: _p, devStored: _ds, prodStored: _ps, ...rest } = raw || {};
+        const name = typeof rest.name === 'string' ? rest.name.trim() : '';
+        if (!name)
+            throw new SecretError('Every DB check needs a name');
+        if (seen.has(name))
+            throw new SecretError(`Duplicate DB check name: ${name}`);
+        seen.add(name);
+        const refs = {};
+        for (const [side, plain] of [['dev', devConn], ['prod', prodConn]]) {
+            const ref = dbRef(profile.id, name, side);
+            if (typeof plain === 'string' && plain.length > 0)
+                putSecretFile(dataDir, ref, encryptSecret(plain, loadKey(env, dataDir)));
+            refs[`${side}ConnRef`] = getSecretFile(dataDir, ref) ? ref : '';
+        }
+        return { ...rest, name, ...refs };
+    });
+    const keep = new Set(out.flatMap((c) => [c.devConnRef, c.prodConnRef]));
+    for (const old of Array.isArray(existing?.dbChecks) ? existing.dbChecks : []) {
+        for (const r of [old?.devConnRef, old?.prodConnRef]) {
+            if (typeof r === 'string' && r.startsWith((0, exports.dbSecretPrefix)(profile.id)) && !keep.has(r))
+                deleteSecretFile(dataDir, r);
+        }
+    }
+    return out;
+}
+/** Remove every stored DB connection secret of a profile (profile deletion). */
+function deleteDbCheckSecrets(profile, dataDir) {
+    if (!profile)
+        return;
+    for (const c of profile.dbChecks || []) {
+        for (const r of [c?.devConnRef, c?.prodConnRef]) {
+            if (typeof r === 'string' && r.startsWith((0, exports.dbSecretPrefix)(profile.id)))
+                deleteSecretFile(dataDir, r);
+        }
+    }
+}
 /**
  * Move any plaintext credentials{A,B}.password into the encrypted store and return a profile
  * without them (username + secretRef only). Input is not mutated. Any client-supplied secretRef
@@ -124,6 +176,9 @@ function sideBinding(profile, side) {
  */
 function storeProfileSecrets(profile, dataDir, env = process.env, existing) {
     const out = { ...profile };
+    const dbChecks = storeDbCheckSecrets(profile, dataDir, env, existing);
+    if (dbChecks)
+        out.dbChecks = dbChecks;
     for (const side of ['A', 'B']) {
         const field = `credentials${side}`;
         const c = profile[field];
@@ -167,6 +222,12 @@ function safeStoreProfileSecrets(profile, dataDir, env = process.env) {
                 const { password: _p, secretRef: _r, ...rest } = out[f];
                 out[f] = rest;
             }
+        }
+        if (Array.isArray(out.dbChecks)) {
+            out.dbChecks = out.dbChecks.map((c) => {
+                const { devConn: _a, prodConn: _b, devConnRef: _c, prodConnRef: _d, ...rest } = c || {};
+                return { ...rest, devConnRef: '', prodConnRef: '' };
+            });
         }
         return { profile: out, error: e instanceof SecretError ? e.message : 'Could not store secret' };
     }

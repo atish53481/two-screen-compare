@@ -11,7 +11,8 @@ import { diffCss } from './engine/css-diff';
 import { diffA11y } from './engine/a11y-diff';
 import { diffData } from './engine/data-rules';
 import { diffNetwork, diffRuntime, toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
-import { originOf, resolveLoginUrl, getDataDir } from './engine/secrets';
+import { originOf, resolveLoginUrl, getDataDir, getSecretFile, decryptSecret, loadKey, dbSecretPrefix } from './engine/secrets';
+import { runDataSourceChecks } from './engine/data-sources';
 import { openStore } from './engine/store';
 import { analyzeFindings, providerFromEnv, type AiProvider, DEFAULT_AI_OPTIONS } from './engine/ai';
 import type { Finding, AiAnalysis, FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
@@ -222,6 +223,8 @@ export interface ComparisonSession {
   ignoreRules: string[];
   ignore: CompiledIgnoreRules;
   dataRules: DataRule[];
+  apiChecks: ApiCheck[];
+  dbChecks: DbCheck[];
   /** Ordered action queue: actions replay one at a time, in capture order. */
   actionQueue: Promise<void>;
   pendingActions: number;
@@ -476,6 +479,8 @@ class QAComparisonEngine {
       ignoreRules: (ignoreRules || []).map((r) => String(r).trim()).filter(Boolean),
       ignore: compileIgnoreRules(ignoreRules || []),
       dataRules: opts.dataRules || [],
+      apiChecks: opts.apiChecks || [],
+      dbChecks: opts.dbChecks || [],
       actionQueue: Promise.resolve(),
       pendingActions: 0,
       stepCounter: 0,
@@ -528,6 +533,8 @@ class QAComparisonEngine {
         await this.performLogin(sessionId, side, r?.creds ?? null, opts.login, r?.error);
       }
     }
+
+    await this.runDataChecks(sessionId);
 
     this.log(sessionId, 'Session initialized', 'Success', 'Success');
     this.log(
@@ -1880,6 +1887,12 @@ class QAComparisonEngine {
         );
       }
 
+      try {
+        await this.runDataChecks(sessionId, new URL(session.devPage.url()).pathname || '/');
+      } catch {
+        /* never fails the comparison */
+      }
+
       this.log(
         sessionId,
         `Compared after ${stepLabel}: ${added} new (Text ${counts.Text}, DOM ${counts.DOM}, CSS ${counts.CSS}, Layout ${counts.Layout}, A11y ${counts.Accessibility}, Data ${counts.Data}, Network ${counts.Network}, Console ${counts.Console}), ${repeated} already reported, ${(ratio * 100).toFixed(1)}% pixels differ` +
@@ -1890,6 +1903,44 @@ class QAComparisonEngine {
     } catch (e: any) {
       console.warn('Screenshot/text comparison failed', e);
       this.log(sessionId, `Comparison failed after ${stepLabel}: ${String(e?.message || e).split('\n')[0]}`, 'Error', 'Error');
+    }
+  }
+
+  /** Decrypt a stored connection string; null on any failure. Never logs the value. */
+  private getSecret(ref: string): string | null {
+    try {
+      const dir = getDataDir();
+      const blob = getSecretFile(dir, ref);
+      return blob ? decryptSecret(blob, loadKey(process.env, dir)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Run the profile's API and DB checks and record their findings through the normal pipeline.
+   * Session start: all checks. After a comparison (afterDevPath): API checks whose whenPathStartsWith matches.
+   * PROD safety: the checks only ever call GET on each page's context.request (runApiCheck's sole method),
+   * so they cannot mutate PROD; DB checks run in BEGIN READ ONLY and never touch the browser.
+   */
+  private async runDataChecks(sessionId: string, afterDevPath?: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session || (!session.apiChecks.length && !session.dbChecks.length)) return;
+    try {
+      const drafts = await runDataSourceChecks({
+        apiChecks: session.apiChecks,
+        dbChecks: session.dbChecks,
+        devCtx: session.devContext.request,
+        prodCtx: session.prodContext.request,
+        devBase: session.devUrl,
+        prodBase: session.prodUrl,
+        getSecret: (ref) => this.getSecret(ref),
+        afterDevPath,
+        refPrefix: session.profileId ? dbSecretPrefix(session.profileId) : 'no-profile:',
+      });
+      for (const d of drafts) this.recordMismatch(sessionId, d);
+    } catch (e: any) {
+      this.log(sessionId, `Data checks failed: ${String(e?.message || e).split(String.fromCharCode(10))[0].slice(0, 200)}`, 'Error', 'Error');
     }
   }
 

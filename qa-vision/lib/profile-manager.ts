@@ -1,7 +1,7 @@
 import 'server-only';
 import path from 'path';
 import { ComparisonProfile, ProfileCredentialsInput } from './types';
-import { getDataDir, storeProfileSecrets, deleteSecretFile } from './engine/secrets';
+import { getDataDir, storeProfileSecrets, deleteSecretFile, deleteDbCheckSecrets } from './engine/secrets';
 import { openStore } from './engine/store';
 
 const dataDir = () => getDataDir();
@@ -77,7 +77,9 @@ export class ProfileManager {
 
   deleteProfile(id: string): boolean {
     if (id === 'default') return false; // Protect default
+    const old = this.getProfile(id);
     if (!store().deleteProfile(id)) return false;
+    deleteDbCheckSecrets(old, dataDir());
     deleteSecretFile(dataDir(), `profile:${id}:A`);
     deleteSecretFile(dataDir(), `profile:${id}:B`);
     return true;

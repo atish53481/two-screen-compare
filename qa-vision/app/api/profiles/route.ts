@@ -12,6 +12,12 @@ function toClient(profile: any) {
       out[f] = { ...rest, stored: Boolean(secretRef) };
     }
   }
+  if (Array.isArray(out.dbChecks)) {
+    out.dbChecks = out.dbChecks.map((c: any) => {
+      const { devConnRef, prodConnRef, devConn: _a, prodConn: _b, ...rest } = c || {};
+      return { ...rest, devStored: Boolean(devConnRef), prodStored: Boolean(prodConnRef) };
+    });
+  }
   return out;
 }
 
@@ -23,6 +29,12 @@ function fromClient(profile: any) {
       const { stored: _s, secretRef: _r, ...rest } = out[f];
       out[f] = rest;
     }
+  }
+  if (Array.isArray(out.dbChecks)) {
+    out.dbChecks = out.dbChecks.map((c: any) => {
+      const { devConnRef: _d, prodConnRef: _p, devStored: _ds, prodStored: _ps, ...rest } = c || {};
+      return rest;
+    });
   }
   return out;
 }

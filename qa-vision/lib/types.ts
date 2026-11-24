@@ -7,6 +7,9 @@ export interface ProfileCredentials {
   stored?: boolean;
 }
 
+/** Accepted on save only; connection strings are write-only and encrypted server-side. */
+export type DbCheckInput = Omit<DbCheck, 'devConnRef' | 'prodConnRef'> & { devConn?: string; prodConn?: string; devStored?: boolean; prodStored?: boolean };
+
 /** Accepted on save only; encrypted and stripped before persisting. */
 export type ProfileCredentialsInput = ProfileCredentials & { password?: string };
 

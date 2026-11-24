@@ -104,6 +104,52 @@ function sideBinding(profile: any, side: 'A' | 'B'): string {
   return `${originOf(url)}|${originOf(profile?.login?.loginPath || '/', url)}`;
 }
 
+/** All of a profile's DB connection refs start with this; the engine refuses refs outside it. */
+export const dbSecretPrefix = (profileId: string) => `profile:${profileId}:db:`;
+const dbRef = (profileId: string, name: string, side: 'dev' | 'prod') => `${dbSecretPrefix(profileId)}${encodeURIComponent(name)}:${side}`;
+
+/**
+ * DB check connection strings are write-only: `devConn`/`prodConn` (plaintext, input only) are encrypted under
+ * refs derived from profile id + check name; stored checks keep only devConnRef/prodConnRef, and a ref is kept
+ * only if its blob exists. Client-supplied refs are ignored. Secrets of removed or renamed checks are deleted.
+ */
+function storeDbCheckSecrets(profile: any, dataDir: string, env: NodeJS.ProcessEnv, existing?: any): any[] | undefined {
+  const checks = profile.dbChecks;
+  if (!Array.isArray(checks)) return undefined;
+  const seen = new Set<string>();
+  const out = checks.map((raw: any) => {
+    const { devConn, prodConn, devConnRef: _d, prodConnRef: _p, devStored: _ds, prodStored: _ps, ...rest } = raw || {};
+    const name = typeof rest.name === 'string' ? rest.name.trim() : '';
+    if (!name) throw new SecretError('Every DB check needs a name');
+    if (seen.has(name)) throw new SecretError(`Duplicate DB check name: ${name}`);
+    seen.add(name);
+    const refs: Record<string, string> = {};
+    for (const [side, plain] of [['dev', devConn], ['prod', prodConn]] as const) {
+      const ref = dbRef(profile.id, name, side);
+      if (typeof plain === 'string' && plain.length > 0) putSecretFile(dataDir, ref, encryptSecret(plain, loadKey(env, dataDir)));
+      refs[`${side}ConnRef`] = getSecretFile(dataDir, ref) ? ref : '';
+    }
+    return { ...rest, name, ...refs };
+  });
+  const keep = new Set(out.flatMap((c) => [c.devConnRef, c.prodConnRef]));
+  for (const old of Array.isArray(existing?.dbChecks) ? existing.dbChecks : []) {
+    for (const r of [old?.devConnRef, old?.prodConnRef]) {
+      if (typeof r === 'string' && r.startsWith(dbSecretPrefix(profile.id)) && !keep.has(r)) deleteSecretFile(dataDir, r);
+    }
+  }
+  return out;
+}
+
+/** Remove every stored DB connection secret of a profile (profile deletion). */
+export function deleteDbCheckSecrets(profile: { id: string; dbChecks?: any[] } | undefined, dataDir: string) {
+  if (!profile) return;
+  for (const c of profile.dbChecks || []) {
+    for (const r of [c?.devConnRef, c?.prodConnRef]) {
+      if (typeof r === 'string' && r.startsWith(dbSecretPrefix(profile.id))) deleteSecretFile(dataDir, r);
+    }
+  }
+}
+
 export interface LoginCreds {
   username: string;
   password: string;
@@ -119,9 +165,11 @@ export function storeProfileSecrets<T extends { id: string; credentialsA?: any; 
   profile: T,
   dataDir: string,
   env: NodeJS.ProcessEnv = process.env,
-  existing?: { urlA?: string; urlB?: string; login?: any; credentialsA?: any; credentialsB?: any }
+  existing?: { urlA?: string; urlB?: string; login?: any; credentialsA?: any; credentialsB?: any; dbChecks?: any[] }
 ): T {
   const out: any = { ...profile };
+  const dbChecks = storeDbCheckSecrets(profile, dataDir, env, existing);
+  if (dbChecks) out.dbChecks = dbChecks;
   for (const side of ['A', 'B'] as const) {
     const field = `credentials${side}`;
     const c = (profile as any)[field];
@@ -166,6 +214,12 @@ export function safeStoreProfileSecrets<T extends { id: string; credentialsA?: a
         const { password: _p, secretRef: _r, ...rest } = out[f];
         out[f] = rest;
       }
+    }
+    if (Array.isArray(out.dbChecks)) {
+      out.dbChecks = out.dbChecks.map((c: any) => {
+        const { devConn: _a, prodConn: _b, devConnRef: _c, prodConnRef: _d, ...rest } = c || {};
+        return { ...rest, devConnRef: '', prodConnRef: '' };
+      });
     }
     return { profile: out, error: e instanceof SecretError ? e.message : 'Could not store secret' };
   }

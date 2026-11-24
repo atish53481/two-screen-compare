@@ -233,3 +233,56 @@ export async function runDbCheck(check: DbCheck, getSecret: (ref: string) => str
   }
   return out;
 }
+
+export interface DataSourceRun {
+  apiChecks?: ApiCheck[];
+  dbChecks?: DbCheck[];
+  devCtx: APIRequestContext;
+  prodCtx: APIRequestContext;
+  devBase: string;
+  prodBase: string;
+  getSecret: (ref: string) => string | null;
+  /** When set, only checks whose whenPathStartsWith matches this DEV path run (post-comparison phase). Unset = session start. */
+  afterDevPath?: string;
+  /** DB checks may only use secret refs under this prefix (a profile's own derived refs). */
+  refPrefix?: string;
+  dbClient?: PgClientCtor;
+}
+
+/**
+ * Run the configured API and DB checks and return their findings. Never throws: an unexpected failure
+ * becomes a finding. At session start (no afterDevPath) every check runs; after a comparison only the
+ * API checks whose whenPathStartsWith prefixes DEV's path run. DB checks run at session start only.
+ */
+export async function runDataSourceChecks(run: DataSourceRun): Promise<FindingDraft[]> {
+  const out: FindingDraft[] = [];
+  const crash = (component: string, e: unknown): FindingDraft => ({
+    type: 'Data', component, devValue: '', prodValue: '', severity: 'high',
+    description: `Check failed unexpectedly: ${redactSecrets(e instanceof Error ? e.message : String(e)).slice(0, 200)}`,
+  });
+  const after = run.afterDevPath;
+  for (const check of run.apiChecks ?? []) {
+    const when = check.whenPathStartsWith;
+    if (after === undefined ? false : !when || !after.startsWith(when)) continue;
+    try {
+      out.push(...(await runApiCheck(check, run.devCtx, run.prodCtx, run.devBase, run.prodBase)));
+    } catch (e) {
+      out.push(crash(`api:${check?.name}`, e));
+    }
+  }
+  if (after === undefined) {
+    for (const check of run.dbChecks ?? []) {
+      try {
+        const bad = run.refPrefix !== undefined && ![check.devConnRef, check.prodConnRef].every((r) => typeof r === 'string' && r.startsWith(run.refPrefix!));
+        if (bad) {
+          out.push({ type: 'Data', component: `db:${check?.name}`, devValue: '', prodValue: '', severity: 'low', description: 'NOT_COMPARABLE: connection secret missing or not owned by this profile' });
+          continue;
+        }
+        out.push(...(await runDbCheck(check, run.getSecret, run.dbClient)));
+      } catch (e) {
+        out.push(crash(`db:${check?.name}`, e));
+      }
+    }
+  }
+  return out;
+}

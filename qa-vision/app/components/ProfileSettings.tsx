@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import type { ComparisonProfile, ProfileCredentialsInput } from '../../lib/types';
+import type { ComparisonProfile, ProfileCredentialsInput, DbCheckInput } from '../../lib/types';
 import type { CaptureSettings, LoginConfig } from '../../lib/engine/types';
 
 interface Props {
@@ -85,6 +85,47 @@ function Credentials({ side, title, creds, onChange }: { side: 'A' | 'B'; title:
   );
 }
 
+function DbChecks({ checks, onChange }: { checks: DbCheckInput[]; onChange: (c: DbCheckInput[]) => void }) {
+  const set = (i: number, patch: Partial<DbCheckInput>) => onChange(checks.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  const connField = (i: number, side: 'dev' | 'prod') => {
+    const c = checks[i];
+    const val = (side === 'dev' ? c.devConn : c.prodConn) || '';
+    const stored = side === 'dev' ? c.devStored : c.prodStored;
+    return (
+      <div>
+        <label className={label}>{side.toUpperCase()} connection string (write-only)</label>
+        <input
+          data-testid={`db-conn-${side}-${i}`}
+          type="password"
+          autoComplete="new-password"
+          className={input}
+          value={val}
+          placeholder={stored ? '•••• stored (type to replace)' : 'postgres://user:pass@host/db'}
+          onChange={(e) => set(i, side === 'dev' ? { devConn: e.target.value } : { prodConn: e.target.value })}
+        />
+        <div data-testid={`db-state-${side}-${i}`} className="text-xs text-zinc-500 mt-1">{stored && !val ? '•••• stored' : val ? 'Will be encrypted on save' : 'Not stored'}</div>
+      </div>
+    );
+  };
+  return (
+    <div data-testid="db-checks" className="space-y-3">
+      <label className={label}>DB checks (read-only SELECT, compared DEV vs PROD)</label>
+      {checks.map((c, i) => (
+        <fieldset key={i} className="rounded-xl border border-zinc-800 p-3 space-y-2">
+          <div className="flex gap-2">
+            <input data-testid={`db-name-${i}`} className={input} placeholder="Check name" value={c.name || ''} onChange={(e) => set(i, { name: e.target.value })} />
+            <button type="button" className="text-xs text-rose-400 px-2" onClick={() => onChange(checks.filter((_, j) => j !== i))}>Remove</button>
+          </div>
+          <textarea data-testid={`db-sql-${i}`} rows={3} spellCheck={false} className={`${input} font-mono`} placeholder="SELECT count(*) AS n FROM users" value={c.sql || ''} onChange={(e) => set(i, { sql: e.target.value })} />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{connField(i, 'dev')}{connField(i, 'prod')}</div>
+        </fieldset>
+      ))}
+      <button type="button" data-testid="db-add" className="text-xs text-sky-400" onClick={() => onChange([...checks, { name: '', sql: '' }])}>+ Add DB check</button>
+      <p className="text-xs text-zinc-500">Connection strings are encrypted server-side on save and never shown again. Only SELECT/WITH queries are accepted.</p>
+    </div>
+  );
+}
+
 export default function ProfileSettings({ profile, onChange }: Props) {
   const capture: CaptureSettings = { ...DEFAULT_CAPTURE, ...(profile.capture as Partial<CaptureSettings>), viewport: { ...DEFAULT_CAPTURE.viewport, ...profile.capture?.viewport } };
   const login: LoginConfig = { ...DEFAULT_LOGIN, ...profile.login };
@@ -139,8 +180,8 @@ export default function ProfileSettings({ profile, onChange }: Props) {
       <section className="space-y-4">
         <h4 className="text-sm font-semibold text-zinc-200">Data rules, API checks and DB checks</h4>
         <JsonList key={`dr-${profile.id}`} id="data-rules-json" title="Data rules" hint='e.g. [{"target":"tid:stat-active-users","mode":"tolerance","tolerance":5}]' value={profile.dataRules || []} onValid={(v) => onChange({ dataRules: v })} />
-        <JsonList key={`api-${profile.id}`} id="api-checks-json" title="API checks" hint='e.g. [{"name":"stats","path":"/api/stats"}] (executed by a later release)' value={profile.apiChecks || []} onValid={(v) => onChange({ apiChecks: v })} />
-        <JsonList key={`db-${profile.id}`} id="db-checks-json" title="DB checks" hint='e.g. [{"name":"user count"}] (executed by a later release)' value={profile.dbChecks || []} onValid={(v) => onChange({ dbChecks: v })} />
+        <JsonList key={`api-${profile.id}`} id="api-checks-json" title="API checks" hint='e.g. [{"name":"stats","path":"/api/stats","fields":["total"],"whenPathStartsWith":"/dashboard"}] (GET only)' value={profile.apiChecks || []} onValid={(v) => onChange({ apiChecks: v })} />
+        <DbChecks key={`db-${profile.id}`} checks={(profile.dbChecks || []) as unknown as DbCheckInput[]} onChange={(c) => onChange({ dbChecks: c as any })} />
       </section>
     </div>
   );

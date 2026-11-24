@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.runApiCheck = runApiCheck;
 exports.assertReadOnlySql = assertReadOnlySql;
 exports.runDbCheck = runDbCheck;
+exports.runDataSourceChecks = runDataSourceChecks;
 const data_rules_1 = require("./data-rules");
 const runtime_diff_1 = require("./runtime-diff");
 const EXACT = { target: '*', mode: 'exact' };
@@ -269,6 +270,46 @@ async function runDbCheck(check, getSecret, ClientOverride) {
             const r = (0, data_rules_1.compareValues)(d, p, rule);
             if (!r.match) {
                 out.push({ ...draft('medium', `DB check "${check.name}" row ${i} column ${col} differs (${r.detail})`, d, p), component: `${component}.${i}.${col}`, property: col });
+            }
+        }
+    }
+    return out;
+}
+/**
+ * Run the configured API and DB checks and return their findings. Never throws: an unexpected failure
+ * becomes a finding. At session start (no afterDevPath) every check runs; after a comparison only the
+ * API checks whose whenPathStartsWith prefixes DEV's path run. DB checks run at session start only.
+ */
+async function runDataSourceChecks(run) {
+    const out = [];
+    const crash = (component, e) => ({
+        type: 'Data', component, devValue: '', prodValue: '', severity: 'high',
+        description: `Check failed unexpectedly: ${(0, runtime_diff_1.redactSecrets)(e instanceof Error ? e.message : String(e)).slice(0, 200)}`,
+    });
+    const after = run.afterDevPath;
+    for (const check of run.apiChecks ?? []) {
+        const when = check.whenPathStartsWith;
+        if (after === undefined ? false : !when || !after.startsWith(when))
+            continue;
+        try {
+            out.push(...(await runApiCheck(check, run.devCtx, run.prodCtx, run.devBase, run.prodBase)));
+        }
+        catch (e) {
+            out.push(crash(`api:${check?.name}`, e));
+        }
+    }
+    if (after === undefined) {
+        for (const check of run.dbChecks ?? []) {
+            try {
+                const bad = run.refPrefix !== undefined && ![check.devConnRef, check.prodConnRef].every((r) => typeof r === 'string' && r.startsWith(run.refPrefix));
+                if (bad) {
+                    out.push({ type: 'Data', component: `db:${check?.name}`, devValue: '', prodValue: '', severity: 'low', description: 'NOT_COMPARABLE: connection secret missing or not owned by this profile' });
+                    continue;
+                }
+                out.push(...(await runDbCheck(check, run.getSecret, run.dbClient)));
+            }
+            catch (e) {
+                out.push(crash(`db:${check?.name}`, e));
             }
         }
     }
