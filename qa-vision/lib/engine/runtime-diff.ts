@@ -2,7 +2,7 @@ import { SENSITIVE_FIELD_RE } from './extract';
 import type { FindingDraft, NetworkEntry, RuntimeEvent } from './types';
 
 export const LOG_CAP = 500;
-const EXTRA_SENSITIVE_RE = /^(authorization|cookie|set-cookie|api-?key|x-api-key|session|sid)$/i;
+export const EXTRA_SENSITIVE_RE = /^(authorization|cookie|set-cookie|api-?key|x-api-key|session|sid)$/i;
 const BLOCKED = 'net::ERR_BLOCKED_BY_CLIENT';
 const COUNTED = new Set(['xhr', 'fetch', 'document']);
 
@@ -62,16 +62,21 @@ export function toNetworkEntry(r: RawResponse): NetworkEntry {
   };
 }
 
-/** Redacts and bounds console/page-error text. */
-export function toRuntimeText(text: string): string {
+/** Redacts secrets from free text: URL query/fragment, Bearer/Basic credentials, values of sensitive keys. No length cap. */
+export function redactSecrets(text: string, sensitiveRe: RegExp = SENSITIVE_FIELD_RE): string {
   let t = String(text ?? '').replace(/https?:\/\/[^\s'"<>)]+/g, (m) => {
     const i = m.search(/[?#]/);
     return i >= 0 ? m.slice(0, i) : m;
   });
   t = t.replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, '$1 [redacted]');
   t = t.replace(/([\w.-]+)["']?\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&}]+)/g, (m, k, sep) =>
-    SENSITIVE_FIELD_RE.test(k) || EXTRA_SENSITIVE_RE.test(k) ? `${k}${sep}[redacted]` : m);
-  return t.slice(0, 300);
+    sensitiveRe.test(k) || EXTRA_SENSITIVE_RE.test(k) ? `${k}${sep}[redacted]` : m);
+  return t;
+}
+
+/** Redacts and bounds console/page-error text. */
+export function toRuntimeText(text: string): string {
+  return redactSecrets(text).slice(0, 300);
 }
 
 export function pushCapped<T>(arr: T[], item: T, cap = LOG_CAP): void {

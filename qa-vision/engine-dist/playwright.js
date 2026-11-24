@@ -2022,27 +2022,41 @@ class QAComparisonEngine {
             /* ignore */
         }
         this.persistRun(session, this.lastSnapshot);
-        this.scheduleAiAnalysis(session, this.lastSnapshot);
+        this.scheduleAiAnalysis(session);
     }
+    /** Resolves the AI provider; tests may replace it with a fake. */
+    aiProviderFactory = () => (0, ai_1.providerFromEnv)(process.env);
+    /** Last background AI run (tests await it; never rejects). */
+    aiPending = Promise.resolve();
     /** Background, fire-and-forget: must never block or throw into Stop. Advisory only; never touches classification. */
-    scheduleAiAnalysis(session, snap) {
-        void (async () => {
+    scheduleAiAnalysis(session) {
+        if (session.aiScheduled)
+            return; // a second Stop must not start a second paid run
+        session.aiScheduled = true;
+        this.aiPending = (async () => {
             try {
-                const provider = (0, ai_1.providerFromEnv)(process.env);
+                const provider = this.aiProviderFactory();
                 if (!provider)
                     return;
                 const findings = session.mismatches.filter((f) => !f.ai || f.ai.status !== 'ok');
                 if (!findings.length)
                     return;
                 const results = await (0, ai_1.analyzeFindings)(findings, provider, ai_1.DEFAULT_AI_OPTIONS);
+                // Merge only `ai` into the stored run: a runId-based mark-expected may have saved newer state meanwhile.
+                const store = (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db'));
+                const run = store.getRun(session.id);
                 for (const f of findings) {
                     const ai = results.get(f.id);
                     if (!ai)
                         continue;
                     f.ai = ai;
-                    this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: f });
+                    const stored = run?.mismatches.find((m) => m.id === f.id);
+                    if (stored)
+                        stored.ai = ai;
+                    this.io?.emit('mismatch-update', { sessionId: session.id, mismatch: stored ?? f });
                 }
-                this.persistRun(session, snap); // same finding objects, so ai is included; endedAt unchanged
+                if (run)
+                    store.saveRun(run);
             }
             catch (e) {
                 console.error('AI analysis failed:', e.message);
@@ -2051,7 +2065,7 @@ class QAComparisonEngine {
     }
     async analyzeFinding(ref, findingId) {
         try {
-            const provider = (0, ai_1.providerFromEnv)(process.env);
+            const provider = this.aiProviderFactory();
             const store = (0, store_1.openStore)(path.join((0, secrets_1.getDataDir)(), 'qa-vision.db'));
             const session = ref.sessionId ? this.sessions.get(ref.sessionId) : undefined;
             const run = !session && ref.runId ? store.getRun(ref.runId) : undefined;

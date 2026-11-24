@@ -72,3 +72,26 @@ test('providerFromEnv', () => {
   assert.equal(providerFromEnv({ QA_VISION_AI_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'k' }).model, 'claude-opus-5-5');
   assert.equal(providerFromEnv({ QA_VISION_AI_PROVIDER: 'openai-compatible', QA_VISION_AI_BASE_URL: 'https://x/v1', QA_VISION_AI_API_KEY: 'k', QA_VISION_AI_MODEL: 'grok' }).name, 'openai-compatible');
 });
+
+test('redactForAi removes secrets in header/JSON/fragment shapes', () => {
+  const cases = [
+    ['{"password":"hunter2"}', 'hunter2'],
+    ['Authorization: Bearer abc123xyz', 'abc123xyz'],
+    ['Cookie: sid=s3cr3tval', 's3cr3tval'],
+    ['x-api-key: shortkey9', 'shortkey9'],
+    ['see /cb#access=zzz111', 'zzz111'],
+  ];
+  for (const [text, secret] of cases) {
+    const out = JSON.stringify(redactForAi(mk('1', { devValue: text, description: text }), SENS));
+    assert.ok(!out.includes(secret), `${secret} leaked from ${text}: ${out}`);
+  }
+});
+
+test('long and numerous reply strings are capped', async () => {
+  const big = 'x'.repeat(5000);
+  const p = fake(async () => JSON.stringify({ results: [{ id: '1', explanation: big, observedFacts: Array(30).fill(big) }] }));
+  const a = (await analyzeFindings([mk('1')], p, opts)).get('1');
+  assert.equal(a.explanation.length, 2000);
+  assert.equal(a.observedFacts.length, 10);
+  assert.equal(a.observedFacts[0].length, 500);
+});

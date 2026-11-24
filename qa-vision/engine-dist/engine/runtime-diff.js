@@ -1,16 +1,17 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.LOG_CAP = void 0;
+exports.EXTRA_SENSITIVE_RE = exports.LOG_CAP = void 0;
 exports.toNetworkPath = toNetworkPath;
 exports.schemaOf = schemaOf;
 exports.toNetworkEntry = toNetworkEntry;
+exports.redactSecrets = redactSecrets;
 exports.toRuntimeText = toRuntimeText;
 exports.pushCapped = pushCapped;
 exports.diffNetwork = diffNetwork;
 exports.diffRuntime = diffRuntime;
 const extract_1 = require("./extract");
 exports.LOG_CAP = 500;
-const EXTRA_SENSITIVE_RE = /^(authorization|cookie|set-cookie|api-?key|x-api-key|session|sid)$/i;
+exports.EXTRA_SENSITIVE_RE = /^(authorization|cookie|set-cookie|api-?key|x-api-key|session|sid)$/i;
 const BLOCKED = 'net::ERR_BLOCKED_BY_CLIENT';
 const COUNTED = new Set(['xhr', 'fetch', 'document']);
 function toNetworkPath(url) {
@@ -59,15 +60,19 @@ function toNetworkEntry(r) {
         failure: r.failure ?? null,
     };
 }
-/** Redacts and bounds console/page-error text. */
-function toRuntimeText(text) {
+/** Redacts secrets from free text: URL query/fragment, Bearer/Basic credentials, values of sensitive keys. No length cap. */
+function redactSecrets(text, sensitiveRe = extract_1.SENSITIVE_FIELD_RE) {
     let t = String(text ?? '').replace(/https?:\/\/[^\s'"<>)]+/g, (m) => {
         const i = m.search(/[?#]/);
         return i >= 0 ? m.slice(0, i) : m;
     });
     t = t.replace(/\b(Bearer|Basic)\s+[\w.~+/=-]+/gi, '$1 [redacted]');
-    t = t.replace(/([\w.-]+)["']?\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&}]+)/g, (m, k, sep) => extract_1.SENSITIVE_FIELD_RE.test(k) || EXTRA_SENSITIVE_RE.test(k) ? `${k}${sep}[redacted]` : m);
-    return t.slice(0, 300);
+    t = t.replace(/([\w.-]+)["']?\s*([=:])\s*("[^"]*"|'[^']*'|[^\s,;&}]+)/g, (m, k, sep) => sensitiveRe.test(k) || exports.EXTRA_SENSITIVE_RE.test(k) ? `${k}${sep}[redacted]` : m);
+    return t;
+}
+/** Redacts and bounds console/page-error text. */
+function toRuntimeText(text) {
+    return redactSecrets(text).slice(0, 300);
 }
 function pushCapped(arr, item, cap = exports.LOG_CAP) {
     arr.push(item);

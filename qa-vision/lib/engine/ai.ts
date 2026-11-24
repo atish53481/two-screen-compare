@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
+import type { BetaTextBlock } from '@anthropic-ai/sdk/resources/beta/messages/messages';
 import type { AiAnalysis, Classification, Finding } from './types';
 import { SENSITIVE_FIELD_RE } from './extract';
+import { redactSecrets } from './runtime-diff';
 
 export interface AiProvider {
   name: string;
@@ -41,7 +43,7 @@ export function providerFromEnv(env: Record<string, string | undefined>): AiProv
       model,
       async complete(system, user, signal) {
         // Thinking is always on for this model: do not send `thinking`, temperature, top_p or top_k.
-        const res: any = await client.beta.messages.create(
+        const res = await client.beta.messages.create(
           {
             model,
             max_tokens: 16000,
@@ -50,13 +52,13 @@ export function providerFromEnv(env: Record<string, string | undefined>): AiProv
             output_config: { effort: 'medium' },
             system,
             messages: [{ role: 'user', content: user }],
-          } as any,
+          },
           { signal }
         );
         if (res.stop_reason === 'refusal') throw new Error('refused');
         return res.content
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
+          .filter((b): b is BetaTextBlock => b.type === 'text')
+          .map((b) => b.text)
           .join('');
       },
     };
@@ -100,17 +102,15 @@ const DIGITS_RE = /\d{9,}/g;
 const MARKER_RE = /\[redacted\]/gi;
 const R = '<redacted>';
 
-/** Drops query strings from URLs/paths (a "?" followed by key=value pairs). */
-function stripQuery(s: string): string {
-  return s.replace(/\?[^\s#"']*=[^\s#"']*/g, '');
+/** Drops query strings and fragments from relative URL paths (absolute URLs are handled by redactSecrets). */
+function stripRelativeQuery(s: string): string {
+  return s.replace(/(^|[\s"'(])(\/[^\s?#"')]*)[?#][^\s"')]*/g, '$1$2');
 }
 
 function scrub(value: unknown, sensitiveRe: RegExp): string {
-  let s = stripQuery(String(value ?? ''));
-  s = s.replace(MARKER_RE, R).replace(EMAIL_RE, R).replace(UUID_RE, R).replace(DIGITS_RE, R).replace(TOKEN_RE, R);
-  // A value attached to a sensitive-looking name (e.g. "password: hunter2") is also withheld.
-  s = s.replace(/([\w-]+)\s*[:=]\s*([^\s<]\S*)/g, (m, k) => (sensitiveRe.test(k) ? `${k}: ${R}` : m));
-  return s;
+  let s = redactSecrets(String(value ?? ''), sensitiveRe);
+  s = stripRelativeQuery(s);
+  return s.replace(MARKER_RE, R).replace(EMAIL_RE, R).replace(UUID_RE, R).replace(DIGITS_RE, R).replace(TOKEN_RE, R).replace(/\[redacted\]/g, R);
 }
 
 /** Keeps only the fields the model needs. No screenshot paths, no URL queries. */
@@ -146,7 +146,8 @@ export function buildPrompt(findings: object[]): { system: string; user: string 
   return { system, user };
 }
 
-const strArr = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
+const strArr = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, 10).map((x) => x.slice(0, 500)) : [];
 
 function parseResults(text: string): any[] {
   let t = text.trim();
@@ -214,7 +215,7 @@ export async function analyzeFindings(
             continue;
           }
           const a = base('ok');
-          a.explanation = typeof r.explanation === 'string' ? r.explanation : '';
+          a.explanation = typeof r.explanation === 'string' ? r.explanation.slice(0, 2000) : '';
           a.observedFacts = strArr(r.observedFacts);
           a.hypotheses = strArr(r.hypotheses);
           a.suggestedInvestigation = strArr(r.suggestedInvestigation);

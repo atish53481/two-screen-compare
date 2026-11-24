@@ -10,6 +10,7 @@ exports.buildPrompt = buildPrompt;
 exports.analyzeFindings = analyzeFindings;
 const sdk_1 = __importDefault(require("@anthropic-ai/sdk"));
 const extract_1 = require("./extract");
+const runtime_diff_1 = require("./runtime-diff");
 exports.DEFAULT_AI_OPTIONS = { timeoutMs: 30000, maxFindings: 40, batchSize: 10 };
 const CLASSIFICATIONS = [
     'MATCH',
@@ -93,16 +94,14 @@ const TOKEN_RE = /[A-Za-z0-9_\-+/=]{16,}/g;
 const DIGITS_RE = /\d{9,}/g;
 const MARKER_RE = /\[redacted\]/gi;
 const R = '<redacted>';
-/** Drops query strings from URLs/paths (a "?" followed by key=value pairs). */
-function stripQuery(s) {
-    return s.replace(/\?[^\s#"']*=[^\s#"']*/g, '');
+/** Drops query strings and fragments from relative URL paths (absolute URLs are handled by redactSecrets). */
+function stripRelativeQuery(s) {
+    return s.replace(/(^|[\s"'(])(\/[^\s?#"')]*)[?#][^\s"')]*/g, '$1$2');
 }
 function scrub(value, sensitiveRe) {
-    let s = stripQuery(String(value ?? ''));
-    s = s.replace(MARKER_RE, R).replace(EMAIL_RE, R).replace(UUID_RE, R).replace(DIGITS_RE, R).replace(TOKEN_RE, R);
-    // A value attached to a sensitive-looking name (e.g. "password: hunter2") is also withheld.
-    s = s.replace(/([\w-]+)\s*[:=]\s*([^\s<]\S*)/g, (m, k) => (sensitiveRe.test(k) ? `${k}: ${R}` : m));
-    return s;
+    let s = (0, runtime_diff_1.redactSecrets)(String(value ?? ''), sensitiveRe);
+    s = stripRelativeQuery(s);
+    return s.replace(MARKER_RE, R).replace(EMAIL_RE, R).replace(UUID_RE, R).replace(DIGITS_RE, R).replace(TOKEN_RE, R).replace(/\[redacted\]/g, R);
 }
 /** Keeps only the fields the model needs. No screenshot paths, no URL queries. */
 function redactForAi(f, sensitiveRe) {
@@ -135,7 +134,7 @@ function buildPrompt(findings) {
     const user = `Analyze these findings (JSON):\n${JSON.stringify(findings)}`;
     return { system, user };
 }
-const strArr = (v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
+const strArr = (v) => Array.isArray(v) ? v.filter((x) => typeof x === 'string').slice(0, 10).map((x) => x.slice(0, 500)) : [];
 function parseResults(text) {
     let t = text.trim();
     const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/i);
@@ -196,7 +195,7 @@ async function analyzeFindings(findings, provider, opts = exports.DEFAULT_AI_OPT
                         continue;
                     }
                     const a = base('ok');
-                    a.explanation = typeof r.explanation === 'string' ? r.explanation : '';
+                    a.explanation = typeof r.explanation === 'string' ? r.explanation.slice(0, 2000) : '';
                     a.observedFacts = strArr(r.observedFacts);
                     a.hypotheses = strArr(r.hypotheses);
                     a.suggestedInvestigation = strArr(r.suggestedInvestigation);
