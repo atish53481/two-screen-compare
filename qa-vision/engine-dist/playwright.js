@@ -40,6 +40,7 @@ exports.comparisonEngine = void 0;
 exports.validateTargetUrl = validateTargetUrl;
 exports.mapDevUrlToProd = mapDevUrlToProd;
 exports.compileIgnoreRules = compileIgnoreRules;
+exports.persistLiveSessions = persistLiveSessions;
 const playwright_1 = require("playwright");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
@@ -1969,21 +1970,21 @@ class QAComparisonEngine {
 }
 exports.comparisonEngine = new QAComparisonEngine();
 exports.default = exports.comparisonEngine;
-// One process-level shutdown hook (guarded so hot reloads do not stack handlers). Existing handlers are untouched.
-{
-    const g = globalThis;
-    if (!g.__qaVisionShutdownHook) {
-        g.__qaVisionShutdownHook = true;
-        const persist = () => exports.comparisonEngine.persistAllSessions();
-        for (const ev of ['beforeExit', 'exit'])
-            process.on(ev, persist);
-        for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
-            process.on(sig, () => {
-                persist();
-                // Only restore default termination when nobody else handles the signal
-                if (process.listenerCount(sig) <= 1)
-                    process.exit(code);
-            });
-        }
+const shutdownGlobals = globalThis;
+shutdownGlobals.__qaVisionLiveEngine = exports.comparisonEngine;
+function persistLiveSessions() {
+    shutdownGlobals.__qaVisionLiveEngine?.persistAllSessions();
+}
+if (!shutdownGlobals.__qaVisionShutdownHook) {
+    shutdownGlobals.__qaVisionShutdownHook = true;
+    for (const ev of ['beforeExit', 'exit'])
+        process.on(ev, persistLiveSessions);
+    for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]]) {
+        process.on(sig, () => {
+            persistLiveSessions();
+            // Only restore default termination when nobody else handles the signal
+            if (process.listenerCount(sig) <= 1)
+                process.exit(code);
+        });
     }
 }

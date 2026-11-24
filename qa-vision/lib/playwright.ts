@@ -2204,18 +2204,23 @@ export const comparisonEngine = new QAComparisonEngine();
 export default comparisonEngine;
 
 // One process-level shutdown hook (guarded so hot reloads do not stack handlers). Existing handlers are untouched.
-{
-  const g = globalThis as typeof globalThis & { __qaVisionShutdownHook?: boolean };
-  if (!g.__qaVisionShutdownHook) {
-    g.__qaVisionShutdownHook = true;
-    const persist = () => comparisonEngine.persistAllSessions();
-    for (const ev of ['beforeExit', 'exit'] as const) process.on(ev, persist);
-    for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
-      process.on(sig, () => {
-        persist();
-        // Only restore default termination when nobody else handles the signal
-        if (process.listenerCount(sig) <= 1) process.exit(code);
-      });
-    }
+// The hook resolves the live engine at exit time, so a reloaded module's instance is the one persisted.
+type ShutdownGlobals = typeof globalThis & { __qaVisionShutdownHook?: boolean; __qaVisionLiveEngine?: QAComparisonEngine };
+const shutdownGlobals = globalThis as ShutdownGlobals;
+shutdownGlobals.__qaVisionLiveEngine = comparisonEngine;
+
+export function persistLiveSessions() {
+  shutdownGlobals.__qaVisionLiveEngine?.persistAllSessions();
+}
+
+if (!shutdownGlobals.__qaVisionShutdownHook) {
+  shutdownGlobals.__qaVisionShutdownHook = true;
+  for (const ev of ['beforeExit', 'exit'] as const) process.on(ev, persistLiveSessions);
+  for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
+    process.on(sig, () => {
+      persistLiveSessions();
+      // Only restore default termination when nobody else handles the signal
+      if (process.listenerCount(sig) <= 1) process.exit(code);
+    });
   }
 }

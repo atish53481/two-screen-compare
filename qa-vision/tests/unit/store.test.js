@@ -186,3 +186,25 @@ test('process exit persists live sessions (shutdown hook)', () => {
   const run = openStore(dbIn(dir)).getRun('sd1');
   assert.ok(run && run.projectName === 'Shutdown' && run.endedAt);
 });
+
+test('shutdown persist resolves the live engine after a module reload', () => {
+  const dir = tmp();
+  const prev = process.env.QA_VISION_DATA_DIR;
+  process.env.QA_VISION_DATA_DIR = dir;
+  try {
+    const modPath = require.resolve('../../engine-dist/playwright.js');
+    const first = require(modPath);
+    delete require.cache[modPath];
+    const second = require(modPath);
+    assert.notEqual(first.default, second.default);
+    assert.equal(globalThis.__qaVisionLiveEngine, second.default);
+    second.default.sessions.set('reload1', { id: 'reload1', projectName: 'Reload', devUrl: 'http://d', prodUrl: 'http://p',
+      startedAt: new Date().toISOString(), logs: [], mismatches: [], isRunning: true });
+    first.persistLiveSessions(); // even the stale module's entry point persists through the live instance
+    const run = openStore(dbIn(dir)).getRun('reload1');
+    assert.ok(run && run.projectName === 'Reload');
+    second.default.sessions.delete('reload1');
+  } finally {
+    if (prev === undefined) delete process.env.QA_VISION_DATA_DIR; else process.env.QA_VISION_DATA_DIR = prev;
+  }
+});
