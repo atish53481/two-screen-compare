@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { profileManager } from '../../../lib/profile-manager';
+import { requireJson } from '../../../lib/http-guards';
 import { SecretError } from '../../../lib/engine/secrets';
 
 export async function GET() {
@@ -13,6 +14,8 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   try {
+    const rejected = requireJson(request);
+    if (rejected) return rejected;
     const body = await request.json();
     
     if (body.action === 'save') {

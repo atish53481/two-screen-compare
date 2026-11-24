@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DECRYPT_FAILED = exports.SecretError = void 0;
+exports.originOf = exports.DECRYPT_FAILED = exports.SecretError = void 0;
 exports.getDataDir = getDataDir;
 exports.loadKey = loadKey;
 exports.encryptSecret = encryptSecret;
@@ -11,6 +11,7 @@ exports.decryptSecret = decryptSecret;
 exports.putSecretFile = putSecretFile;
 exports.getSecretFile = getSecretFile;
 exports.deleteSecretFile = deleteSecretFile;
+exports.resolveLoginUrl = resolveLoginUrl;
 exports.storeProfileSecrets = storeProfileSecrets;
 exports.safeStoreProfileSecrets = safeStoreProfileSecrets;
 exports.resolveSessionLogin = resolveSessionLogin;
@@ -105,13 +106,41 @@ function deleteSecretFile(dataDir, ref) {
         writeMap(dataDir, map);
     }
 }
+// ---- profile helpers ----
+const originOf = (u, base) => {
+    if (typeof u !== 'string')
+        return null;
+    try {
+        return new URL(u, base).origin;
+    }
+    catch {
+        return null;
+    }
+};
+exports.originOf = originOf;
+/** Resolve loginPath against the side's base URL; null when it resolves to a different origin (or is invalid). */
+function resolveLoginUrl(loginPath, baseUrl) {
+    const baseOrigin = (0, exports.originOf)(baseUrl);
+    try {
+        const u = new URL(loginPath || '/', baseUrl);
+        return baseOrigin && u.origin === baseOrigin ? u.toString() : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** What a side's stored password is bound to: the side URL origin and the login page origin. */
+function sideBinding(profile, side) {
+    const url = side === 'A' ? profile?.urlA : profile?.urlB;
+    return `${(0, exports.originOf)(url)}|${(0, exports.originOf)(profile?.login?.loginPath || '/', url)}`;
+}
 /**
  * Move any plaintext credentials{A,B}.password into the encrypted store and return a profile
  * without them (username + secretRef only). Input is not mutated. Any client-supplied secretRef
  * is ignored: the ref is always derived as profile:<id>:<side> and kept only if that blob exists.
  * Throws SecretError when the key is unusable.
  */
-function storeProfileSecrets(profile, dataDir, env = process.env) {
+function storeProfileSecrets(profile, dataDir, env = process.env, existing) {
     const out = { ...profile };
     for (const side of ['A', 'B']) {
         const field = `credentials${side}`;
@@ -120,6 +149,10 @@ function storeProfileSecrets(profile, dataDir, env = process.env) {
             continue;
         const { password, secretRef: _ignored, ...rest } = c;
         const ref = `profile:${profile.id}:${side}`;
+        // A stored password is bound to the origin it was saved for: moving the URL/login page drops it
+        if (existing && sideBinding(existing, side) !== sideBinding(profile, side)) {
+            deleteSecretFile(dataDir, ref);
+        }
         if (typeof password === 'string' && password.length > 0) {
             putSecretFile(dataDir, ref, encryptSecret(password, loadKey(env, dataDir)));
             out[field] = { ...rest, secretRef: ref };
@@ -149,14 +182,6 @@ function safeStoreProfileSecrets(profile, dataDir, env = process.env) {
         return { profile: out, error: e instanceof SecretError ? e.message : 'Could not store secret' };
     }
 }
-const originOf = (u) => {
-    try {
-        return new URL(u).origin;
-    }
-    catch {
-        return null;
-    }
-};
 /**
  * Server-side: decide whether a profile's stored credentials may be used for a session. Credentials are
  * only released when the session's DEV/PROD origins equal the profile's urlA/urlB origins (fail closed).
@@ -166,8 +191,8 @@ function resolveSessionLogin(profile, devUrl, prodUrl, dataDir, env = process.en
         return { ok: true };
     const pairs = [[devUrl, profile.urlA], [prodUrl, profile.urlB]];
     for (const [given, expected] of pairs) {
-        const o = originOf(given);
-        if (!o || o !== originOf(expected)) {
+        const o = (0, exports.originOf)(given);
+        if (!o || o !== (0, exports.originOf)(expected)) {
             return { ok: false, error: 'Session URLs do not match the profile origins — refusing to use stored credentials' };
         }
     }

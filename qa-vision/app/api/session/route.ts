@@ -1,14 +1,13 @@
 ﻿import { NextRequest, NextResponse } from 'next/server';
 import comparisonEngine, { validateTargetUrl } from '@/lib/playwright';
+import { requireJson } from '@/lib/http-guards';
 import { profileManager } from '@/lib/profile-manager';
 import { getDataDir, resolveSessionLogin } from '@/lib/engine/secrets';
 
 export async function POST(request: NextRequest) {
   try {
-    // Reject cross-site "simple" form posts (text/plain etc.): only real JSON requests are accepted
-    if (!(request.headers.get('content-type') || '').toLowerCase().startsWith('application/json')) {
-      return NextResponse.json({ success: false, error: 'Content-Type must be application/json' }, { status: 415 });
-    }
+    const rejected = requireJson(request);
+    if (rejected) return rejected;
     const body = await request.json();
     const {
       action,

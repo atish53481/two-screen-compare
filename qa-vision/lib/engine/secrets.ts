@@ -97,6 +97,32 @@ export function deleteSecretFile(dataDir: string, ref: string) {
 
 // ---- profile helpers ----
 
+export const originOf = (u: unknown, base?: string): string | null => {
+  if (typeof u !== 'string') return null;
+  try {
+    return new URL(u, base).origin;
+  } catch {
+    return null;
+  }
+};
+
+/** Resolve loginPath against the side's base URL; null when it resolves to a different origin (or is invalid). */
+export function resolveLoginUrl(loginPath: string, baseUrl: string): string | null {
+  const baseOrigin = originOf(baseUrl);
+  try {
+    const u = new URL(loginPath || '/', baseUrl);
+    return baseOrigin && u.origin === baseOrigin ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/** What a side's stored password is bound to: the side URL origin and the login page origin. */
+function sideBinding(profile: any, side: 'A' | 'B'): string {
+  const url = side === 'A' ? profile?.urlA : profile?.urlB;
+  return `${originOf(url)}|${originOf(profile?.login?.loginPath || '/', url)}`;
+}
+
 export interface LoginCreds {
   username: string;
   password: string;
@@ -111,7 +137,8 @@ export interface LoginCreds {
 export function storeProfileSecrets<T extends { id: string; credentialsA?: any; credentialsB?: any }>(
   profile: T,
   dataDir: string,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
+  existing?: { urlA?: string; urlB?: string; login?: any }
 ): T {
   const out: any = { ...profile };
   for (const side of ['A', 'B'] as const) {
@@ -120,6 +147,10 @@ export function storeProfileSecrets<T extends { id: string; credentialsA?: any; 
     if (!c) continue;
     const { password, secretRef: _ignored, ...rest } = c;
     const ref = `profile:${profile.id}:${side}`;
+    // A stored password is bound to the origin it was saved for: moving the URL/login page drops it
+    if (existing && sideBinding(existing, side) !== sideBinding(profile, side)) {
+      deleteSecretFile(dataDir, ref);
+    }
     if (typeof password === 'string' && password.length > 0) {
       putSecretFile(dataDir, ref, encryptSecret(password, loadKey(env, dataDir)));
       out[field] = { ...rest, secretRef: ref };
@@ -151,14 +182,6 @@ export function safeStoreProfileSecrets<T extends { id: string; credentialsA?: a
     return { profile: out, error: e instanceof SecretError ? e.message : 'Could not store secret' };
   }
 }
-
-const originOf = (u: string): string | null => {
-  try {
-    return new URL(u).origin;
-  } catch {
-    return null;
-  }
-};
 
 export type SessionLoginResolution =
   | { ok: true; login?: any; loginCredentials?: { dev: ReturnType<typeof resolveProfileCredentials>; prod: ReturnType<typeof resolveProfileCredentials> } }

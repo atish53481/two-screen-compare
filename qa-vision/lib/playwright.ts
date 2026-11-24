@@ -11,6 +11,7 @@ import { diffCss } from './engine/css-diff';
 import { diffA11y } from './engine/a11y-diff';
 import { diffData } from './engine/data-rules';
 import { diffNetwork, diffRuntime, toNetworkEntry, toRuntimeText, pushCapped } from './engine/runtime-diff';
+import { originOf, resolveLoginUrl } from './engine/secrets';
 import type { FindingDraft, PageSnapshot, CaptureSettings, LoginConfig, DataRule, ApiCheck, DbCheck, NetworkEntry, RuntimeEvent } from './engine/types';
 
 /**
@@ -583,13 +584,22 @@ class QAComparisonEngine {
     // Only DEV has a recorder; PROD login must not drop real user actions made in the DEV window
     session.suppressCapture = side === 'DEV';
     try {
-      if (cfg.loginPath) {
-        const target = new URL(cfg.loginPath, side === 'DEV' ? session.devUrl : session.prodUrl).toString();
-        if (page.url() !== target) await page.goto(target, { waitUntil: 'domcontentloaded', timeout });
-      }
+      const baseUrl = side === 'DEV' ? session.devUrl : session.prodUrl;
+      const boundOrigin = originOf(baseUrl);
+      const mismatch = async () => {
+        this.log(sessionId, `Auto-login unavailable on ${side}: login page origin mismatch — log in manually in the window`, 'Info', 'Info');
+        return false;
+      };
+      const target = resolveLoginUrl(cfg.loginPath, baseUrl);
+      if (!target) return await mismatch();
+      if (cfg.loginPath && page.url() !== target) await page.goto(target, { waitUntil: 'domcontentloaded', timeout });
+      // Never type a secret into a page whose origin is not the one the credentials are bound to
+      const onBoundOrigin = () => originOf(page.url()) === boundOrigin;
       // Let client-side frameworks hydrate so typed values are not lost
       await page.waitForLoadState('networkidle', { timeout: Math.min(timeout, 5000) }).catch(() => {});
+      if (!onBoundOrigin()) return await mismatch();
       await page.locator(cfg.usernameSelector).first().fill(creds.username, { timeout });
+      if (!onBoundOrigin()) return await mismatch();
       await page.locator(cfg.passwordSelector).first().fill(creds.password, { timeout });
       if (side === 'PROD') {
         session.permitMutationsUntil = Date.now() + 5000;

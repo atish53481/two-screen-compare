@@ -89,7 +89,7 @@ export class ProfileManager {
     // Encrypt any plaintext password (form input only) before it can reach profiles.json
     const id = profile.id || 'profile_' + Date.now();
     const withId: any = { ...profile, id };
-    profile = storeProfileSecrets(withId, dataDir());
+    profile = storeProfileSecrets(withId, dataDir(), process.env, this.getProfile(id));
 
     if (profile.id && this.getProfile(profile.id)) {
       // Update existing
