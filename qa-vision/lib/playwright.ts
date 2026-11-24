@@ -498,7 +498,7 @@ class QAComparisonEngine {
         this.log(sessionId, `${label} browser window was closed — replication stopped; Stop and start a new session`, label === 'DEV' ? 'Error' : 'n/a', 'Error');
         this.setSyncState(sessionId, true, `${label} browser closed`);
         // The session has effectively ended: record the run now; Stop later rewrites the same row
-        this.persistRun(this.snapshotOf(current));
+        this.persistRun(current);
       });
     }
 
@@ -2105,9 +2105,9 @@ class QAComparisonEngine {
   }
 
   /** Idempotent (saveRun replaces by run id). A storage failure must never break session teardown. */
-  private persistRun(snap: SessionSnapshot) {
+  private persistRun(session: ComparisonSession, snap?: SessionSnapshot) {
     try {
-      openStore(path.join(getDataDir(), 'qa-vision.db')).saveRun(snap);
+      openStore(path.join(getDataDir(), 'qa-vision.db')).saveRun(snap ?? this.snapshotOf(session));
     } catch (e) {
       console.error('Could not persist run history:', (e as Error).message);
     }
@@ -2122,7 +2122,7 @@ class QAComparisonEngine {
     } catch {
       /* ignore */
     }
-    this.persistRun(this.lastSnapshot);
+    this.persistRun(session, this.lastSnapshot);
   }
 
   async closeSession(sessionId: string) {
@@ -2143,6 +2143,11 @@ class QAComparisonEngine {
       this.sessions.delete(sessionId);
       console.log(`Session ${sessionId} closed`);
     }
+  }
+
+  /** Synchronous: persist every live session's run (used on process shutdown; safe inside 'exit'). */
+  persistAllSessions() {
+    for (const s of this.sessions.values()) if (s.isRunning) this.persistRun(s);
   }
 
   async closeAllSessions() {
@@ -2197,3 +2202,20 @@ class QAComparisonEngine {
 
 export const comparisonEngine = new QAComparisonEngine();
 export default comparisonEngine;
+
+// One process-level shutdown hook (guarded so hot reloads do not stack handlers). Existing handlers are untouched.
+{
+  const g = globalThis as typeof globalThis & { __qaVisionShutdownHook?: boolean };
+  if (!g.__qaVisionShutdownHook) {
+    g.__qaVisionShutdownHook = true;
+    const persist = () => comparisonEngine.persistAllSessions();
+    for (const ev of ['beforeExit', 'exit'] as const) process.on(ev, persist);
+    for (const [sig, code] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
+      process.on(sig, () => {
+        persist();
+        // Only restore default termination when nobody else handles the signal
+        if (process.listenerCount(sig) <= 1) process.exit(code);
+      });
+    }
+  }
+}

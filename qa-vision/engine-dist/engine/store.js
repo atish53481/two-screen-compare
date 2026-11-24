@@ -176,9 +176,16 @@ function migrateLegacyFiles(store, dir) {
         if (Array.isArray(list)) {
             for (const p of list) {
                 try {
-                    if (!p || typeof p.id !== 'string')
+                    if (!p || typeof p !== 'object' || typeof p.id !== 'string' || !p.id) {
+                        console.error('Profile entry without a string id: skipped during migration');
                         continue;
-                    const hasPlain = [p.credentialsA, p.credentialsB].some((c) => c && typeof c === 'object' && 'password' in c);
+                    }
+                    const badCreds = ['credentialsA', 'credentialsB'].find((f) => p[f] != null && (typeof p[f] !== 'object' || Array.isArray(p[f])));
+                    if (badCreds) {
+                        console.error(`Profile "${p.id}": ${badCreds} is not an object; skipped during migration`);
+                        continue;
+                    }
+                    const hasPlain = [p.credentialsA, p.credentialsB].some((c) => c && 'password' in c);
                     let profile = p;
                     if (hasPlain) {
                         const r = (0, secrets_1.safeStoreProfileSecrets)(p, dir);

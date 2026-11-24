@@ -133,18 +133,25 @@ test('migration imports secrets.json blobs and renames the file', () => {
   assert.ok(fs.existsSync(path.join(dir, 'secrets.json.migrated')));
 });
 
-test('migration skips a malformed profile entry, imports the rest and still renames', () => {
+test('migration skips malformed entries, imports the rest and still renames', () => {
   const dir = tmp();
   const origErr = console.error;
-  console.error = () => {};
+  const logged = [];
+  console.error = (m) => logged.push(String(m));
   try {
     fs.writeFileSync(path.join(dir, 'profiles.json'), JSON.stringify([
       { id: 'bad', credentialsA: 'oops' },
-      { id: 'good', name: 'G' },
+      { id: 'bad2', credentialsB: 5 },
+      { name: 'no id' },
       null,
+      { id: 'throws', updatedAt: {} }, // unbindable value: saveProfile throws, per-entry catch must absorb it
+      { id: 'good', name: 'G' },
     ]));
     const store = openStore(dbIn(dir));
-    assert.ok(store.getProfile('good'));
+    const ids = store.listProfiles().map((p) => p.id);
+    assert.deepEqual(ids, ['good']);
+    assert.ok(logged.some((l) => l.includes('"bad"') && l.includes('credentialsA')));
+    assert.ok(logged.some((l) => l.includes('"throws"')));
     assert.ok(!fs.existsSync(path.join(dir, 'profiles.json')));
     assert.ok(fs.existsSync(path.join(dir, 'profiles.json.migrated')));
   } finally {
@@ -164,4 +171,18 @@ test('corrupt secrets.json is skipped without crashing and renamed', () => {
   } finally {
     console.error = origErr;
   }
+});
+
+test('process exit persists live sessions (shutdown hook)', () => {
+  const { spawnSync } = require('child_process');
+  const dir = tmp();
+  const script = `
+    const engine = require(${JSON.stringify(path.resolve(__dirname, '../../playwright.js'))}).default;
+    engine.sessions.set('sd1', { id: 'sd1', projectName: 'Shutdown', devUrl: 'http://d', prodUrl: 'http://p',
+      startedAt: new Date().toISOString(), logs: [{ id: 'l1' }], mismatches: [], isRunning: true });
+  `;
+  const r = spawnSync(process.execPath, ['-e', script], { env: { ...process.env, QA_VISION_DATA_DIR: dir }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const run = openStore(dbIn(dir)).getRun('sd1');
+  assert.ok(run && run.projectName === 'Shutdown' && run.endedAt);
 });

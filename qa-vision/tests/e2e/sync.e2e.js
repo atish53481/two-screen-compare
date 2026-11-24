@@ -103,6 +103,6 @@ runSuite('Synchronization & findings', async ({ check }) => {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline && !openStore().getRun(c)) await new Promise((r) => setTimeout(r, 200));
   const closedRun = openStore().getRun(c);
-  check('closing the DEV browser persists the run row', !!closedRun && closedRun.projectName === 'sync-C');
+  check('closing the DEV browser persists the run row', !!closedRun && closedRun.projectName === 'sync-C' && !!closedRun.endedAt);
   await engine.closeSession(c);
 });
