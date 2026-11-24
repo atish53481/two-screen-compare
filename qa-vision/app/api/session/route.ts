@@ -113,11 +113,12 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        if (!comparisonEngine.getSession(sessionId)) {
-          return NextResponse.json({ success: false, error: 'Unknown session' }, { status: 404 });
-        }
-        const phase = await comparisonEngine.setPaused(sessionId, Boolean(paused));
-        return NextResponse.json({ success: true, paused: phase === 'paused', phase });
+        const r = await comparisonEngine.setPaused(sessionId, Boolean(paused));
+        const status = r.ok ? 200 : r.status === 'not-found' ? 404 : 409;
+        return NextResponse.json(
+          { success: r.ok, error: r.ok ? undefined : r.message, message: r.message, paused: r.phase === 'paused', phase: r.phase },
+          { status }
+        );
       }
 
       case 'start': {

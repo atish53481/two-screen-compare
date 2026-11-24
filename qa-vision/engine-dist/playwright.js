@@ -972,7 +972,17 @@ class QAComparisonEngine {
      * Note: this aligns the page/route only; in-page state (typed values, open modals,
      * client-side login state) is not transferred.
      */
-    async resync(sessionId, stepLabel = 'resync') {
+    async resync(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.isRunning)
+            return { ok: false, message: 'No active session' };
+        if (session.phase !== 'running' || session.starting) {
+            return { ok: false, message: `Resync is only available while comparing (session is ${session.starting ? 'starting' : session.phase})` };
+        }
+        return this.performResync(sessionId, 'resync');
+    }
+    /** Resync without the phase check: used by Start Comparison and Start again, which own the phase transition. */
+    async performResync(sessionId, stepLabel) {
         const session = this.sessions.get(sessionId);
         if (!session || !session.isRunning)
             return { ok: false, message: 'No active session' };
@@ -1037,37 +1047,67 @@ class QAComparisonEngine {
         if (session.phase !== 'ready' || session.starting) {
             return { ok: false, status: 'bad-phase', phase: session.phase, message: `Session is ${session.starting ? 'starting' : session.phase}, not ready` };
         }
+        // The phase stays 'ready' (recorder events dropped) until PROD is aligned; `starting` rejects pause/start meanwhile
         session.starting = true;
         try {
-            this.setPhase(session, 'running'); // before resync, so its baseline comparison and DEV actions are live
             await this.runDataChecks(sessionId);
-            const r = await this.resync(sessionId, 'initial');
-            if (!r.ok) {
-                this.setPhase(session, 'ready');
-                return { ok: false, status: 'failed', phase: 'ready', message: r.message };
-            }
+            const r = await this.performResync(sessionId, 'initial');
+            if (!r.ok)
+                return { ok: false, status: 'failed', phase: session.phase, message: r.message };
+            this.setPhase(session, 'running');
             this.log(sessionId, 'Comparison started', 'Started', 'Started');
-            return { ok: true, status: 'ok', phase: 'running', message: r.message };
+            return { ok: true, status: 'ok', phase: session.phase, message: r.message };
+        }
+        catch (err) {
+            const message = `Start failed: ${String(err?.message || err).split('\n')[0]}`;
+            this.log(sessionId, message, 'Error', 'Error');
+            return { ok: false, status: 'failed', phase: session.phase, message };
         }
         finally {
             session.starting = false;
         }
     }
-    /** Pause (running -> paused) or resume (paused -> running, with a resync + comparison so drift is caught). */
+    /**
+     * Pause (running -> paused) or resume (paused -> running). Resume first resyncs PROD to DEV and
+     * compares, so drift is caught; if that fails the session stays paused and ok is false.
+     */
     async setPaused(sessionId, paused) {
         const session = this.sessions.get(sessionId);
-        if (!session)
-            return undefined;
-        if (paused && session.phase === 'running') {
+        if (!session || !session.isRunning)
+            return { ok: false, status: 'not-found', message: 'No active session' };
+        const bad = (message) => ({ ok: false, status: 'bad-phase', phase: session.phase, message });
+        if (session.starting)
+            return bad('Session is starting; wait for Start to finish');
+        if (paused) {
+            if (session.phase === 'paused')
+                return { ok: true, status: 'ok', phase: session.phase, message: 'Already paused' };
+            if (session.phase !== 'running')
+                return bad(`Cannot pause a session that is ${session.phase}`);
             this.setPhase(session, 'paused');
             this.log(sessionId, 'Session paused', 'OK', 'OK');
+            return { ok: true, status: 'ok', phase: session.phase, message: 'Paused' };
         }
-        else if (!paused && session.phase === 'paused') {
+        if (session.phase === 'running')
+            return { ok: true, status: 'ok', phase: session.phase, message: 'Already running' };
+        if (session.phase !== 'paused')
+            return bad(`Cannot resume a session that is ${session.phase}`);
+        session.starting = true; // also blocks a second resume / a pause while resyncing
+        try {
+            const r = await this.performResync(sessionId, 'resume');
+            if (!r.ok)
+                return { ok: false, status: 'failed', phase: session.phase, message: r.message };
             this.setPhase(session, 'running');
             this.log(sessionId, 'Session resumed', 'OK', 'OK');
-            await this.resync(sessionId, 'resume');
+            return { ok: true, status: 'ok', phase: session.phase, message: r.message };
         }
-        return session.phase;
+        catch (err) {
+            const message = `Resume failed: ${String(err?.message || err).split('\n')[0]}`;
+            this.log(sessionId, message, 'Error', 'Error');
+            return { ok: false, status: 'failed', phase: session.phase, message };
+        }
+        finally {
+            session.starting = false;
+        }
     }
     /** Replay one DEV action on PROD. Returns true when the DEV action happened (so a comparison is due). */
     async replicateAction(sessionId, action, stepId = "manual") {

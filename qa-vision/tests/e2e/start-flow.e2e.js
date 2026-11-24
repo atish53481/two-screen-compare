@@ -71,6 +71,50 @@ runSuite('Start flow (ready -> running -> paused)', async ({ check }) => {
   const run = openStore().getRun(b);
   check('stop from ready persists the run (zero steps)', !!run, run ? '' : 'not persisted');
 
+  // Failure handling and races
+  const f = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'start-flow-failures', startImmediately: false });
+  const F = engine.getSession(f);
+  await waitForLoginForm(F);
+  const realChecks = engine.runDataChecks;
+  const realResync = engine.performResync;
+
+  engine.runDataChecks = async () => {
+    throw new Error('boom');
+  };
+  const thrown = await engine.startComparison(f);
+  engine.runDataChecks = realChecks;
+  check('a throw in startComparison reverts to "ready" with ok:false', !thrown.ok && thrown.status === 'failed' && engine.getPhase(f) === 'ready' && !F.starting, JSON.stringify(thrown));
+
+  const manual = await engine.resync(f);
+  check('resync is rejected unless running', !manual.ok && /only available/.test(manual.message), manual.message);
+
+  engine.runDataChecks = async () => {
+    await sleep(800);
+  };
+  const pending = engine.startComparison(f);
+  await sleep(150);
+  const midPause = await engine.setPaused(f, true);
+  const midStart = await engine.startComparison(f);
+  check('pause during starting is rejected; phase stays "ready" until aligned', !midPause.ok && midPause.status === 'bad-phase' && engine.getPhase(f) === 'ready', JSON.stringify(midPause));
+  check('second start during starting is rejected', !midStart.ok && midStart.status === 'bad-phase');
+  const done = await pending;
+  engine.runDataChecks = realChecks;
+  check('start completes after the race with the real phase "running"', done.ok && done.phase === 'running' && engine.getPhase(f) === 'running');
+
+  await engine.setPaused(f, true);
+  engine.performResync = async () => ({ ok: false, message: 'simulated resync failure' });
+  const failedResume = await engine.setPaused(f, false);
+  check('resume whose resync fails stays "paused" with ok:false and the reason', !failedResume.ok && failedResume.phase === 'paused' && engine.getPhase(f) === 'paused' && F.isPaused && /simulated/.test(failedResume.message), JSON.stringify(failedResume));
+  engine.performResync = realResync;
+  const goodResume = await engine.setPaused(f, false);
+  check('resume succeeds once resync works', goodResume.ok && engine.getPhase(f) === 'running');
+
+  await engine.setPaused(f, true);
+  await F.prodPage.close();
+  const closedResume = await engine.setPaused(f, false);
+  check('resume with a closed PROD window stays paused', !closedResume.ok && engine.getPhase(f) === 'paused', closedResume.message);
+  await engine.closeSession(f);
+
   // startImmediately keeps the legacy behaviour (default)
   const c = await engine.createSession(DEV_URL, PROD_URL, { projectName: 'start-flow-legacy' });
   const C = engine.getSession(c);

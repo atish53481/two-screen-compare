@@ -269,6 +269,8 @@ export interface ComparisonSession {
   /** Live-view frame loop (see startFrameStream). */
   frameTimer?: ReturnType<typeof setInterval>;
   frameBusy?: boolean;
+  /** Live-view input from the dashboard, applied to DEV one at a time in arrival order. */
+  liveInputQueue?: Promise<void>;
   startedAt: string;
   evidenceDir: string;
   /** Network/API entries seen since the last comparison (capped at 500 each). */
@@ -435,7 +437,9 @@ class QAComparisonEngine {
     fs.mkdirSync(evidenceDir, { recursive: true });
 
     const launchOptions = {
-      headless: process.env.QA_VISION_HEADLESS === '1', // visible by default; headless for automated tests
+      // Headless by default: the user drives DEV from the dashboard's Live view (see handleLiveInput).
+      // QA_VISION_SHOW_BROWSERS=1 brings back the separate visible DEV/PROD windows.
+      headless: process.env.QA_VISION_SHOW_BROWSERS !== '1' || process.env.QA_VISION_HEADLESS === '1',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -1134,7 +1138,17 @@ class QAComparisonEngine {
    * Note: this aligns the page/route only; in-page state (typed values, open modals,
    * client-side login state) is not transferred.
    */
-  async resync(sessionId: string, stepLabel = 'resync'): Promise<{ ok: boolean; message: string; devUrl?: string; prodUrl?: string }> {
+  async resync(sessionId: string): Promise<{ ok: boolean; message: string; devUrl?: string; prodUrl?: string }> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.isRunning) return { ok: false, message: 'No active session' };
+    if (session.phase !== 'running' || session.starting) {
+      return { ok: false, message: `Resync is only available while comparing (session is ${session.starting ? 'starting' : session.phase})` };
+    }
+    return this.performResync(sessionId, 'resync');
+  }
+
+  /** Resync without the phase check: used by Start Comparison and Start again, which own the phase transition. */
+  private async performResync(sessionId: string, stepLabel: string): Promise<{ ok: boolean; message: string; devUrl?: string; prodUrl?: string }> {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isRunning) return { ok: false, message: 'No active session' };
     if (!session.devBrowser.isConnected() || !session.prodBrowser.isConnected() || session.devPage.isClosed() || session.prodPage.isClosed()) {
@@ -1208,35 +1222,59 @@ class QAComparisonEngine {
     if (session.phase !== 'ready' || session.starting) {
       return { ok: false, status: 'bad-phase', phase: session.phase, message: `Session is ${session.starting ? 'starting' : session.phase}, not ready` };
     }
+    // The phase stays 'ready' (recorder events dropped) until PROD is aligned; `starting` rejects pause/start meanwhile
     session.starting = true;
     try {
-      this.setPhase(session, 'running'); // before resync, so its baseline comparison and DEV actions are live
       await this.runDataChecks(sessionId);
-      const r = await this.resync(sessionId, 'initial');
-      if (!r.ok) {
-        this.setPhase(session, 'ready');
-        return { ok: false, status: 'failed', phase: 'ready', message: r.message };
-      }
+      const r = await this.performResync(sessionId, 'initial');
+      if (!r.ok) return { ok: false, status: 'failed', phase: session.phase, message: r.message };
+      this.setPhase(session, 'running');
       this.log(sessionId, 'Comparison started', 'Started', 'Started');
-      return { ok: true, status: 'ok', phase: 'running', message: r.message };
+      return { ok: true, status: 'ok', phase: session.phase, message: r.message };
+    } catch (err: any) {
+      const message = `Start failed: ${String(err?.message || err).split('\n')[0]}`;
+      this.log(sessionId, message, 'Error', 'Error');
+      return { ok: false, status: 'failed', phase: session.phase, message };
     } finally {
       session.starting = false;
     }
   }
 
-  /** Pause (running -> paused) or resume (paused -> running, with a resync + comparison so drift is caught). */
-  async setPaused(sessionId: string, paused: boolean): Promise<SessionPhase | undefined> {
+  /**
+   * Pause (running -> paused) or resume (paused -> running). Resume first resyncs PROD to DEV and
+   * compares, so drift is caught; if that fails the session stays paused and ok is false.
+   */
+  async setPaused(
+    sessionId: string,
+    paused: boolean
+  ): Promise<{ ok: boolean; status: 'ok' | 'not-found' | 'bad-phase' | 'failed'; phase?: SessionPhase; message: string }> {
     const session = this.sessions.get(sessionId);
-    if (!session) return undefined;
-    if (paused && session.phase === 'running') {
+    if (!session || !session.isRunning) return { ok: false, status: 'not-found', message: 'No active session' };
+    const bad = (message: string) => ({ ok: false, status: 'bad-phase' as const, phase: session.phase, message });
+    if (session.starting) return bad('Session is starting; wait for Start to finish');
+    if (paused) {
+      if (session.phase === 'paused') return { ok: true, status: 'ok', phase: session.phase, message: 'Already paused' };
+      if (session.phase !== 'running') return bad(`Cannot pause a session that is ${session.phase}`);
       this.setPhase(session, 'paused');
       this.log(sessionId, 'Session paused', 'OK', 'OK');
-    } else if (!paused && session.phase === 'paused') {
+      return { ok: true, status: 'ok', phase: session.phase, message: 'Paused' };
+    }
+    if (session.phase === 'running') return { ok: true, status: 'ok', phase: session.phase, message: 'Already running' };
+    if (session.phase !== 'paused') return bad(`Cannot resume a session that is ${session.phase}`);
+    session.starting = true; // also blocks a second resume / a pause while resyncing
+    try {
+      const r = await this.performResync(sessionId, 'resume');
+      if (!r.ok) return { ok: false, status: 'failed', phase: session.phase, message: r.message };
       this.setPhase(session, 'running');
       this.log(sessionId, 'Session resumed', 'OK', 'OK');
-      await this.resync(sessionId, 'resume');
+      return { ok: true, status: 'ok', phase: session.phase, message: r.message };
+    } catch (err: any) {
+      const message = `Resume failed: ${String(err?.message || err).split('\n')[0]}`;
+      this.log(sessionId, message, 'Error', 'Error');
+      return { ok: false, status: 'failed', phase: session.phase, message };
+    } finally {
+      session.starting = false;
     }
-    return session.phase;
   }
 
   /** Replay one DEV action on PROD. Returns true when the DEV action happened (so a comparison is due). */
@@ -2457,6 +2495,18 @@ class QAComparisonEngine {
   startFrameStream(sessionId: string) {
     const session = this.sessions.get(sessionId);
     if (!session || session.frameTimer) return;
+    // Frames keep flowing while paused: the Live view is where the user drives DEV, so it must never freeze.
+    session.frameTimer = setInterval(() => {
+      if (!session.isRunning) return this.stopFrameStream(sessionId);
+      void this.emitFrames(session, ['dev', 'prod']);
+    }, 1000);
+    session.frameTimer.unref?.();
+  }
+
+  /** One frame per requested side (skipped while a previous grab is in flight or nobody is watching). */
+  private async emitFrames(session: ComparisonSession, sides: Array<'dev' | 'prod'>) {
+    const io = this.io;
+    if (session.frameBusy || !session.isRunning || !io || io.sockets.sockets.size < 1) return;
     const grab = async (page: Page): Promise<string | null> => {
       try {
         const masks = ['input[type="password"]', ...session.capture.maskSelectors].map((sel) => page.locator(sel));
@@ -2466,21 +2516,79 @@ class QAComparisonEngine {
         return null;
       }
     };
-    session.frameTimer = setInterval(async () => {
-      const io = this.io;
-      if (!session.isRunning) return this.stopFrameStream(sessionId);
-      if (session.frameBusy || session.isPaused || !io || io.sockets.sockets.size < 1) return;
-      session.frameBusy = true;
-      try {
-        for (const [side, page] of [['dev', session.devPage], ['prod', session.prodPage]] as const) {
-          const data = await grab(page);
-          if (data && session.isRunning && !session.isPaused) io.emit('frame', { sessionId, side, data, url: urlForLog(page.url()) });
-        }
-      } finally {
-        session.frameBusy = false;
+    session.frameBusy = true;
+    try {
+      for (const side of sides) {
+        const page = side === 'dev' ? session.devPage : session.prodPage;
+        const data = await grab(page);
+        if (data && session.isRunning) io.emit('frame', { sessionId: session.id, side, data, url: urlForLog(page.url()) });
       }
-    }, 1000);
-    session.frameTimer.unref?.();
+    } finally {
+      session.frameBusy = false;
+    }
+  }
+
+  /**
+   * Live-view input: the dashboard's DEV pane forwards mouse/keyboard input here, and it is dispatched as real
+   * input on the DEV page. The DEV recorder therefore captures it exactly as if the user had used a DEV window,
+   * and PROD mirrors it through the normal replay path. Coordinates are CSS pixels in the DEV viewport (the
+   * frame is a viewport screenshot). Inputs apply one at a time, in arrival order; bad input is ignored.
+   */
+  handleLiveInput(sessionId: string, input: unknown) {
+    const session = this.sessions.get(sessionId);
+    if (!session || !session.isRunning || session.stopRequested || !input || typeof input !== 'object') return;
+    const i = input as Record<string, unknown>;
+    const { width, height } = session.capture.viewport;
+    const coord = (v: unknown, max: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.min(Math.max(n, 0), max - 1) : null;
+    };
+    const str = (v: unknown, max: number) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : null);
+    const apply = async () => {
+      if (!session.isRunning || session.stopRequested || session.suppressCapture) return;
+      const page = session.devPage;
+      const mouse = page.mouse;
+      switch (i.kind) {
+        case 'move':
+        case 'click':
+        case 'wheel': {
+          const x = coord(i.x, width);
+          const y = coord(i.y, height);
+          if (x === null || y === null) return;
+          await mouse.move(x, y);
+          if (i.kind === 'click') {
+            const button = i.button === 'right' ? 'right' : 'left';
+            const clickCount = i.count === 2 ? 2 : 1;
+            await mouse.down({ button, clickCount });
+            await mouse.up({ button, clickCount });
+          } else if (i.kind === 'wheel') {
+            const dy = Math.max(-3000, Math.min(3000, Number(i.deltaY) || 0));
+            const dx = Math.max(-3000, Math.min(3000, Number(i.deltaX) || 0));
+            if (dx || dy) await mouse.wheel(dx, dy);
+          }
+          break;
+        }
+        case 'key': {
+          // Playwright key names, optionally with modifiers: "Enter", "Shift+Tab", "Control+a"
+          const key = str(i.key, 40);
+          if (key && /^[\x20-\x7e]+$/.test(key)) await page.keyboard.press(key);
+          break;
+        }
+        case 'text': {
+          // Printable characters typed into the pane; pasted text arrives here too
+          const text = str(i.text, 5000);
+          if (text) await page.keyboard.type(text);
+          break;
+        }
+        default:
+          return;
+      }
+      // Refresh DEV now (mouse moves excluded) so the pane responds without waiting for the 1 s tick
+      if (i.kind !== 'move') setTimeout(() => void this.emitFrames(session, ['dev']), 120);
+    };
+    session.liveInputQueue = (session.liveInputQueue ?? Promise.resolve())
+      .then(() => Promise.race([apply(), new Promise<void>((r) => setTimeout(r, 5000))]))
+      .catch((e) => console.error('Live input failed:', (e as Error).message));
   }
 
   stopFrameStream(sessionId: string) {

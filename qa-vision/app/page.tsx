@@ -5,7 +5,7 @@ import { io as connectSocket, type Socket } from 'socket.io-client';
 import { Play, Pause, Square, RefreshCw, Download, Settings, AlertTriangle, CheckCircle, XCircle, Eye, Power, Plus, Trash2, Edit } from 'lucide-react';
 import { format } from 'date-fns';
 import type { ComparisonProfile } from '../lib/types';
-import LiveView, { type Frame } from './components/LiveView';
+import LiveView, { type Frame, type LiveInput } from './components/LiveView';
 import Timeline from './components/Timeline';
 import FindingsPanel from './components/FindingsPanel';
 import EvidenceViewer from './components/EvidenceViewer';
@@ -47,6 +47,8 @@ const QA_VISION = () => {
   const [phase, setPhase] = useState<'ready' | 'running' | 'paused'>('ready');
   const isPaused = phase === 'paused';
   const [isBusy, setIsBusy] = useState(false); // a session request is in flight
+  const busyRef = React.useRef(false); // synchronous guard: a double click never sends a second request
+  const reqToken = React.useRef(0); // Stop bumps it so a late start/pause response cannot change state
   const [isStopping, setIsStopping] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [mismatches, setMismatches] = useState<Mismatch[]>([]);
@@ -63,6 +65,11 @@ const QA_VISION = () => {
   const [exportNote, setExportNote] = useState('');
   const sessionRef = React.useRef<string | null>(null);
   const viewRunRef = React.useRef(false);
+  const socketRef = React.useRef<Socket | null>(null);
+  // Live view: DEV pane input goes to the DEV browser of this tab's own session
+  const sendLiveInput = React.useCallback((input: LiveInput) => {
+    if (sessionRef.current) socketRef.current?.emit('live-input', { sessionId: sessionRef.current, ...input });
+  }, []);
   const [status, setStatus] = useState('QA Vision Master Ready — Load or create a comparison profile');
   const [lastReportMeta, setLastReportMeta] = useState<{
     id: string;
@@ -83,6 +90,7 @@ const QA_VISION = () => {
 
     // Real-time Socket.IO connection (same origin as the dashboard; server.js hosts both)
     const socket: Socket = connectSocket({ path: '/socket.io', reconnection: true, reconnectionAttempts: 5 });
+    socketRef.current = socket;
     // Live events only feed the live session; a stored run opened read-only is never touched
     const mine = (data: any) => !viewRunRef.current && (!sessionRef.current || data?.sessionId === sessionRef.current);
     socket.on('log', (data: any) => {
@@ -109,6 +117,7 @@ const QA_VISION = () => {
       setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || '') } }));
     });
     return () => {
+      socketRef.current = null;
       socket.disconnect();
     };
   }, []);
@@ -168,7 +177,7 @@ const QA_VISION = () => {
         setPhase('ready');
         setMismatches([]);
         setStatus(
-          'READY — log in or navigate in the "QA Vision DEV" window. Nothing is compared or replicated yet. Press START COMPARISON when DEV is where you want to begin.'
+          'READY — log in or navigate in the DEV pane of Live Comparison. Nothing is compared or replicated yet. Press START COMPARISON when DEV is where you want to begin.'
         );
         setActiveTab('dashboard');
       } else {
@@ -195,34 +204,44 @@ const QA_VISION = () => {
 
   // Ready -> running: aligns PROD to DEV's current page, then compares
   const startComparison = async () => {
-    if (!isRunning || isStopping || isBusy || !sessionId) return;
+    if (!isRunning || isStopping || busyRef.current || !sessionId) return;
+    busyRef.current = true;
+    const token = ++reqToken.current;
     setIsBusy(true);
     setStatus('Starting: aligning PROD to the DEV page and running the first comparison…');
     try {
       const { res, data } = await postSession({ action: 'start', sessionId });
+      if (token !== reqToken.current) return; // Stop was pressed meanwhile
       if (res.ok && data.success) {
-        setPhase('running');
-        setStatus('COMPARING — DEV actions are replicated to PROD and compared. Use only the "QA Vision DEV" window.');
+        setPhase(data.phase === 'paused' ? 'paused' : data.phase === 'ready' ? 'ready' : 'running');
+        setStatus('COMPARING — DEV actions are replicated to PROD and compared. Work in the DEV pane of Live Comparison.');
       } else {
+        if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
         setStatus(`❌ Could not start: ${data?.error || data?.message || 'HTTP ' + res.status}`);
       }
     } catch (e: any) {
-      setStatus(`❌ Could not start: ${e?.message || 'network error'}`);
+      if (token === reqToken.current) setStatus(`❌ Could not start: ${e?.message || 'network error'}`);
     } finally {
-      setIsBusy(false);
+      if (token === reqToken.current) {
+        busyRef.current = false;
+        setIsBusy(false);
+      }
     }
   };
 
   // Running -> paused, and paused -> running ("START AGAIN": resyncs PROD, then compares)
   const pauseComparison = async () => {
-    if (!isRunning || isStopping || isBusy || !sessionId) return;
+    if (!isRunning || isStopping || busyRef.current || !sessionId) return;
     const resuming = isPaused;
+    busyRef.current = true;
+    const token = ++reqToken.current;
     setIsBusy(true);
     setStatus(resuming ? 'Starting again: re-aligning PROD to DEV and comparing…' : 'Pausing…');
     try {
       const { res, data } = await postSession({ action: 'pause', sessionId, paused: !resuming });
+      if (token !== reqToken.current) return;
+      if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
       if (res.ok && data.success) {
-        setPhase(data.phase === 'paused' ? 'paused' : 'running');
         setStatus(
           data.phase === 'paused'
             ? 'PAUSED — nothing is replicated or compared. Press START AGAIN to resync PROD and continue.'
@@ -232,15 +251,21 @@ const QA_VISION = () => {
         setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${data?.error || 'HTTP ' + res.status}`);
       }
     } catch (e: any) {
-      setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${e?.message || 'network error'}`);
+      if (token === reqToken.current) setStatus(`❌ ${resuming ? 'Start again' : 'Pause'} failed: ${e?.message || 'network error'}`);
     } finally {
-      setIsBusy(false);
+      if (token === reqToken.current) {
+        busyRef.current = false;
+        setIsBusy(false);
+      }
     }
   };
 
   const stopComparison = async () => {
     if (!isRunning || isStopping) return;
 
+    reqToken.current++; // invalidate any in-flight start/pause response
+    busyRef.current = false;
+    setIsBusy(false);
     setIsStopping(true);
     setStatus('🛑 Stopping real browser sessions and cleaning up...');
 
@@ -605,7 +630,7 @@ const QA_VISION = () => {
                     <button
                       type="button"
                       onClick={stopComparison}
-                      disabled={isStopping || isBusy}
+                      disabled={isStopping}
                       className="flex items-center justify-center gap-2 bg-red-600 hover:bg-red-500 py-4 rounded-2xl font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <Square className="h-5 w-5" />
@@ -748,6 +773,7 @@ const QA_VISION = () => {
                   isRunning={isRunning}
                   isPaused={isPaused}
                   outOfSync={outOfSync}
+                  onInput={sendLiveInput}
                 />
               )}
               <Timeline logs={logs} findings={mismatches} selectedStep={selectedStep} onSelectStep={setSelectedStep} />

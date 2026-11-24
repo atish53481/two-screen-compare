@@ -198,6 +198,8 @@ const postJson = (p, body) =>
     await test('clicking START COMPARISON shows PAUSE; starting again via the route -> 409', async () => {
       const responded = page.waitForResponse((r) => r.url().endsWith('/api/session') && r.request().method() === 'POST', { timeout: 60000 });
       await btn(/START COMPARISON/).click();
+      // While Start is in flight the controls are busy but Stop must stay enabled
+      assert(await btn(/STOP/).first().isEnabled(), 'Stop disabled while Start is in flight');
       assert((await responded).status() === 200, 'start did not return 200');
       await btn(/PAUSE/).waitFor({ timeout: 10000 });
       assert((await btn(/START COMPARISON/).count()) === 0, 'START COMPARISON still shown');
