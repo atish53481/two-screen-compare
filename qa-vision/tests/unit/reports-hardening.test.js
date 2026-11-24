@@ -39,8 +39,39 @@ test('skipped-action logs count, de-duplicated against skipped findings', () => 
     mismatches: [finding({ classification: 'SKIPPED_BY_SAFETY_POLICY', component: 'POST /api/x' })],
   }));
   assert.equal(m.summary.skippedUnsafe, 2);
-  assert.deepEqual(m.skippedActions, ['Skipped on PROD (strict): click "Delete"']);
+  assert.deepEqual(m.skippedActions, [
+    { action: 'Skipped on PROD (strict): click "Delete"' },
+    { action: 'Blocked PROD request (strict): POST /api/x', findingId: 'f1' },
+  ]);
 });
+
+test('a generic skipped finding does not hide an unrelated skipped log', () => {
+  const m = buildReportModel(snap({
+    logs: [{ timestamp: '1', action: 'Skipped on PROD (strict): click "button" Save', status: 'skipped', devResult: 'Executed', prodResult: 'Blocked' }],
+    mismatches: [finding({ classification: 'SKIPPED_BY_SAFETY_POLICY', component: 'button', devValue: 'a', stepIds: [] })],
+  }));
+  assert.equal(m.skippedActions.length, 1);
+  assert.equal(m.skippedActions[0].findingId, undefined);
+  assert.equal(m.summary.skippedUnsafe, 2);
+});
+
+test('a skipped log and finding sharing a stepId count once', () => {
+  const m = buildReportModel(snap({
+    logs: [{ timestamp: '1', action: '[step-3] Skipped on PROD: click Delete', status: 'skipped', devResult: 'Executed', prodResult: 'Blocked' }],
+    mismatches: [finding({ classification: 'SKIPPED_BY_SAFETY_POLICY', stepIds: ['step-3'] })],
+  }));
+  assert.equal(m.skippedActions[0].findingId, 'f1');
+  assert.equal(m.summary.skippedUnsafe, 1);
+});
+
+test('query tokens in log text are redacted from timeline and skipped actions', () => {
+  const out = renderJsonText(buildReportModel(snap({
+    logs: [{ timestamp: '1', action: 'Blocked PROD request (strict): POST http://p/api?token=SECRET123', status: 'skipped', devResult: 'n/a', prodResult: 'Blocked' }],
+  })));
+  assert.ok(!out.includes('SECRET123'), out);
+});
+
+const renderJsonText = (m) => require('../../engine-dist/engine/reports/json.js').renderJson(m);
 
 test('urls lose userinfo/query/fragment; ai text is redacted', () => {
   assert.equal(sanitizeUrl('http://u:pw@dev/x?token=abc#frag'), 'http://dev/x');

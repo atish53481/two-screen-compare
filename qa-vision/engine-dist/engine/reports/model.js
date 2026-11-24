@@ -75,10 +75,21 @@ function buildReportModel(snap) {
         if (f.page)
             pages.add(pathOf(f.page));
     const skippedFindings = findings.filter((f) => f.classification === 'SKIPPED_BY_SAFETY_POLICY');
+    // Every skipped/blocked log is listed. It links to a skipped finding only by a stable key: the [step-N] id, or an
+    // exact request signature (method + path). Text containment is deliberately not used (generic values would hide logs).
+    const requestSig = (text) => {
+        const m = /\b(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(\S+)/.exec(text);
+        return m ? `${m[1]} ${pathOf(m[2])}` : '';
+    };
     const skippedActions = logs
         .filter((l) => l.status === 'skipped' || l.prodResult === 'Blocked')
-        .map((l) => String(l.action))
-        .filter((a) => !skippedFindings.some((f) => [f.component, f.devValue].some((k) => k && a.includes(k))));
+        .map((l) => {
+        const action = String(l.action ?? '');
+        const stepId = /\[(step-\d+)\]/.exec(action)?.[1];
+        const sig = requestSig(action);
+        const linked = skippedFindings.find((f) => (stepId && f.stepIds?.includes(stepId)) || (sig && requestSig(String(f.component)) === sig));
+        return { action: (0, runtime_diff_1.redactSecrets)(action), ...(linked ? { findingId: linked.id } : {}) };
+    });
     const comparisons = logs.filter((l) => String(l.action).startsWith('Compared after')).length;
     return {
         meta: {
@@ -100,15 +111,15 @@ function buildReportModel(snap) {
             byClassification: tally(findings.map((f) => f.classification)),
             expected: count('EXPECTED_DIFFERENCE'),
             replayIssues: count('REPLAY_FAILURE'),
-            skippedUnsafe: skippedFindings.length + skippedActions.length,
+            skippedUnsafe: skippedFindings.length + skippedActions.filter((a) => !a.findingId).length,
         },
         timeline: logs.map((l) => {
             const stepId = /\[(step-\d+)\]/.exec(String(l.action))?.[1] ?? '';
             return {
                 stepId,
-                action: String(l.action ?? ''),
-                devResult: String(l.devResult ?? ''),
-                prodResult: String(l.prodResult ?? ''),
+                action: (0, runtime_diff_1.redactSecrets)(String(l.action ?? '')),
+                devResult: (0, runtime_diff_1.redactSecrets)(String(l.devResult ?? '')),
+                prodResult: (0, runtime_diff_1.redactSecrets)(String(l.prodResult ?? '')),
                 status: String(l.status ?? ''),
                 findingIds: stepId ? findings.filter((f) => f.stepIds?.includes(stepId)).map((f) => f.id) : [],
             };

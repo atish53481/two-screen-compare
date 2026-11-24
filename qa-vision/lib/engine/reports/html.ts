@@ -76,7 +76,7 @@ img{max-width:100%;border:1px solid #ccc}figure{margin:.5rem 0}</style></head><b
 <h2>Differences by type</h2>${countTable(summary.byType)}${countTable(summary.byClassification)}
 <h2>Expected differences</h2>${findingRows(findings.filter((f) => f.classification === 'EXPECTED_DIFFERENCE'))}
 <h2>Replay issues</h2>${findingRows(findings.filter((f) => f.classification === 'REPLAY_FAILURE'))}
-<h2>Skipped unsafe actions</h2>${findingRows(findings.filter((f) => f.classification === 'SKIPPED_BY_SAFETY_POLICY'))}${list(model.skippedActions)}
+<h2>Skipped unsafe actions</h2>${findingRows(findings.filter((f) => f.classification === 'SKIPPED_BY_SAFETY_POLICY'))}${list(model.skippedActions.map((a) => (a.findingId ? `${a.action} (finding ${a.findingId})` : a.action)))}
 <h2>All findings</h2>${findingRows(findings)}
 <h2>Timeline</h2>${timeline}
 <h2>AI analysis</h2><p class="muted">Observed facts and hypotheses are listed separately. AI output is advisory and never changes a classification.</p>${ai.join('') || '<p class="muted">No AI analysis available.</p>'}
