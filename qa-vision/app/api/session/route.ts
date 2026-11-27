@@ -156,6 +156,17 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ success: true, message: 'Session stopped' });
       }
 
+      case 'diagnose': {
+        if (!sessionId) {
+          return NextResponse.json({ success: false, error: 'sessionId required' }, { status: 400 });
+        }
+        const result = await comparisonEngine.diagnoseSession(sessionId);
+        return NextResponse.json(
+          { ...result, success: result.ok },
+          { status: result.ok ? 200 : 404 }
+        );
+      }
+
       default:
         return NextResponse.json(
           { success: false, error: 'Unknown action' },

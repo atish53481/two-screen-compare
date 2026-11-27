@@ -66,9 +66,18 @@ app.prepare().then(() => {
   io.on('connection', (socket) => {
     console.log('✅ QA Vision client connected for real-time updates');
     socket.emit('status', { message: 'Real-time synchronization active' });
-    // Live view: mouse/keyboard input from the dashboard's DEV pane, applied to the DEV browser
+    // Live view: mouse/keyboard input from the dashboard's panes. side 'dev' (default) drives DEV and is mirrored;
+    // side 'prod' drives PROD directly and is only accepted while the session is ready or paused.
     socket.on('live-input', (data) => {
       if (data && typeof data.sessionId === 'string') comparisonEngine.handleLiveInput(data.sessionId, data);
+    });
+    // Live view browser controls: address bar (goto), back, forward, reload. Answers through the ack callback.
+    socket.on('live-nav', (data, ack) => {
+      const reply = typeof ack === 'function' ? ack : () => {};
+      if (!data || typeof data.sessionId !== 'string') return reply({ ok: false, message: 'sessionId required' });
+      comparisonEngine
+        .liveNavigate(data.sessionId, data.side, data.op, data.url)
+        .then(reply, (e) => reply({ ok: false, message: String((e && e.message) || e) }));
     });
   });
 

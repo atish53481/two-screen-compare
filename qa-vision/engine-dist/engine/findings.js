@@ -36,7 +36,7 @@ exports.DEFAULT_CAPTURE_SETTINGS = {
     fullPage: false,
     maskSelectors: [],
     scopeSelector: '',
-    settleMs: 350,
+    settleMs: 150,
     layoutTolerancePx: 2,
 };
 function clampNum(v, min, max, fallback) {

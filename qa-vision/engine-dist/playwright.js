@@ -32,23 +32,23 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.comparisonEngine = void 0;
 exports.validateTargetUrl = validateTargetUrl;
+exports.mergeBaseQuery = mergeBaseQuery;
 exports.mapDevUrlToProd = mapDevUrlToProd;
+exports.onSharedOutsideHost = onSharedOutsideHost;
+exports.urlForAddressBar = urlForAddressBar;
 exports.compileIgnoreRules = compileIgnoreRules;
 exports.persistLiveSessions = persistLiveSessions;
 const playwright_1 = require("playwright");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
-const pixelmatch_1 = __importDefault(require("pixelmatch"));
-const pngjs_1 = require("pngjs");
 const findings_1 = require("./engine/findings");
 const extract_1 = require("./engine/extract");
 const dom_diff_1 = require("./engine/dom-diff");
+const pixel_diff_1 = require("./engine/pixel-diff");
+const worker_threads_1 = require("worker_threads");
 const css_diff_1 = require("./engine/css-diff");
 const a11y_diff_1 = require("./engine/a11y-diff");
 const data_rules_1 = require("./engine/data-rules");
@@ -82,6 +82,312 @@ const BLOCKED_HOSTS = new Set([
     'fd00:ec2::254',
 ]);
 /**
+ * Akamai and similar WAFs block obvious automation fingerprints.
+ * Prefer the system Chrome channel and a normal desktop Chrome UA (never "QA-Vision-*"
+ * or "HeadlessChrome"). QA_VISION_BROWSER=chromium forces bundled Chromium.
+ */
+function preferSystemChrome() {
+    return String(process.env.QA_VISION_BROWSER || 'chrome').toLowerCase() !== 'chromium';
+}
+function desktopChromeUserAgent(browserVersion) {
+    const raw = String(browserVersion || '').replace(/^Chrome\//i, '').trim();
+    const full = /^\d+(\.\d+){1,3}$/.test(raw) ? raw : '131.0.0.0';
+    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${full} Safari/537.36`;
+}
+/** Reduce common headless/automation signals sites use for bot checks. */
+function attachStealth(context) {
+    context.addInitScript(() => {
+        try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        }
+        catch {
+            /* ignore */
+        }
+        try {
+            const w = window;
+            if (!w.chrome)
+                w.chrome = { runtime: {} };
+        }
+        catch {
+            /* ignore */
+        }
+    });
+}
+async function launchQaBrowser(launchOptions) {
+    if (preferSystemChrome()) {
+        try {
+            return await playwright_1.chromium.launch({ ...launchOptions, channel: 'chrome' });
+        }
+        catch {
+            // System Chrome missing or broken — fall back to bundled Chromium.
+        }
+    }
+    return playwright_1.chromium.launch(launchOptions);
+}
+/**
+ * Live Comparison shows one page per side. target=_blank / window.open would open an invisible
+ * Playwright tab the user never sees. Rewrite those to same-tab navigation so the link opens
+ * in the live pane (and can be mirrored to PROD).
+ */
+function attachSameTabLinkBehavior(context) {
+    context.addInitScript(() => {
+        const httpUrl = (raw) => {
+            try {
+                if (raw == null || raw === '')
+                    return null;
+                const abs = new URL(String(raw), location.href);
+                if (abs.protocol !== 'http:' && abs.protocol !== 'https:')
+                    return null;
+                return abs.href;
+            }
+            catch {
+                return null;
+            }
+        };
+        const go = (raw) => {
+            const href = httpUrl(raw);
+            if (!href)
+                return false;
+            try {
+                location.assign(href);
+                return true;
+            }
+            catch {
+                try {
+                    location.href = href;
+                    return true;
+                }
+                catch {
+                    return false;
+                }
+            }
+        };
+        const retarget = (root) => {
+            try {
+                (root || document).querySelectorAll('a[target="_blank"], a[target="_new"]').forEach((node) => {
+                    const a = node;
+                    a.setAttribute('target', '_self');
+                    a.setAttribute('data-qa-vision-same-tab', '1');
+                });
+            }
+            catch {
+                /* ignore */
+            }
+        };
+        const boot = () => {
+            retarget(document);
+            try {
+                const mo = new MutationObserver(() => retarget(document));
+                mo.observe(document.documentElement, {
+                    childList: true,
+                    subtree: true,
+                    attributes: true,
+                    attributeFilter: ['target'],
+                });
+            }
+            catch {
+                /* ignore */
+            }
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', boot, { once: true });
+        }
+        else {
+            boot();
+        }
+        // Programmatic popups (absolute or relative http(s)) → this tab
+        try {
+            const originalOpen = window.open.bind(window);
+            window.open = function (url, target, features) {
+                if (go(url ?? null))
+                    return window;
+                // about:blank / blob / empty — keep default (some download helpers need a real window)
+                return originalOpen(url, target, features);
+            };
+        }
+        catch {
+            /* ignore */
+        }
+        // Capture-phase click: any gesture that would open a new tab opens in this pane instead.
+        document.addEventListener('click', (e) => {
+            try {
+                if (e.button !== 0 && e.button !== 1)
+                    return;
+                const a = e.target?.closest?.('a[href]');
+                if (!a)
+                    return;
+                const href = httpUrl(a.href);
+                if (!href)
+                    return;
+                const t = (a.getAttribute('target') || '').toLowerCase();
+                const modifierNewTab = e.ctrlKey || e.metaKey || e.button === 1;
+                const attrNewTab = t === '_blank' || t === '_new';
+                // Already retargeted to _self: only intercept modifier/middle clicks
+                if (!attrNewTab && !modifierNewTab)
+                    return;
+                e.preventDefault();
+                e.stopPropagation();
+                go(href);
+            }
+            catch {
+                /* ignore */
+            }
+        }, true);
+        // Auxclick covers middle-button on some browsers
+        document.addEventListener('auxclick', (e) => {
+            try {
+                if (e.button !== 1)
+                    return;
+                const a = e.target?.closest?.('a[href]');
+                if (!a)
+                    return;
+                const href = httpUrl(a.href);
+                if (!href)
+                    return;
+                e.preventDefault();
+                e.stopPropagation();
+                go(href);
+            }
+            catch {
+                /* ignore */
+            }
+        }, true);
+    });
+}
+async function newQaContext(browser, viewport) {
+    const context = await browser.newContext({
+        viewport: { ...viewport },
+        locale: process.env.QA_VISION_LOCALE || 'en-US',
+        timezoneId: process.env.QA_VISION_TZ || 'America/New_York',
+        colorScheme: 'light',
+        userAgent: desktopChromeUserAgent(browser.version()),
+        // DEV installs a recorder init-script + exposeFunction bridge. Strict CSP / Trusted Types on
+        // targets like appalpha.bruin.com can block that injection and leave the SPA on an endless
+        // spinner while PROD (no recorder) loads data normally. Bypass CSP so page JS still runs.
+        bypassCSP: true,
+        ignoreHTTPSErrors: true,
+        extraHTTPHeaders: {
+            'Accept-Language': process.env.QA_VISION_ACCEPT_LANGUAGE || 'en-US,en;q=0.9',
+        },
+    });
+    attachStealth(context);
+    attachSameTabLinkBehavior(context);
+    return context;
+}
+/**
+ * Keep profile query params (e.g. clientId) after SSO/redirects without a catch-all context.route.
+ *
+ * IMPORTANT: never hard-reload in a loop. Bruin's SPA sometimes writes clientId=0 into the URL; a
+ * page.goto() fight causes endless reloads and a permanently blank main pane. Soft-fix the URL
+ * (and common storage keys) at most a few times per path.
+ */
+function attachBaseQueryGuard(page, baseUrl) {
+    let baseOrigin = '';
+    let baseParams = [];
+    try {
+        const b = new URL(baseUrl);
+        baseOrigin = b.origin;
+        baseParams = [...b.searchParams.entries()];
+    }
+    catch {
+        return;
+    }
+    if (!baseParams.length || !baseOrigin)
+        return;
+    let fixing = false;
+    let lastSoftAt = 0;
+    const softCountByPath = new Map();
+    const maybeFix = async () => {
+        if (fixing || page.isClosed())
+            return;
+        const now = Date.now();
+        if (now - lastSoftAt < 800)
+            return; // debounce SPA thrash
+        let cur;
+        try {
+            cur = page.url();
+        }
+        catch {
+            return;
+        }
+        let u;
+        try {
+            u = new URL(cur);
+        }
+        catch {
+            return;
+        }
+        if (u.origin !== baseOrigin)
+            return;
+        const fixed = mergeBaseQuery(cur, baseUrl);
+        if (fixed === cur)
+            return;
+        const pathKey = u.pathname;
+        const used = softCountByPath.get(pathKey) || 0;
+        if (used >= 3)
+            return; // stop fighting the SPA on this route
+        fixing = true;
+        lastSoftAt = now;
+        softCountByPath.set(pathKey, used + 1);
+        try {
+            await page
+                .evaluate(({ href, params }) => {
+                try {
+                    const next = new URL(href, location.href);
+                    if (next.origin !== location.origin)
+                        return;
+                    const dest = next.pathname + next.search + next.hash;
+                    if (dest !== location.pathname + location.search + location.hash) {
+                        history.replaceState(history.state, '', dest);
+                    }
+                    // Seed storage keys SPAs often read for tenant context
+                    for (const [k, v] of params) {
+                        try {
+                            sessionStorage.setItem(k, v);
+                            sessionStorage.setItem(k.toLowerCase(), v);
+                            if (/clientid/i.test(k)) {
+                                sessionStorage.setItem('clientId', v);
+                                sessionStorage.setItem('selectedClientId', v);
+                                localStorage.setItem('clientId', v);
+                                localStorage.setItem('selectedClientId', v);
+                            }
+                        }
+                        catch {
+                            /* private mode */
+                        }
+                    }
+                }
+                catch {
+                    /* ignore */
+                }
+            }, { href: fixed, params: baseParams })
+                .catch(() => { });
+        }
+        finally {
+            fixing = false;
+        }
+    };
+    page.on('framenavigated', (frame) => {
+        if (frame === page.mainFrame())
+            void maybeFix();
+    });
+    page.on('load', () => {
+        void maybeFix();
+    });
+}
+/** Long-lived / streaming responses: never call response.body() on these (hangs the collector). */
+const SKIP_BODY_URL_RE = /longpoll|long-poll|\/stream\b|event-source|server-sent|\/sse\b|\/ws\b|websocket|notify\/wait|mercure/i;
+function shouldReadJsonBody(url, contentType, contentLengthHeader) {
+    if (!/json/i.test(contentType))
+        return false;
+    if (SKIP_BODY_URL_RE.test(url))
+        return false;
+    if (contentLengthHeader == null || contentLengthHeader === '')
+        return false; // chunked / unknown: skip
+    const len = Number(contentLengthHeader);
+    return Number.isFinite(len) && len > 0 && len <= 256 * 1024;
+}
+/**
  * Validate a target URL before a browser is pointed at it.
  * Optional org allowlist: QA_VISION_ALLOWED_HOSTS="example.com,localhost" (suffix match).
  */
@@ -112,7 +418,63 @@ function validateTargetUrl(raw) {
     }
     return { ok: true, url: u.toString() };
 }
-/** Map a DEV URL onto the PROD base (same relative path/query/hash). Null if outside the DEV base. */
+/** Auth/callback paths on the app origin (SSO return) — still map even when outside the profile path prefix. */
+const APP_AUTH_PATH_RE = /\/(signin|sign-in|login|log-in|auth|oauth|callback|sso|kinde|saml)([-_/]|$)/i;
+/** Query values that mean "unset" — Bruin sets clientId=0 when the SPA drops the real client. */
+const EMPTY_QUERY_VALUE_RE = /^(0|null|undefined|)$/i;
+function queryValueMissing(current) {
+    return current == null || EMPTY_QUERY_VALUE_RE.test(String(current).trim());
+}
+/**
+ * Merge profile query params into the current URL (e.g. keep clientId=86937).
+ * Fills missing keys and replaces empty/0/null placeholders so dashboards do not load blank.
+ */
+function mergeBaseQuery(href, ...bases) {
+    try {
+        const u = new URL(href);
+        let changed = false;
+        for (const base of bases) {
+            if (!base)
+                continue;
+            let b;
+            try {
+                b = new URL(base);
+            }
+            catch {
+                continue;
+            }
+            if (b.origin !== u.origin)
+                continue;
+            for (const [k, v] of b.searchParams) {
+                if (queryValueMissing(u.searchParams.get(k))) {
+                    u.searchParams.set(k, v);
+                    changed = true;
+                }
+            }
+        }
+        return changed ? u.toString() : href;
+    }
+    catch {
+        return href;
+    }
+}
+function searchWithBaseDefaults(current, ...bases) {
+    const out = new URLSearchParams(current);
+    for (const b of bases) {
+        for (const [k, v] of b.searchParams) {
+            if (queryValueMissing(out.get(k)))
+                out.set(k, v);
+        }
+    }
+    const s = out.toString();
+    return s ? `?${s}` : '';
+}
+/**
+ * Map a DEV URL onto the PROD base (same relative path/query/hash). Null if outside the DEV base.
+ * Profile query params (e.g. clientId) are carried over when missing or placeholder (0/null).
+ * When DEV/PROD bases share the same path on different hosts (Bruin appalpha vs app), any same-origin
+ * app path maps 1:1 so SPA routes like /piab-dashboard still replicate.
+ */
 function mapDevUrlToProd(devHref, devBase, prodBase) {
     try {
         const d = new URL(devHref);
@@ -121,15 +483,102 @@ function mapDevUrlToProd(devHref, devBase, prodBase) {
         if (d.origin !== db.origin)
             return null;
         const devPrefix = db.pathname.replace(/\/+$/, '');
-        if (devPrefix && d.pathname !== devPrefix && !d.pathname.startsWith(devPrefix + '/'))
-            return null;
-        const rest = d.pathname.slice(devPrefix.length);
         const prodPrefix = pb.pathname.replace(/\/+$/, '');
-        return `${pb.origin}${prodPrefix}${rest || '/'}${d.search}${d.hash}`;
+        const underPrefix = !devPrefix || d.pathname === devPrefix || d.pathname.startsWith(devPrefix + '/');
+        // Same path on different hosts (e.g. both .../sdwan-dashboard): treat the whole origin as the app.
+        const sameAppPath = devPrefix === prodPrefix;
+        if (!underPrefix && !sameAppPath) {
+            if (!APP_AUTH_PATH_RE.test(d.pathname))
+                return null;
+            return `${pb.origin}${d.pathname}${searchWithBaseDefaults(d.searchParams, db, pb)}${d.hash}`;
+        }
+        let path;
+        if (sameAppPath || !devPrefix) {
+            path = d.pathname || '/';
+        }
+        else {
+            const rest = d.pathname.slice(devPrefix.length);
+            path = `${prodPrefix}${rest}` || '/';
+        }
+        return `${pb.origin}${path}${searchWithBaseDefaults(d.searchParams, db, pb)}${d.hash}`;
     }
     catch {
         return null;
     }
+}
+/**
+ * True when DEV is outside its base URL but PROD is on the very same origin, e.g. both apps redirected to a shared
+ * SSO/login host. The two pages are then already equivalent: PROD needs no navigation, and replayed clicks/fills
+ * drive it through the flow (its URLs may differ by per-session tokens, so DEV's URL is never copied over).
+ */
+function onSharedOutsideHost(devHref, prodHref, devBase, prodBase) {
+    try {
+        const d = new URL(devHref);
+        const p = new URL(prodHref);
+        if (!/^https?:$/.test(d.protocol) || d.origin !== p.origin)
+            return false;
+        return mapDevUrlToProd(devHref, devBase, prodBase) === null && d.origin !== new URL(prodBase).origin;
+    }
+    catch {
+        return false;
+    }
+}
+let pixelWorker = null;
+let pixelWorkerBroken = false;
+let pixelJobSeq = 0;
+const pixelJobs = new Map();
+function getPixelWorker() {
+    if (pixelWorker || pixelWorkerBroken || process.env.QA_VISION_PIXEL_WORKER === '0')
+        return pixelWorker;
+    const file = path.join(process.cwd(), 'engine-dist', 'engine', 'pixel-worker.js');
+    if (!fs.existsSync(file)) {
+        pixelWorkerBroken = true;
+        return null;
+    }
+    try {
+        const w = new worker_threads_1.Worker(file);
+        w.unref(); // never keeps the process alive on its own
+        w.on('message', (msg) => {
+            const job = pixelJobs.get(msg.id);
+            if (!job)
+                return;
+            pixelJobs.delete(msg.id);
+            if (msg.error || !msg.result)
+                return job.reject(new Error(msg.error || 'pixel worker returned nothing'));
+            const o = msg.result.overlayPng;
+            job.resolve({ ...msg.result, overlayPng: o ? Buffer.from(o.buffer, o.byteOffset, o.byteLength) : undefined });
+        });
+        const fail = (err) => {
+            if (pixelWorker === w)
+                pixelWorker = null;
+            for (const job of pixelJobs.values())
+                job.reject(err);
+            pixelJobs.clear();
+        };
+        w.on('error', (err) => fail(err));
+        w.on('exit', (code) => fail(new Error(`pixel worker exited (${code})`)));
+        pixelWorker = w;
+    }
+    catch {
+        pixelWorkerBroken = true;
+    }
+    return pixelWorker;
+}
+async function diffPixelsOffThread(buf1, buf2, threshold) {
+    const w = getPixelWorker();
+    if (w) {
+        try {
+            return await new Promise((resolve, reject) => {
+                const id = ++pixelJobSeq;
+                pixelJobs.set(id, { resolve, reject });
+                w.postMessage({ id, a: buf1, b: buf2, threshold });
+            });
+        }
+        catch {
+            /* worker died or failed on this job: do it here instead */
+        }
+    }
+    return (0, pixel_diff_1.diffPixels)(buf1, buf2, threshold);
 }
 /** Strip query/hash (may carry tokens) for logging. */
 function urlForLog(href) {
@@ -140,6 +589,45 @@ function urlForLog(href) {
     catch {
         return '(invalid url)';
     }
+}
+/** Query/fragment parameters whose values are credentials: masked even in the Live view's address bar. */
+const SECRET_URL_PARAM_RE = /token(?!_type)|passw|secret|^code$|signature|^sig$|assertion|samlresponse|api[-_]?key|^auth$|^session/i;
+/**
+ * The full URL for the Live view's address bar: query and fragment included (client_id, redirect_uri, state, scope
+ * and so on stay readable), with only credential values masked. Logs, reports and evidence keep urlForLog.
+ */
+function urlForAddressBar(href) {
+    let u;
+    try {
+        u = new URL(href);
+    }
+    catch {
+        return '(invalid url)';
+    }
+    if (!/^https?:$/.test(u.protocol))
+        return href;
+    const mask = (params) => {
+        let changed = false;
+        for (const key of new Set(params.keys())) {
+            if (SECRET_URL_PARAM_RE.test(key)) {
+                params.set(key, '***');
+                changed = true;
+            }
+        }
+        return changed;
+    };
+    u.username = '';
+    u.password = '';
+    if (mask(u.searchParams))
+        u.search = u.searchParams.toString();
+    // OAuth implicit flows put tokens in the fragment (#access_token=...): mask those too when it is key=value shaped
+    const frag = u.hash.slice(1);
+    if (frag.includes('=')) {
+        const fp = new URLSearchParams(frag);
+        if (mask(fp))
+            u.hash = fp.toString();
+    }
+    return u.toString();
 }
 function redactValue(message, action) {
     let msg = String(message || '');
@@ -194,7 +682,44 @@ function compileIgnoreRules(rules) {
     };
 }
 /** Max time for structural extraction plus diffs on one step. */
-const comparisonBudgetMs = () => Number(process.env.QA_VISION_COMPARE_BUDGET_MS) || 15000;
+/**
+ * Compare depth:
+ * - standard (default): text + fonts + field values + images + visual pixels (what Live Comparison needs)
+ * - full: also a11y/layout/network/console (QA_VISION_FULL_COMPARE=1 or QA_VISION_COMPARE_MODE=full)
+ * - fast: text + visual only (QA_VISION_COMPARE_MODE=fast)
+ */
+function compareMode() {
+    const raw = String(process.env.QA_VISION_COMPARE_MODE || '').toLowerCase().trim();
+    if (raw === 'fast' || raw === 'off')
+        return 'fast';
+    if (raw === 'full' || process.env.QA_VISION_FULL_COMPARE === '1')
+        return 'full';
+    return 'standard';
+}
+const fullCompareEnabled = () => compareMode() === 'full';
+const standardCompareEnabled = () => compareMode() !== 'fast';
+/** Font-focused CSS props for standard live compare (fast enough for every step). */
+const LIVE_FONT_STYLE_PROPS = [
+    'font-family',
+    'font-size',
+    'font-weight',
+    'font-style',
+    'color',
+    'text-decoration-line',
+    'line-height',
+];
+const comparisonBudgetMs = () => {
+    const n = Number(process.env.QA_VISION_COMPARE_BUDGET_MS);
+    if (Number.isFinite(n) && n >= 500)
+        return n;
+    const mode = compareMode();
+    return mode === 'full' ? 8000 : mode === 'standard' ? 5000 : 2500;
+};
+/** Max Live-view frames per second per pane (QA_VISION_LIVE_FPS, 1-30, default 5). */
+function liveCastMinIntervalMs() {
+    const fps = Number(process.env.QA_VISION_LIVE_FPS);
+    return Math.round(1000 / (Number.isFinite(fps) && fps >= 1 && fps <= 30 ? fps : 5));
+}
 function getEngineGlobals() {
     const g = globalThis;
     if (!g.__qaVisionEngine) {
@@ -285,29 +810,63 @@ class QAComparisonEngine {
         // Look logs up at event time: consumers may replace the arrays.
         const net = { push: (e) => (0, runtime_diff_1.pushCapped)(session.netLog[side], e) };
         const rt = { push: (e) => (0, runtime_diff_1.pushCapped)(session.runtimeLog[side], e) };
+        const label = side === 'dev' ? 'DEV' : 'PROD';
+        // Dedupe noisy block logs (same path failing repeatedly must not flood the timeline).
+        const recentBlockKeys = new Map();
+        const noteBlock = (text) => {
+            const key = text.slice(0, 160);
+            const now = Date.now();
+            const prev = recentBlockKeys.get(key) || 0;
+            if (now - prev < 8000)
+                return;
+            recentBlockKeys.set(key, now);
+            if (recentBlockKeys.size > 40) {
+                for (const [k, t] of recentBlockKeys)
+                    if (now - t > 60000)
+                        recentBlockKeys.delete(k);
+            }
+            this.log(session.id, `${label} blocked/failed request: ${text}`, side === 'dev' ? 'Error' : 'n/a', side === 'prod' ? 'Error' : 'n/a');
+        };
         page.on('response', async (res) => {
             try {
                 const req = res.request();
                 const headers = res.headers();
                 const contentType = headers['content-type'] || '';
+                const status = res.status();
+                const url = res.url();
+                const method = req.method();
                 let json;
-                if (/json/i.test(contentType)) {
-                    const len = Number(headers['content-length'] || 0);
-                    if (!len || len <= 256 * 1024) {
-                        try {
-                            const body = await res.body();
-                            if (body.length <= 256 * 1024)
-                                json = JSON.parse(body.toString('utf8'));
-                        }
-                        catch {
-                            /* schema stays null */
-                        }
+                // Only sample small, finite JSON bodies. Long-poll / chunked / large bodies used to hang
+                // await res.body() and could stall DEV (where SPA data APIs + longpolling run after login).
+                if (shouldReadJsonBody(url, contentType, headers['content-length'])) {
+                    try {
+                        const body = await Promise.race([
+                            res.body(),
+                            new Promise((r) => setTimeout(() => r(null), 1500)),
+                        ]);
+                        if (body && body.length <= 256 * 1024)
+                            json = JSON.parse(body.toString('utf8'));
+                    }
+                    catch {
+                        /* schema stays null */
                     }
                 }
                 net.push((0, runtime_diff_1.toNetworkEntry)({
-                    method: req.method(), url: res.url(), status: res.status(),
+                    method, url, status,
                     resourceType: req.resourceType(), contentType, json,
                 }));
+                // Surface auth / gateway blocks in the session log so a blank DEV pane is explainable.
+                if (status === 401 || status === 403 || status === 407 || status === 429) {
+                    const path = (() => {
+                        try {
+                            return new URL(url).pathname;
+                        }
+                        catch {
+                            return url.slice(0, 80);
+                        }
+                    })();
+                    noteBlock(`${method} ${status} ${path}`);
+                }
             }
             catch {
                 /* ignore */
@@ -320,6 +879,11 @@ class QAComparisonEngine {
                     method: req.method(), url: req.url(), status: null,
                     resourceType: req.resourceType(), failure,
                 }));
+                // Safety-policy aborts on PROD are intentional; still record them. Real client blocks on DEV
+                // (Akamai, extension, CSP) must show up so "data not loading" is diagnosable.
+                if (failure.includes('ERR_BLOCKED') || failure.includes('ERR_ACCESS') || failure.includes('ERR_FAILED')) {
+                    noteBlock(`${req.method()} ${urlForLog(req.url())} ${failure}`);
+                }
                 if (failure !== 'net::ERR_BLOCKED_BY_CLIENT') {
                     rt.push({ kind: 'request-failed', text: (0, runtime_diff_1.toRuntimeText)(`${req.method()} ${req.url()} ${failure}`) });
                 }
@@ -374,22 +938,44 @@ class QAComparisonEngine {
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                // Back/Forward must really load the page: a back/forward-cache restore fires no load event (goBack then
+                // stalls until its timeout, and the move is never mirrored to PROD), and both sides should behave alike
+                '--disable-back-forward-cache',
                 `--window-size=${capture.viewport.width},${capture.viewport.height + 100}`,
             ],
             timeout: 60000,
         };
-        const devBrowser = await playwright_1.chromium.launch(launchOptions);
-        const prodBrowser = await playwright_1.chromium.launch(launchOptions);
-        const devContext = await devBrowser.newContext({
-            viewport: { ...capture.viewport },
-            userAgent: 'QA-Vision-DEV',
-        });
-        const prodContext = await prodBrowser.newContext({
-            viewport: { ...capture.viewport },
-            userAgent: 'QA-Vision-PROD',
-        });
-        const devPage = await devContext.newPage();
-        const prodPage = await prodContext.newPage();
+        // System Chrome + normal desktop UA: sites behind Akamai (e.g. app.bruin.com) deny
+        // the old "QA-Vision-DEV/PROD" user agents and bare automation fingerprints.
+        // DEV and PROD start in parallel: launch time is one browser start, not two
+        const openSide = async () => {
+            const browser = await launchQaBrowser(launchOptions);
+            try {
+                const context = await newQaContext(browser, capture.viewport);
+                return { browser, context, page: await context.newPage() };
+            }
+            catch (e) {
+                await browser.close().catch(() => { });
+                throw e;
+            }
+        };
+        const [devSide, prodSide] = await Promise.allSettled([openSide(), openSide()]);
+        if (devSide.status === 'rejected' || prodSide.status === 'rejected') {
+            // Never leave the other browser running
+            for (const r of [devSide, prodSide])
+                if (r.status === 'fulfilled')
+                    await r.value.browser.close().catch(() => { });
+            throw (devSide.status === 'rejected' ? devSide.reason : prodSide.reason);
+        }
+        const { browser: devBrowser, context: devContext, page: devPage } = devSide.value;
+        const { browser: prodBrowser, context: prodContext, page: prodPage } = prodSide.value;
+        // Preserve clientId etc. without a catch-all context.route (that broke SignalR/XHR on appalpha).
+        attachBaseQueryGuard(devPage, devUrl);
+        attachBaseQueryGuard(prodPage, prodUrl);
+        // Safety net: if a popup still opens, fold it into the main live pane (never leave an invisible tab).
+        this.attachPopupToMainPane(sessionId, 'dev', devContext);
+        this.attachPopupToMainPane(sessionId, 'prod', prodContext);
         // Headless browsers show no dialogs: an unhandled alert() would look like "nothing happened". Report each one
         // in the log and on the dashboard, then answer it: alert/beforeunload are accepted, confirm/prompt dismissed
         // (the safe answer: nothing is approved on the user's behalf).
@@ -615,6 +1201,9 @@ class QAComparisonEngine {
         const session = this.sessions.get(sessionId);
         if (!session)
             return;
+        // full = no blocking: skip the catch-all route so PROD XHR/SignalR/WebSocket are never proxied
+        if (session.safetyPolicy === 'full')
+            return;
         await session.prodContext.route('**/*', async (route) => {
             const req = route.request();
             const method = req.method().toUpperCase();
@@ -771,6 +1360,11 @@ class QAComparisonEngine {
       href: tag === 'a' ? (el.getAttribute('href') || '') : '',
       isSubmit: isSubmit,
       isSensitive: type === 'password' || ${extract_1.SENSITIVE_FIELD_RE.toString()}.test(sensitiveHay),
+      // One-time codes (2-step verification, SMS/authenticator codes) are single-use: never replayed on PROD
+      isOneTimeCode: (tag === 'input' || tag === 'textarea') && (
+        (el.getAttribute('autocomplete') || '').toLowerCase() === 'one-time-code' ||
+        ${extract_1.ONE_TIME_CODE_RE.toString()}.test([sensitiveHay, el.getAttribute('aria-label'), el.getAttribute('placeholder'), labelFor(el)].join(' '))
+      ),
       text: tag === 'input' || tag === 'textarea' || tag === 'select'
         ? ''
         : (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').substring(0, 60),
@@ -976,11 +1570,54 @@ class QAComparisonEngine {
     }
   }, true);
 
-  window.addEventListener('popstate', () => {
-    emit({ type: 'navigate', url: window.location.href });
-  });
+  let lastNavHref = location.href;
+  function emitNavigate() {
+    try {
+      const href = window.location.href;
+      if (href === lastNavHref) return;
+      lastNavHref = href;
+      emit({ type: 'navigate', url: href });
+    } catch (_) {}
+  }
 
-  console.log('[QA Vision] Recorder active on this page');
+  window.addEventListener('popstate', emitNavigate);
+
+  // Scroll: debounced so wheel bursts become one PROD step. Live-view wheel is also mirrored server-side.
+  let scrollTimer = null;
+  let lastScrollKey = '';
+  window.addEventListener(
+    'scroll',
+    () => {
+      if (scrollTimer) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(() => {
+        scrollTimer = null;
+        try {
+          const x = window.scrollX || document.documentElement.scrollLeft || 0;
+          const y = window.scrollY || document.documentElement.scrollTop || 0;
+          const key = Math.round(x) + '|' + Math.round(y);
+          if (key === lastScrollKey) return;
+          lastScrollKey = key;
+          emit({ type: 'scroll', x: Math.round(x), y: Math.round(y), isMutation: false });
+        } catch (_) {}
+      }, 120);
+    },
+    { passive: true, capture: true }
+  );
+
+  // React/Vue SPAs use pushState/replaceState — without these hooks PROD never follows in-app route changes.
+  try {
+    const wrap = (fn) =>
+      function () {
+        const ret = fn.apply(this, arguments);
+        emitNavigate();
+        return ret;
+      };
+    if (!window.__qaVisionHistoryHooked) {
+      window.__qaVisionHistoryHooked = true;
+      history.pushState = wrap(history.pushState.bind(history));
+      history.replaceState = wrap(history.replaceState.bind(history));
+    }
+  } catch (_) {}
 })();
 `;
     }
@@ -1079,16 +1716,24 @@ class QAComparisonEngine {
         if (!drained)
             this.log(sessionId, 'Resync: in-flight replay did not finish within 15s; continuing', 'Info', 'Info');
         const devHref = session.devPage.url();
+        const prodHref = session.prodPage.url();
         const target = mapDevUrlToProd(devHref, session.devUrl, session.prodUrl);
-        if (!target) {
-            const message = `DEV is at ${urlForLog(devHref)}, outside its base URL — PROD cannot be aligned. Navigate DEV back inside ${urlForLog(session.devUrl)}.`;
+        // Both apps on the same outside host (shared SSO/login page): already aligned, PROD stays where it is
+        const shared = !target && onSharedOutsideHost(devHref, prodHref, session.devUrl, session.prodUrl);
+        if (!target && !shared) {
+            const message = `DEV is at ${urlForLog(devHref)}, outside its base URL, and PROD is at ${urlForLog(prodHref)} — PROD cannot be aligned. ` +
+                `Navigate DEV back inside ${urlForLog(session.devUrl)}, or use the PROD pane to bring PROD to the matching page.`;
             this.log(sessionId, `Resync failed: ${message}`, 'Executed', 'Error');
             return { ok: false, message };
         }
         try {
-            await session.prodPage.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            if (target)
+                await session.prodPage.goto(target, { waitUntil: 'domcontentloaded', timeout: 30000 });
             const recorderOk = await this.injectRecorderScript(session.devPage);
-            this.log(sessionId, `Resynchronized: PROD navigated to ${urlForLog(target)} (DEV at ${urlForLog(devHref)}); recorder ${recorderOk ? 'active' : 'NOT active'}`, 'Synced', recorderOk ? 'Synced' : 'Error');
+            const where = target
+                ? `PROD navigated to ${urlForLog(target)}`
+                : `PROD already on the shared host ${new URL(devHref).origin} (left in place)`;
+            this.log(sessionId, `Resynchronized: ${where} (DEV at ${urlForLog(devHref)}); recorder ${recorderOk ? 'active' : 'NOT active'}`, 'Synced', recorderOk ? 'Synced' : 'Error');
             this.setSyncState(sessionId, false, 'resynchronized');
             session.uncomparedSteps.push(stepLabel);
             await this.enqueueTask(sessionId, async () => {
@@ -1098,10 +1743,12 @@ class QAComparisonEngine {
             return {
                 ok: recorderOk,
                 message: recorderOk
-                    ? `PROD aligned to ${urlForLog(target)}. Page state such as typed values or open dialogs is not copied.`
+                    ? target
+                        ? `PROD aligned to ${urlForLog(target)}. Page state such as typed values or open dialogs is not copied.`
+                        : `DEV and PROD are both on ${new URL(devHref).origin}; PROD left in place and DEV actions now replicate to it.`
                     : 'PROD aligned, but the DEV recorder could not be re-armed. Reload the DEV window.',
                 devUrl: urlForLog(devHref),
-                prodUrl: urlForLog(target),
+                prodUrl: urlForLog(target ?? prodHref),
             };
         }
         catch (err) {
@@ -1132,6 +1779,7 @@ class QAComparisonEngine {
         // The phase stays 'ready' (recorder events dropped) until PROD is aligned; `starting` rejects pause/start meanwhile
         session.starting = true;
         try {
+            await this.drainProdLiveInput(session);
             await this.runDataChecks(sessionId);
             const r = await this.performResync(sessionId, 'initial');
             if (!r.ok)
@@ -1175,6 +1823,7 @@ class QAComparisonEngine {
             return bad(`Cannot resume a session that is ${session.phase}`);
         session.starting = true; // also blocks a second resume / a pause while resyncing
         try {
+            await this.drainProdLiveInput(session);
             const r = await this.performResync(sessionId, 'resume');
             if (!r.ok)
                 return { ok: false, status: 'failed', phase: session.phase, message: r.message };
@@ -1191,7 +1840,53 @@ class QAComparisonEngine {
             session.starting = false;
         }
     }
+    /**
+     * Let direct PROD input that is already being applied finish (bounded) before Start/Resume aligns PROD.
+     * Input still queued is skipped by handleLiveInput, since `starting` is set by then.
+     */
+    async drainProdLiveInput(session) {
+        if (!session.prodLiveInputQueue)
+            return;
+        await Promise.race([session.prodLiveInputQueue, new Promise((r) => setTimeout(r, 5000))]);
+    }
     /** Replay one DEV action on PROD. Returns true when the DEV action happened (so a comparison is due). */
+    /**
+     * After a click that SPA-navigates DEV, bring PROD to the mapped route (and restore clientId).
+     * Without this, PROD stays on the old page and later clicks time out or hit the wrong screen.
+     */
+    async alignProdToDevRoute(sessionId, stepId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || session.phase !== 'running')
+            return;
+        await new Promise((r) => setTimeout(r, 150));
+        let devHref = '';
+        let prodHref = '';
+        try {
+            devHref = session.devPage.url();
+            prodHref = session.prodPage.url();
+        }
+        catch {
+            return;
+        }
+        const target = mapDevUrlToProd(devHref, session.devUrl, session.prodUrl);
+        if (!target)
+            return;
+        try {
+            const want = new URL(target);
+            const have = new URL(prodHref);
+            const pathDiff = want.pathname.replace(/\/+$/, '') !== have.pathname.replace(/\/+$/, '');
+            // Only hard-navigate PROD when the path changed. Query-only (clientId) fixes are soft.
+            if (!pathDiff)
+                return;
+            if (want.pathname.replace(/\/+$/, '') === have.pathname.replace(/\/+$/, ''))
+                return;
+            await session.prodPage.goto(target, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            this.log(sessionId, `[${stepId}] PROD aligned to ${urlForLog(target)} after DEV route change`, 'Success', 'Success');
+        }
+        catch (err) {
+            this.log(sessionId, `[${stepId}] PROD route align failed: ${String(err?.message || err).split('\n')[0]}`, 'Info', 'Error');
+        }
+    }
     async replicateAction(sessionId, action, stepId = "manual") {
         const session = this.sessions.get(sessionId);
         if (!session || !session.isRunning || session.phase !== 'running')
@@ -1200,6 +1895,17 @@ class QAComparisonEngine {
         const label = action.testId || action.ariaLabel || action.labelText || action.text || action.name || action.selector || action.type;
         // Checkbox/radio "change" events arrive as fill; the click event already replicates them.
         if ((action.type === 'fill' || action.type === 'input') && /^(checkbox|radio)$/.test(action.inputType || '')) {
+            return false;
+        }
+        // A one-time code (2-step verification) is single-use: DEV has just used it, so replaying it on PROD is
+        // rejected by the identity provider (and can flag the account). Pause instead, so the PROD pane unlocks and
+        // the user signs PROD in with its own fresh code; Start again then resumes mirroring.
+        if ((action.type === 'fill' || action.type === 'input') && action.isOneTimeCode) {
+            this.setPhase(session, 'paused');
+            const notice = `⏸ Paused for 2-step verification: DEV entered a one-time code, which cannot be reused on PROD. ` +
+                `Enter PROD's own code in the PROD pane and finish signing in there, then press Start again.`;
+            this.log(sessionId, `[${stepId}] One-time code not replayed on PROD (single-use) — session paused`, 'Captured', 'Skipped');
+            this.io?.emit('status', { sessionId, phase: 'paused', message: 'paused', notice });
             return false;
         }
         try {
@@ -1233,8 +1939,9 @@ class QAComparisonEngine {
                         return this.recordReplayFailure(sessionId, action, label, stepId, 'REPLAY_FAILURE', `PROD element "${label}" (matched by ${target.strategy}) is disabled; it was enabled on DEV`);
                     }
                     await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => { });
-                    await target.locator.click({ timeout: 5000 }); // no force: respect PROD actionability
+                    await target.locator.click({ timeout: 8000 }); // no force: respect PROD actionability
                     this.log(sessionId, `Clicked ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+                    await this.alignProdToDevRoute(sessionId, stepId);
                     break;
                 }
                 case 'dblclick': {
@@ -1242,8 +1949,9 @@ class QAComparisonEngine {
                     if (!target.ok)
                         return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
                     await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => { });
-                    await target.locator.dblclick({ timeout: 5000 });
+                    await target.locator.dblclick({ timeout: 8000 });
                     this.log(sessionId, `Double-clicked ${label} (matched by ${target.strategy})`, 'Success', 'Success');
+                    await this.alignProdToDevRoute(sessionId, stepId);
                     break;
                 }
                 case 'hover': {
@@ -1251,7 +1959,7 @@ class QAComparisonEngine {
                     if (!target.ok)
                         return this.recordReplayFailure(sessionId, action, label, stepId, target.classification, target.detail);
                     await target.locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => { });
-                    await target.locator.hover({ timeout: 5000 });
+                    await target.locator.hover({ timeout: 8000 });
                     this.log(sessionId, `Hovered ${label} (matched by ${target.strategy})`, 'Success', 'Success');
                     break;
                 }
@@ -1297,6 +2005,26 @@ class QAComparisonEngine {
                         break;
                     const prodUrl = mapDevUrlToProd(action.url, session.devUrl, session.prodUrl);
                     if (!prodUrl) {
+                        // Shared outside host (SSO/login): PROD gets there itself through the replayed clicks/submits, so give
+                        // its own redirect a moment to land rather than copying DEV's (token-bearing) URL over.
+                        const devOrigin = (() => {
+                            try {
+                                return new URL(action.url).origin;
+                            }
+                            catch {
+                                return '';
+                            }
+                        })();
+                        const sameHost = () => onSharedOutsideHost(action.url, prodPage.url(), session.devUrl, session.prodUrl);
+                        if (devOrigin && !sameHost()) {
+                            await prodPage
+                                .waitForURL((u) => u.origin === devOrigin, { timeout: 5000, waitUntil: 'commit' })
+                                .catch(() => { });
+                        }
+                        if (sameHost()) {
+                            this.log(sessionId, `DEV moved to ${urlForLog(action.url)} on the shared host; PROD is on the same host (followed)`, 'Success', 'Success');
+                            break;
+                        }
                         this.log(sessionId, `Navigation not replayed: ${urlForLog(action.url)} is outside the DEV base URL`, 'Executed', 'Skipped');
                         this.recordMismatch(sessionId, {
                             component: urlForLog(action.url),
@@ -1316,7 +2044,25 @@ class QAComparisonEngine {
                     break;
                 }
                 case 'scroll': {
-                    await prodPage.evaluate((y) => window.scrollTo(0, y || 0), action.y || 0);
+                    // Prefer wheel deltas (nested SPA scrollers). Fall back to window scroll position.
+                    const dx = Number(action.deltaX) || 0;
+                    const dy = Number(action.deltaY) || 0;
+                    if (dx || dy) {
+                        const { width: vw, height: vh } = session.capture.viewport;
+                        const mx = Number.isFinite(Number(action.x)) ? Math.min(Math.max(Number(action.x), 0), vw - 1) : Math.floor(vw / 2);
+                        const my = Number.isFinite(Number(action.y)) ? Math.min(Math.max(Number(action.y), 0), vh - 1) : Math.floor(vh / 2);
+                        await this.applyWheelAt(prodPage, mx, my, Math.max(-3000, Math.min(3000, dx)), Math.max(-3000, Math.min(3000, dy)));
+                    }
+                    else {
+                        const y = Number(action.y) || 0;
+                        const x = Number(action.x) || 0;
+                        await prodPage.evaluate(({ sx, sy }) => {
+                            window.scrollTo(sx, sy);
+                            const se = document.scrollingElement || document.documentElement;
+                            if (se && se !== document.body)
+                                se.scrollTo(sx, sy);
+                        }, { sx: x, sy: y });
+                    }
                     this.log(sessionId, `Scrolled`, 'Success', 'Success');
                     break;
                 }
@@ -1449,8 +2195,12 @@ class QAComparisonEngine {
     /** Extract structured, human-readable text/content from a page for exact diffs */
     async extractPageContent(page) {
         return page.evaluate((sensitiveSource) => {
-            const results = [];
+            const texts = [];
+            const fonts = [];
+            const values = [];
+            const images = [];
             const seen = new Set();
+            const seenFont = new Set();
             const sensitiveRe = new RegExp(sensitiveSource, 'i');
             /** Never read the value of password / secret-looking fields into evidence. */
             const fieldText = (el) => {
@@ -1475,14 +2225,13 @@ class QAComparisonEngine {
                 const t = clean(text);
                 if (!t || t.length < 1)
                     return;
-                // Skip pure whitespace / tiny noise
                 if (t.length === 1 && !/[0-9a-zA-Z]/.test(t))
                     return;
                 const key = `${testId || label}|${t}`.toLowerCase();
                 if (seen.has(key))
                     return;
                 seen.add(key);
-                results.push({
+                texts.push({
                     key: testId || label || tag,
                     label: label || tag,
                     text: t.slice(0, 500),
@@ -1490,46 +2239,29 @@ class QAComparisonEngine {
                     testId: testId || '',
                 });
             };
-            // Prefer stable test ids
             document.querySelectorAll('[data-testid]').forEach((el) => {
                 const testId = el.getAttribute('data-testid') || '';
                 push(testId, fieldText(el), el.tagName.toLowerCase(), testId);
             });
-            // Headings, buttons, labels, banners, stats
             const selectors = [
-                'h1',
-                'h2',
-                'h3',
-                'button',
-                'a',
-                'label',
-                '[role="button"]',
-                'input',
-                'textarea',
-                'select',
-                'p',
-                '.dev-banner',
-                '.prod-banner',
-                '[class*="banner"]',
+                'h1', 'h2', 'h3', 'h4', 'button', 'a', 'label', '[role="button"]',
+                'input', 'textarea', 'select', 'p', 'th', 'td', 'li',
+                '.dev-banner', '.prod-banner', '[class*="banner"]',
             ];
             document.querySelectorAll(selectors.join(',')).forEach((el, index) => {
                 const tag = el.tagName.toLowerCase();
                 const testId = el.getAttribute('data-testid') || '';
                 if (testId)
-                    return; // already captured
-                let text = '';
-                if (tag === 'input' || tag === 'textarea') {
+                    return;
+                if (tag === 'input' || tag === 'textarea' || tag === 'select') {
                     const input = el;
-                    text = fieldText(el) || input.name || input.type || '';
-                    push(input.name || input.type || `input-${index}`, text, tag, '');
+                    push(input.name || input.id || input.type || `input-${index}`, fieldText(el) || input.name || input.type || '', tag, '');
                 }
                 else {
-                    text = el.textContent || '';
-                    const label = clean(text).slice(0, 40) || `${tag}-${index}`;
-                    push(label, text, tag, '');
+                    const text = el.textContent || '';
+                    push(clean(text).slice(0, 40) || `${tag}-${index}`, text, tag, '');
                 }
             });
-            // Notable metric-like numbers near labels
             document.querySelectorAll('div, span').forEach((el) => {
                 const t = clean(el.textContent || '');
                 if (!t || t.length > 40)
@@ -1538,10 +2270,104 @@ class QAComparisonEngine {
                     push(t.slice(0, 30), t, el.tagName.toLowerCase(), '');
                 }
             });
-            return results.slice(0, 200);
+            // Field values (explicit Value category)
+            document.querySelectorAll('input, textarea, select').forEach((el, i) => {
+                const input = el;
+                const hay = [input.name, input.id, input.getAttribute('autocomplete')].join(' ');
+                const type = (input.type || tagOf(el) || '').toLowerCase();
+                const name = input.name || input.id || input.getAttribute('data-testid') || `field-${i}`;
+                let value = '';
+                if (type === 'password' || sensitiveRe.test(hay))
+                    value = input.value ? '[redacted]' : '';
+                else if (type === 'checkbox' || type === 'radio')
+                    value = input.checked ? 'checked' : 'unchecked';
+                else
+                    value = (input.value || '').slice(0, 200);
+                values.push({ key: String(name).slice(0, 80), name: String(name).slice(0, 80), value, inputType: type || 'text' });
+            });
+            function tagOf(el) {
+                return el.tagName.toLowerCase();
+            }
+            // Fonts on visible headings, buttons, labels, and main text
+            const fontSel = 'h1,h2,h3,h4,button,a,label,p,span,th,td,li,[role="button"],[data-testid]';
+            document.querySelectorAll(fontSel).forEach((el, i) => {
+                try {
+                    const he = el;
+                    const rect = he.getBoundingClientRect();
+                    if (rect.width < 4 || rect.height < 4)
+                        return;
+                    const cs = getComputedStyle(he);
+                    if (cs.visibility === 'hidden' || cs.display === 'none' || Number(cs.opacity) === 0)
+                        return;
+                    const text = clean(he.innerText || he.textContent || '').slice(0, 60);
+                    if (!text)
+                        return;
+                    const fontFamily = (cs.fontFamily || '').split(',')[0].replace(/["']/g, '').trim();
+                    const fontSize = cs.fontSize || '';
+                    const fontWeight = cs.fontWeight || '';
+                    const color = cs.color || '';
+                    const key = he.getAttribute('data-testid') ||
+                        he.id ||
+                        `${he.tagName.toLowerCase()}:${text.slice(0, 24)}`;
+                    const sig = `${key}|${fontFamily}|${fontSize}|${fontWeight}|${color}`;
+                    if (seenFont.has(sig))
+                        return;
+                    seenFont.add(sig);
+                    fonts.push({
+                        key: String(key).slice(0, 80),
+                        text,
+                        fontFamily,
+                        fontSize,
+                        fontWeight,
+                        color,
+                    });
+                }
+                catch {
+                    /* ignore */
+                }
+            });
+            // Images (src path + alt) — skip tiny icons / tracking pixels
+            document.querySelectorAll('img').forEach((el, i) => {
+                const img = el;
+                const rect = img.getBoundingClientRect();
+                if (rect.width < 12 || rect.height < 12)
+                    return;
+                let src = img.currentSrc || img.src || img.getAttribute('src') || '';
+                try {
+                    const u = new URL(src, document.baseURI);
+                    src = u.pathname + (u.search ? '?…' : '');
+                }
+                catch {
+                    src = src.split(/[?#]/)[0].slice(-120);
+                }
+                const alt = (img.alt || img.title || '').trim().slice(0, 120);
+                const key = img.getAttribute('data-testid') || img.id || src || `img-${i}`;
+                images.push({
+                    key: String(key).slice(0, 100),
+                    src: src.slice(0, 200),
+                    alt,
+                    w: Math.round(rect.width),
+                    h: Math.round(rect.height),
+                });
+            });
+            return {
+                texts: texts.slice(0, 200),
+                fonts: fonts.slice(0, 80),
+                values: values.slice(0, 80),
+                images: images.slice(0, 40),
+            };
         }, extract_1.SENSITIVE_FIELD_RE.source);
     }
-    diffPageContent(devItems, prodItems) {
+    diffPageContent(devPackOrItems, prodPackOrItems) {
+        const emptyPack = { texts: [], fonts: [], values: [], images: [] };
+        const devPack = Array.isArray(devPackOrItems)
+            ? { ...emptyPack, texts: devPackOrItems }
+            : { ...emptyPack, ...devPackOrItems };
+        const prodPack = Array.isArray(prodPackOrItems)
+            ? { ...emptyPack, texts: prodPackOrItems }
+            : { ...emptyPack, ...prodPackOrItems };
+        const devItems = devPack.texts;
+        const prodItems = prodPack.texts;
         const diffs = [];
         const normalizeKey = (item) => {
             if (item.testId)
@@ -1664,22 +2490,142 @@ class QAComparisonEngine {
                 });
             }
         }
-        // De-dupe by dev+prod pair
+        // Fonts
+        const fontMap = (list) => {
+            const m = new Map();
+            for (const f of list || [])
+                if (!m.has(f.key))
+                    m.set(f.key, f);
+            return m;
+        };
+        const dFonts = fontMap(devPack.fonts);
+        const pFonts = fontMap(prodPack.fonts);
+        for (const key of new Set([...dFonts.keys(), ...pFonts.keys()])) {
+            const d = dFonts.get(key);
+            const p = pFonts.get(key);
+            if (!d || !p)
+                continue;
+            const parts = [];
+            if (d.fontFamily !== p.fontFamily)
+                parts.push(`family DEV=${d.fontFamily || '(none)'} PROD=${p.fontFamily || '(none)'}`);
+            if (d.fontSize !== p.fontSize)
+                parts.push(`size DEV=${d.fontSize || '(none)'} PROD=${p.fontSize || '(none)'}`);
+            if (d.fontWeight !== p.fontWeight)
+                parts.push(`weight DEV=${d.fontWeight || '(none)'} PROD=${p.fontWeight || '(none)'}`);
+            if (d.color !== p.color)
+                parts.push(`color DEV=${d.color || '(none)'} PROD=${p.color || '(none)'}`);
+            if (!parts.length)
+                continue;
+            diffs.push({
+                component: (d.text || key).slice(0, 80),
+                type: 'CSS',
+                devValue: `${d.fontFamily} ${d.fontSize}/${d.fontWeight} ${d.color}`.trim(),
+                prodValue: `${p.fontFamily} ${p.fontSize}/${p.fontWeight} ${p.color}`.trim(),
+                severity: 'medium',
+                description: `Font differs on "${(d.text || key).slice(0, 40)}": ${parts.join('; ')}`,
+            });
+        }
+        // Field values
+        const valMap = (list) => {
+            const m = new Map();
+            for (const v of list || []) {
+                const k = `${v.inputType}|${v.key}`.toLowerCase();
+                if (!m.has(k))
+                    m.set(k, v);
+            }
+            return m;
+        };
+        const dVals = valMap(devPack.values);
+        const pVals = valMap(prodPack.values);
+        for (const key of new Set([...dVals.keys(), ...pVals.keys()])) {
+            const d = dVals.get(key);
+            const p = pVals.get(key);
+            const dValue = d?.value ?? '(missing on DEV)';
+            const pValue = p?.value ?? '(missing on PROD)';
+            if (dValue === pValue)
+                continue;
+            if ((!d?.value && !p?.value) || (dValue === '[redacted]' && pValue === '[redacted]'))
+                continue;
+            const name = d?.name || p?.name || key;
+            diffs.push({
+                component: String(name).slice(0, 80),
+                type: 'Data',
+                devValue: dValue,
+                prodValue: pValue,
+                severity: 'medium',
+                description: `Field value differs for "${name}" (${d?.inputType || p?.inputType || 'input'}). DEV="${dValue}". PROD="${pValue}".`,
+            });
+        }
+        // Images
+        const imgMap = (list) => {
+            const m = new Map();
+            for (const im of list || []) {
+                const k = im.key || im.src;
+                if (!m.has(k))
+                    m.set(k, im);
+            }
+            return m;
+        };
+        const dImgs = imgMap(devPack.images);
+        const pImgs = imgMap(prodPack.images);
+        for (const key of new Set([...dImgs.keys(), ...pImgs.keys()])) {
+            const d = dImgs.get(key);
+            const p = pImgs.get(key);
+            if (d && !p) {
+                diffs.push({
+                    component: (d.alt || d.src || key).slice(0, 80),
+                    type: 'Visual',
+                    devValue: `img ${d.src} (${d.w}x${d.h}) alt="${d.alt}"`,
+                    prodValue: '(missing on PROD)',
+                    severity: 'medium',
+                    description: `Image present on DEV only: ${d.src || key}`,
+                });
+                continue;
+            }
+            if (p && !d) {
+                diffs.push({
+                    component: (p.alt || p.src || key).slice(0, 80),
+                    type: 'Visual',
+                    devValue: '(missing on DEV)',
+                    prodValue: `img ${p.src} (${p.w}x${p.h}) alt="${p.alt}"`,
+                    severity: 'medium',
+                    description: `Image present on PROD only: ${p.src || key}`,
+                });
+                continue;
+            }
+            if (!d || !p)
+                continue;
+            if (d.src === p.src && d.alt === p.alt)
+                continue;
+            diffs.push({
+                component: (d.alt || d.src || key).slice(0, 80),
+                type: 'Visual',
+                devValue: `${d.src} alt="${d.alt}" ${d.w}x${d.h}`,
+                prodValue: `${p.src} alt="${p.alt}" ${p.w}x${p.h}`,
+                severity: 'medium',
+                description: `Image differs for "${(d.alt || key).slice(0, 40)}": DEV src/alt vs PROD src/alt.`,
+            });
+        }
+        // De-dupe by type+dev+prod pair
         const seen = new Set();
         return diffs.filter((d) => {
-            const k = `${d.devValue}||${d.prodValue}`;
+            const k = `${d.type}|${d.devValue}||${d.prodValue}`;
             if (seen.has(k))
                 return false;
             seen.add(k);
             return true;
-        }).slice(0, 40);
+        }).slice(0, 80);
     }
     /** Wait until a page has a parsed document and its UI has had a moment to settle. */
     async waitForSettled(page, settleMs) {
-        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-        // Let in-flight API calls finish so network logs are drained consistently on both sides (non-fatal)
-        await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => { });
-        await page.waitForTimeout(settleMs);
+        await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => { });
+        // Skip networkidle by default: SPAs with long-poll/SignalR never go idle and stall every step.
+        if (process.env.QA_VISION_WAIT_NETWORKIDLE === '1') {
+            await page.waitForLoadState('networkidle', { timeout: 1500 }).catch(() => { });
+        }
+        const ms = Math.min(Math.max(0, settleMs), compareMode() === "full" ? 2000 : compareMode() === "standard" ? 600 : 400);
+        if (ms > 0)
+            await page.waitForTimeout(ms);
     }
     /**
      * Capture and compare DEV vs PROD. `steps` lists every step this comparison covers
@@ -1727,11 +2673,17 @@ class QAComparisonEngine {
                     return;
                 }
             }
+            // Viewport PNG (not fullPage): full-page shots are huge and freeze the live SPA while capturing.
             const shoot = (page) => {
-                const shotOpts = { type: 'png', mask: cap.maskSelectors.map((m) => page.locator(m)) };
+                const shotOpts = {
+                    type: 'png',
+                    mask: cap.maskSelectors.map((m) => page.locator(m)),
+                    timeout: 5000,
+                    animations: 'disabled',
+                };
                 return cap.scopeSelector
                     ? page.locator(cap.scopeSelector).first().screenshot(shotOpts)
-                    : page.screenshot({ ...shotOpts, fullPage: cap.fullPage });
+                    : page.screenshot({ ...shotOpts, fullPage: !!cap.fullPage && fullCompareEnabled() });
             };
             const stamp = Date.now();
             const [devScreenshot, prodScreenshot, devContent, prodContent] = await Promise.all([
@@ -1742,8 +2694,7 @@ class QAComparisonEngine {
             ]);
             const devPath = path.join(session.evidenceDir, `dev-${stamp}.png`);
             const prodPath = path.join(session.evidenceDir, `prod-${stamp}.png`);
-            fs.writeFileSync(devPath, devScreenshot);
-            fs.writeFileSync(prodPath, prodScreenshot);
+            await Promise.all([fs.promises.writeFile(devPath, devScreenshot), fs.promises.writeFile(prodPath, prodScreenshot)]);
             const { ratio, diffPath, sideBySidePath } = await this.compareScreenshots(devScreenshot, prodScreenshot, path.join(session.evidenceDir, `diff-${stamp}.png`), path.join(session.evidenceDir, `side-by-side-${stamp}.png`), cap.pixelThreshold);
             const evidence = {
                 devScreenshotPath: devPath,
@@ -1779,48 +2730,25 @@ class QAComparisonEngine {
                 if (isNew)
                     counts.Text++;
             }
-            // 1b) Structural comparisons (DOM, CSS, layout, a11y, data, network, console) under a time budget
+            // 1b) Structural: standard (default) = DOM presence + CSS fonts; full adds a11y/data depth
             const budgetStart = Date.now();
             const budgetMs = comparisonBudgetMs();
             let budgetExceeded = false;
             let structuralFailure = '';
             let timer;
-            try {
-                const extractArg = {
-                    scopeSelector: cap.scopeSelector,
-                    maxElements: 400,
-                    maxRows: 50,
-                    sensitiveSource: extract_1.SENSITIVE_FIELD_RE.source,
-                    styleProps: [...extract_1.STYLE_PROPS],
-                    attrAllowlist: [...extract_1.ATTR_ALLOWLIST],
-                };
-                const timeout = (p) => Promise.race([p, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('budget')), budgetMs); })]);
-                const [devSnap, prodSnap] = await timeout(Promise.all([session.devPage.evaluate(extract_1.extractPageSnapshot, extractArg), session.prodPage.evaluate(extract_1.extractPageSnapshot, extractArg)]));
-                const { pairs } = (0, dom_diff_1.pairElements)(devSnap.elements, prodSnap.elements);
-                // DEV runs ahead of PROD while actions are still queued: keep the logs for the comparison that follows
-                const deferLogs = session.pendingActions > 0;
-                const drafts = [
-                    ...(0, dom_diff_1.diffDom)(devSnap.elements, prodSnap.elements),
-                    ...(0, css_diff_1.diffCss)(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
-                    ...(0, a11y_diff_1.diffA11y)(pairs),
-                    ...(0, data_rules_1.diffData)(pairs, devSnap.tables, prodSnap.tables, session.dataRules),
-                    ...(deferLogs ? [] : (0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0))),
-                    ...(deferLogs ? [] : (0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0))),
-                ];
-                if (Date.now() - budgetStart > budgetMs)
-                    budgetExceeded = true;
-                else {
-                    for (const d of drafts) {
+            const deferLogs = session.pendingActions > 0;
+            if (!standardCompareEnabled()) {
+                if (!deferLogs) {
+                    for (const d of [
+                        ...(0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0)),
+                        ...(0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0)),
+                    ]) {
                         if (session.ignore.active) {
                             const excludedBy = session.ignore.exclude(d);
-                            if (excludedBy) {
-                                suppressed.push(`${d.component} (${excludedBy})`);
+                            if (excludedBy)
                                 continue;
-                            }
-                            if (session.ignore.normalize(d.devValue) === session.ignore.normalize(d.prodValue)) {
-                                suppressed.push(`${d.component} (normalized)`);
+                            if (session.ignore.normalize(d.devValue) === session.ignore.normalize(d.prodValue))
                                 continue;
-                            }
                         }
                         const isNew = this.recordMismatch(sessionId, { ...d, ...evidence });
                         tally(isNew);
@@ -1829,48 +2757,81 @@ class QAComparisonEngine {
                     }
                 }
             }
-            catch (e) {
-                if (e?.message === 'budget')
-                    budgetExceeded = true;
-                else
-                    structuralFailure = String(e?.message || e).split(String.fromCharCode(10))[0];
-            }
-            finally {
-                if (timer)
-                    clearTimeout(timer);
-            }
-            if (budgetExceeded || structuralFailure) {
-                session.netLog.dev.splice(0);
-                session.netLog.prod.splice(0);
-                session.runtimeLog.dev.splice(0);
-                session.runtimeLog.prod.splice(0);
-                if (budgetExceeded) {
-                    this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${budgetMs} ms): keeping text and visual findings only`, 'Captured', 'Error');
+            else {
+                try {
+                    const extractArg = {
+                        scopeSelector: cap.scopeSelector,
+                        maxElements: fullCompareEnabled() ? 150 : 90,
+                        maxRows: fullCompareEnabled() ? 30 : 15,
+                        sensitiveSource: extract_1.SENSITIVE_FIELD_RE.source,
+                        styleProps: fullCompareEnabled() ? [...extract_1.STYLE_PROPS] : [...LIVE_FONT_STYLE_PROPS],
+                        attrAllowlist: [...extract_1.ATTR_ALLOWLIST],
+                    };
+                    const timeout = (p) => Promise.race([p, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('budget')), budgetMs); })]);
+                    const [devSnap, prodSnap] = await timeout(Promise.all([session.devPage.evaluate(extract_1.extractPageSnapshot, extractArg), session.prodPage.evaluate(extract_1.extractPageSnapshot, extractArg)]));
+                    const { pairs } = (0, dom_diff_1.pairElements)(devSnap.elements, prodSnap.elements);
+                    const drafts = [
+                        ...(0, dom_diff_1.diffDom)(devSnap.elements, prodSnap.elements),
+                        ...(0, css_diff_1.diffCss)(pairs, { layoutTolerancePx: cap.layoutTolerancePx }),
+                        ...(fullCompareEnabled() ? (0, a11y_diff_1.diffA11y)(pairs) : []),
+                        ...(fullCompareEnabled() ? (0, data_rules_1.diffData)(pairs, devSnap.tables, prodSnap.tables, session.dataRules) : []),
+                        ...(deferLogs ? [] : (0, runtime_diff_1.diffNetwork)(session.netLog.dev.splice(0), session.netLog.prod.splice(0))),
+                        ...(deferLogs ? [] : (0, runtime_diff_1.diffRuntime)(session.runtimeLog.dev.splice(0), session.runtimeLog.prod.splice(0))),
+                    ];
+                    if (Date.now() - budgetStart > budgetMs)
+                        budgetExceeded = true;
+                    else {
+                        for (const d of drafts) {
+                            if (session.ignore.active) {
+                                const excludedBy = session.ignore.exclude(d);
+                                if (excludedBy) {
+                                    suppressed.push(`${d.component} (${excludedBy})`);
+                                    continue;
+                                }
+                                if (session.ignore.normalize(d.devValue) === session.ignore.normalize(d.prodValue)) {
+                                    suppressed.push(`${d.component} (normalized)`);
+                                    continue;
+                                }
+                            }
+                            const isNew = this.recordMismatch(sessionId, { ...d, ...evidence });
+                            tally(isNew);
+                            if (isNew)
+                                counts[d.type] = (counts[d.type] || 0) + 1;
+                        }
+                    }
                 }
-                else {
-                    this.log(sessionId, `Structural comparison failed after ${stepLabel}: ${structuralFailure}; keeping text and visual findings only`, 'Captured', 'Error');
+                catch (e) {
+                    if (e?.message === 'budget')
+                        budgetExceeded = true;
+                    else
+                        structuralFailure = String(e?.message || e).split(String.fromCharCode(10))[0];
+                }
+                finally {
+                    if (timer)
+                        clearTimeout(timer);
+                }
+                if (budgetExceeded || structuralFailure) {
+                    session.netLog.dev.splice(0);
+                    session.netLog.prod.splice(0);
+                    session.runtimeLog.dev.splice(0);
+                    session.runtimeLog.prod.splice(0);
+                    if (budgetExceeded) {
+                        this.log(sessionId, `Comparison budget exceeded after ${stepLabel} (${budgetMs} ms): keeping text and visual findings only`, 'Captured', 'Error');
+                    }
+                    else {
+                        this.log(sessionId, `Structural comparison failed after ${stepLabel}: ${structuralFailure}; keeping text and visual findings only`, 'Captured', 'Error');
+                    }
                 }
             }
-            // 2) Visual summary
-            if (ratio > cap.visualDiffRatio && textDiffs.length === 0) {
+            // 2) Image / screenshot compare — always report when pixel diff exceeds threshold
+            if (ratio > cap.visualDiffRatio) {
                 tally(this.recordMismatch(sessionId, {
-                    component: 'Viewport appearance',
-                    type: 'Visual',
-                    devValue: 'See DEV screenshot',
-                    prodValue: `${(ratio * 100).toFixed(1)}% of pixels differ from DEV`,
-                    severity: ratio > 0.1 ? 'high' : 'medium',
-                    description: `Visual difference of ${(ratio * 100).toFixed(1)}% with no extractable text change. Colors, spacing, or images likely differ.`,
-                    ...evidence,
-                }));
-            }
-            else if (ratio > 0.05 && textDiffs.length > 0) {
-                tally(this.recordMismatch(sessionId, {
-                    component: 'Viewport (visual context)',
+                    component: 'Viewport image',
                     type: 'Visual',
                     devValue: 'DEV screenshot attached',
-                    prodValue: `PROD screenshot attached — ${(ratio * 100).toFixed(1)}% pixels differ`,
-                    severity: 'low',
-                    description: 'Visual context for the text differences on this page. Use the side-by-side screenshots for layout/color comparison.',
+                    prodValue: `PROD screenshot — ${(ratio * 100).toFixed(1)}% pixels differ`,
+                    severity: ratio > 0.12 ? 'high' : ratio > 0.05 ? 'medium' : 'low',
+                    description: `Screenshot image differs by ${(ratio * 100).toFixed(1)}% of pixels. Open side-by-side evidence to compare layout, colors, charts, and graphics.`,
                     ...evidence,
                 }));
             }
@@ -1929,53 +2890,23 @@ class QAComparisonEngine {
         }
     }
     async compareScreenshots(buf1, buf2, preferredDiffPath, sideBySidePath, pixelThreshold = 0.1) {
-        const img1 = pngjs_1.PNG.sync.read(buf1);
-        const img2 = pngjs_1.PNG.sync.read(buf2);
-        if (img1.width !== img2.width || img1.height !== img2.height) {
+        const px = await diffPixelsOffThread(buf1, buf2, pixelThreshold);
+        if (px.sizeMismatch || !px.overlayPng) {
             // Still try to build side-by-side with sharp if available
             const sbs = await this.writeSideBySide(buf1, buf2, sideBySidePath);
             return { ratio: 1.0, sideBySidePath: sbs };
         }
-        const diff = new pngjs_1.PNG({ width: img1.width, height: img1.height });
-        const numDiffPixels = (0, pixelmatch_1.default)(img1.data, img2.data, diff.data, img1.width, img1.height, {
-            threshold: pixelThreshold,
-            includeAA: true,
-            diffColor: [255, 0, 0],
-            alpha: 0.6,
-        });
-        // Overlay red diff on top of a faded DEV screenshot for clearer evidence
-        const overlay = new pngjs_1.PNG({ width: img1.width, height: img1.height });
-        for (let i = 0; i < img1.data.length; i += 4) {
-            const isDiff = diff.data[i] > 0 || diff.data[i + 1] > 0 || diff.data[i + 2] > 0;
-            if (isDiff) {
-                overlay.data[i] = 255;
-                overlay.data[i + 1] = 40;
-                overlay.data[i + 2] = 40;
-                overlay.data[i + 3] = 255;
-            }
-            else {
-                // dimmed original
-                overlay.data[i] = Math.floor(img1.data[i] * 0.55);
-                overlay.data[i + 1] = Math.floor(img1.data[i + 1] * 0.55);
-                overlay.data[i + 2] = Math.floor(img1.data[i + 2] * 0.55);
-                overlay.data[i + 3] = 255;
-            }
-        }
         let diffPath;
         try {
-            fs.mkdirSync(path.dirname(preferredDiffPath), { recursive: true });
-            fs.writeFileSync(preferredDiffPath, pngjs_1.PNG.sync.write(overlay));
+            await fs.promises.mkdir(path.dirname(preferredDiffPath), { recursive: true });
+            await fs.promises.writeFile(preferredDiffPath, px.overlayPng);
             diffPath = preferredDiffPath;
         }
         catch {
             /* non-fatal */
         }
-        const sbs = await this.writeSideBySide(buf1, buf2, sideBySidePath, pngjs_1.PNG.sync.write(overlay));
-        return {
-            ratio: numDiffPixels / (img1.width * img1.height),
-            diffPath,
-            sideBySidePath: sbs,
-        };
+        const sbs = await this.writeSideBySide(buf1, buf2, sideBySidePath, px.overlayPng);
+        return { ratio: px.ratio, diffPath, sideBySidePath: sbs };
     }
     async writeSideBySide(devBuf, prodBuf, outPath, diffBuf) {
         if (!outPath)
@@ -2331,10 +3262,11 @@ class QAComparisonEngine {
         }
     }
     /**
-     * Live view: every 1000 ms, while the session runs, is not paused and at least one socket is connected, emit a
-     * `frame {sessionId, side, data (base64 JPEG q50), url}` per side. A tick is skipped while the previous one is still
-     * in flight. Password inputs (and the profile's mask selectors) are masked in the pixels; a frame whose masking
-     * fails is dropped, never sent unmasked.
+     * Live view: each side streams through a CDP screencast: Chrome pushes a JPEG on every repaint, coalesced to
+     * QA_VISION_LIVE_FPS (default 8), emitted as `frame {sessionId, side, data (base64 JPEG), url, focus}`. Screenshots (1 per second) are the
+     * fallback: for a side whose screencast could not start, and whenever the profile has mask selectors (screencast
+     * pixels cannot be masked, and a frame is never sent unmasked). A 1 s heartbeat re-sends the last frame of an idle
+     * screencast so a dashboard that (re)connects is never left blank.
      */
     startFrameStream(sessionId) {
         const session = this.sessions.get(sessionId);
@@ -2347,15 +3279,147 @@ class QAComparisonEngine {
             void this.emitFrames(session, ['dev', 'prod']);
         }, 1000);
         session.frameTimer.unref?.();
+        // QA_VISION_LIVE_SCREENCAST=0 forces the 1 fps screenshot path
+        if (!session.capture.maskSelectors.length && process.env.QA_VISION_LIVE_SCREENCAST !== '0') {
+            void this.startScreencast(session, 'dev');
+            void this.startScreencast(session, 'prod');
+        }
+    }
+    async startScreencast(session, side) {
+        const page = side === 'dev' ? session.devPage : session.prodPage;
+        let cdp;
+        try {
+            cdp = await page.context().newCDPSession(page);
+        }
+        catch {
+            return; // not Chromium / page gone: the screenshot fallback covers this side
+        }
+        const cast = { cdp, lastEmitAt: 0, focus: '', focusAt: 0 };
+        const { width, height } = session.capture.viewport;
+        // Keep stream size equal to the Playwright viewport so click coords map 1:1. Quality/FPS stay lower for speed.
+        const begin = () => cdp.send('Page.startScreencast', {
+            format: 'jpeg',
+            quality: 50,
+            maxWidth: width,
+            maxHeight: height,
+            everyNthFrame: 2,
+        });
+        cdp.on('Page.screencastFrame', (ev) => {
+            // Ack at once: Chrome sends the next frame only after the ack (built-in back-pressure)
+            cdp.send('Page.screencastFrameAck', { sessionId: ev.sessionId }).catch(() => { });
+            if (cast.stopped)
+                return;
+            cast.pending = ev.data;
+            this.flushCast(session, side, cast);
+        });
+        try {
+            await begin();
+        }
+        catch {
+            cdp.detach().catch(() => { });
+            return;
+        }
+        if (!session.isRunning || !session.frameTimer) {
+            cast.stopped = true;
+            cdp.detach().catch(() => { });
+            return;
+        }
+        (session.casts ??= {})[side] = cast;
+        // A main-frame navigation can swap the renderer: restart so the stream never silently stalls on the old page.
+        page.on('load', () => {
+            if (cast.stopped)
+                return;
+            cdp
+                .send('Page.stopScreencast')
+                .catch(() => { })
+                .then(() => (cast.stopped ? undefined : begin()))
+                .catch(() => { });
+        });
+    }
+    /** Emit the newest screencast frame, at most liveCastMinIntervalMs() apart per side. */
+    flushCast(session, side, cast) {
+        if (cast.flushTimer)
+            return;
+        const wait = Math.max(0, cast.lastEmitAt + liveCastMinIntervalMs() - Date.now());
+        cast.flushTimer = setTimeout(async () => {
+            const data = cast.pending;
+            cast.pending = undefined;
+            try {
+                if (!data || cast.stopped)
+                    return;
+                cast.last = data;
+                const io = this.io;
+                if (!session.isRunning || !io || io.sockets.sockets.size < 1)
+                    return;
+                cast.lastEmitAt = Date.now();
+                const page = side === 'dev' ? session.devPage : session.prodPage;
+                // Focus label is expensive (page.evaluate); refresh rarely so streaming stays cheap
+                if (Date.now() - cast.focusAt > 2000) {
+                    cast.focusAt = Date.now();
+                    cast.focus = await this.focusLabel(page);
+                }
+                if (!cast.stopped && session.isRunning) {
+                    const { width: vw, height: vh } = session.capture.viewport;
+                    io.emit('frame', {
+                        sessionId: session.id,
+                        side,
+                        data,
+                        url: urlForAddressBar(page.url()),
+                        focus: cast.focus,
+                        vw,
+                        vh,
+                    });
+                }
+            }
+            finally {
+                cast.flushTimer = undefined;
+                if (cast.pending && !cast.stopped)
+                    this.flushCast(session, side, cast);
+            }
+        }, wait);
+    }
+    /** Name the focused field (both panes are drivable), so focus stays visible even on a password input. Never its value. */
+    focusLabel(page) {
+        // Bounded: an evaluate can wait out a navigation, and a stalled label must never hold up the frame stream
+        const label = page
+            .evaluate(() => {
+            const el = document.activeElement;
+            if (!el || el === document.body || el === document.documentElement)
+                return '';
+            const tag = el.tagName.toLowerCase();
+            const type = el.getAttribute('type');
+            const name = el.getAttribute('aria-label') || el.getAttribute('name') || el.getAttribute('placeholder') || el.id ||
+                (tag === 'button' || tag === 'a' ? (el.innerText || '').trim().slice(0, 40) : ''); // never editable content
+            return `${tag}${type ? `[${type}]` : ''}${name ? ` "${name}"` : ''}`.slice(0, 80);
+        })
+            .catch(() => '');
+        let timer;
+        const timeout = new Promise((r) => (timer = setTimeout(() => r(''), 500)));
+        return Promise.race([label, timeout]).finally(() => clearTimeout(timer));
     }
     /** One frame per requested side (skipped while a previous grab is in flight or nobody is watching). */
     async emitFrames(session, sides, urgent = false) {
         const io = this.io;
         if (!session.isRunning || !io || io.sockets.sockets.size < 1)
             return;
+        // Screencast sides push their own frames; an idle one (nothing repainted for 1 s) re-sends its last frame
+        sides = sides.filter((side) => {
+            const cast = session.casts?.[side];
+            if (!cast || cast.stopped)
+                return true;
+            if (!urgent && cast.last && !cast.pending && !cast.flushTimer && Date.now() - cast.lastEmitAt >= 1000) {
+                cast.pending = cast.last;
+                this.flushCast(session, side, cast);
+            }
+            return false;
+        });
+        if (!sides.length)
+            return;
         if (session.frameBusy) {
+            // Input feedback must not be dropped: refresh the requested side(s) right after the grab in flight
             if (urgent)
-                session.frameAgain = true; // input feedback must not be dropped; refresh DEV right after
+                for (const s of sides)
+                    (session.frameAgain ??= new Set()).add(s);
             return;
         }
         const grab = async (page) => {
@@ -2376,31 +3440,20 @@ class QAComparisonEngine {
             for (const side of sides) {
                 const page = side === 'dev' ? session.devPage : session.prodPage;
                 const data = await grab(page);
-                // DEV only: name the focused field, so focus stays visible even on a masked password input. Never its value.
-                const focus = side === 'dev'
-                    ? await page
-                        .evaluate(() => {
-                        const el = document.activeElement;
-                        if (!el || el === document.body || el === document.documentElement)
-                            return '';
-                        const tag = el.tagName.toLowerCase();
-                        const type = el.getAttribute('type');
-                        const name = el.getAttribute('aria-label') || el.getAttribute('name') || el.getAttribute('placeholder') || el.id ||
-                            (tag === 'button' || tag === 'a' ? (el.innerText || '').trim().slice(0, 40) : ''); // never editable content
-                        return `${tag}${type ? `[${type}]` : ''}${name ? ` "${name}"` : ''}`.slice(0, 80);
-                    })
-                        .catch(() => '')
-                    : undefined;
-                if (data && session.isRunning)
-                    io.emit('frame', { sessionId: session.id, side, data, url: urlForLog(page.url()), focus });
+                const focus = await this.focusLabel(page);
+                if (data && session.isRunning) {
+                    const { width: vw, height: vh } = session.capture.viewport;
+                    io.emit('frame', { sessionId: session.id, side, data, url: urlForAddressBar(page.url()), focus, vw, vh });
+                }
             }
         }
         finally {
             session.frameBusy = false;
         }
-        if (session.frameAgain) {
-            session.frameAgain = false;
-            void this.emitFrames(session, ['dev']);
+        if (session.frameAgain?.size) {
+            const again = [...session.frameAgain];
+            session.frameAgain.clear();
+            void this.emitFrames(session, again);
         }
     }
     /**
@@ -2408,12 +3461,134 @@ class QAComparisonEngine {
      * Ends early when another action gets queued: that action's task runs the comparison, so replays never stall here.
      */
     async waitForLiveInputQuiet(session) {
+        // Longer quiet window batches more steps into one comparison (faster feel, less SPA thrash).
+        const quietMs = fullCompareEnabled() ? 700 : 1100;
+        const maxWait = fullCompareEnabled() ? 4000 : 2500;
         const start = Date.now();
-        while (Date.now() - start < 4000 &&
+        while (Date.now() - start < maxWait &&
             session.pendingActions === 0 &&
             session.lastLiveInputAt &&
-            Date.now() - session.lastLiveInputAt < 700) {
-            await new Promise((r) => setTimeout(r, 100));
+            Date.now() - session.lastLiveInputAt < quietMs) {
+            await new Promise((r) => setTimeout(r, 80));
+        }
+    }
+    /**
+     * If a target=_blank / window.open popup still appears, navigate the main live pane to that URL
+     * and close the popup. Live Comparison only streams one page per side.
+     */
+    attachPopupToMainPane(sessionId, side, context) {
+        context.on('page', async (popup) => {
+            const session = this.sessions.get(sessionId);
+            if (!session || !session.isRunning) {
+                await popup.close().catch(() => { });
+                return;
+            }
+            const main = side === 'dev' ? session.devPage : session.prodPage;
+            if (popup === main)
+                return;
+            const readHref = async () => {
+                for (let i = 0; i < 20; i++) {
+                    let href = '';
+                    try {
+                        href = popup.url();
+                    }
+                    catch {
+                        return '';
+                    }
+                    if (href && href !== 'about:blank' && !href.startsWith('blob:'))
+                        return href;
+                    await new Promise((r) => setTimeout(r, 100));
+                }
+                try {
+                    return popup.url();
+                }
+                catch {
+                    return '';
+                }
+            };
+            try {
+                await popup.waitForLoadState('domcontentloaded', { timeout: 12000 }).catch(() => { });
+                const href = await readHref();
+                if (!href || href === 'about:blank' || href.startsWith('blob:')) {
+                    await popup.close().catch(() => { });
+                    return;
+                }
+                const check = validateTargetUrl(href);
+                if (!check.ok) {
+                    this.log(sessionId, `${side.toUpperCase()} blocked popup to unsafe URL: ${check.error}`, side === 'dev' ? 'Error' : 'n/a', side === 'prod' ? 'Error' : 'n/a');
+                    await popup.close().catch(() => { });
+                    return;
+                }
+                let mainUrl = '';
+                try {
+                    mainUrl = main.url();
+                }
+                catch {
+                    mainUrl = '';
+                }
+                if (mainUrl !== check.url) {
+                    await main.goto(check.url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e) => {
+                        this.log(sessionId, `${side.toUpperCase()} could not open link in live pane: ${String(e?.message || e).split('\n')[0]}`, side === 'dev' ? 'Error' : 'n/a', side === 'prod' ? 'Error' : 'n/a');
+                    });
+                    this.log(sessionId, `${side.toUpperCase()} opened link in live pane: ${urlForLog(check.url)}`, side === 'dev' ? 'Success' : 'n/a', side === 'prod' ? 'Success' : 'n/a');
+                    if (side === 'dev' && session.phase === 'running' && !session.isPaused) {
+                        const prodTarget = mapDevUrlToProd(check.url, session.devUrl, session.prodUrl);
+                        if (prodTarget) {
+                            await session.prodPage
+                                .goto(prodTarget, { waitUntil: 'domcontentloaded', timeout: 45000 })
+                                .catch(() => { });
+                            this.log(sessionId, `PROD followed DEV link to ${urlForLog(prodTarget)}`, 'Success', 'Success');
+                        }
+                    }
+                    setTimeout(() => void this.emitFrames(session, side === 'dev' ? ['dev', 'prod'] : [side], true), 100);
+                }
+            }
+            finally {
+                await popup.close().catch(() => { });
+            }
+        });
+    }
+    /**
+     * Scroll at a point: try the nearest overflow container (SPA panels), then mouse.wheel as fallback.
+     * Used for live-view wheel on DEV and the PROD mirror while comparing.
+     */
+    async applyWheelAt(page, x, y, dx, dy) {
+        await page.mouse.move(x, y).catch(() => { });
+        const scrolled = await page
+            .evaluate(({ px, py, ddx, ddy }) => {
+            const root = document.elementFromPoint(px, py);
+            let el = root;
+            while (el && el !== document.body && el !== document.documentElement) {
+                const st = window.getComputedStyle(el);
+                const oy = st.overflowY;
+                const ox = st.overflowX;
+                const canY = (oy === 'auto' || oy === 'scroll' || oy === 'overlay') && el.scrollHeight > el.clientHeight + 2;
+                const canX = (ox === 'auto' || ox === 'scroll' || ox === 'overlay') && el.scrollWidth > el.clientWidth + 2;
+                if (canY || canX) {
+                    const beforeTop = el.scrollTop;
+                    const beforeLeft = el.scrollLeft;
+                    if (canY)
+                        el.scrollTop += ddy;
+                    if (canX)
+                        el.scrollLeft += ddx;
+                    if (el.scrollTop !== beforeTop || el.scrollLeft !== beforeLeft)
+                        return true;
+                }
+                el = el.parentElement;
+            }
+            const se = (document.scrollingElement || document.documentElement);
+            const beforeY = se.scrollTop;
+            const beforeX = se.scrollLeft;
+            se.scrollTop += ddy;
+            se.scrollLeft += ddx;
+            window.scrollBy(ddx, ddy);
+            return se.scrollTop !== beforeY || se.scrollLeft !== beforeX;
+        }, { px: x, py: y, ddx: dx, ddy: dy })
+            .catch(() => false);
+        // Always also send a wheel event so listeners / virtual lists that ignore scrollTop still move
+        await page.mouse.wheel(dx, dy).catch(() => { });
+        if (!scrolled) {
+            /* wheel already attempted */
         }
     }
     /**
@@ -2421,24 +3596,36 @@ class QAComparisonEngine {
      * input on the DEV page. The DEV recorder therefore captures it exactly as if the user had used a DEV window,
      * and PROD mirrors it through the normal replay path. Coordinates are CSS pixels in the DEV viewport (the
      * frame is a viewport screenshot). Inputs apply one at a time, in arrival order; bad input is ignored.
+     *
+     * `side: 'prod'` drives the PROD page directly instead (e.g. to log in there or fix drift). That input is not
+     * recorded, not mirrored and not compared, and is accepted only while the session is 'ready' or 'paused', so it
+     * never races a replay. PROD's network guard still applies, so the safety policy holds for direct input too.
      */
     handleLiveInput(sessionId, input) {
         const session = this.sessions.get(sessionId);
         if (!session || !session.isRunning || session.stopRequested || !input || typeof input !== 'object')
             return;
         const i = input;
+        const side = i.side === 'prod' ? 'prod' : 'dev';
+        const prodAllowed = () => !session.starting && (session.phase === 'ready' || session.phase === 'paused');
+        if (side === 'prod' && !prodAllowed())
+            return;
         const { width, height } = session.capture.viewport;
         const coord = (v, max) => {
             const n = Number(v);
             return Number.isFinite(n) ? Math.min(Math.max(n, 0), max - 1) : null;
         };
         const str = (v, max) => (typeof v === 'string' && v.length > 0 && v.length <= max ? v : null);
-        if (i.kind !== 'move')
+        if (side === 'dev' && i.kind !== 'move')
             session.lastLiveInputAt = Date.now();
         const apply = async () => {
-            if (!session.isRunning || session.stopRequested || session.suppressCapture)
+            if (!session.isRunning || session.stopRequested)
                 return;
-            const page = session.devPage;
+            if (side === 'dev' && session.suppressCapture)
+                return;
+            if (side === 'prod' && !prodAllowed())
+                return; // a Start/Resume began while this input was queued
+            const page = side === 'prod' ? session.prodPage : session.devPage;
             const mouse = page.mouse;
             switch (i.kind) {
                 case 'move':
@@ -2466,8 +3653,20 @@ class QAComparisonEngine {
                     else if (i.kind === 'wheel') {
                         const dy = Math.max(-3000, Math.min(3000, Number(i.deltaY) || 0));
                         const dx = Math.max(-3000, Math.min(3000, Number(i.deltaX) || 0));
-                        if (dx || dy)
-                            await mouse.wheel(dx, dy);
+                        if (dx || dy) {
+                            await this.applyWheelAt(page, x, y, dx, dy);
+                            // Live-view wheel is CDP input: the page recorder never sees it. While comparing,
+                            // mirror the same wheel onto PROD so nested SPA scrollers stay in sync.
+                            if (side === 'dev' && session.phase === 'running' && !session.isPaused) {
+                                try {
+                                    await this.applyWheelAt(session.prodPage, x, y, dx, dy);
+                                    setTimeout(() => void this.emitFrames(session, ['prod'], true), 50);
+                                }
+                                catch {
+                                    /* PROD page may be navigating */
+                                }
+                            }
+                        }
                     }
                     break;
                 }
@@ -2488,22 +3687,141 @@ class QAComparisonEngine {
                 default:
                     return;
             }
-            // Refresh DEV now (mouse moves excluded) so the pane responds without waiting for the 1 s tick
+            // Refresh the driven pane now (mouse moves excluded) so it responds without waiting for the 1 s tick
             if (i.kind !== 'move') {
-                session.lastLiveInputAt = Date.now(); // the quiet gap starts once the input has actually been applied
-                setTimeout(() => void this.emitFrames(session, ['dev'], true), 80);
+                if (side === 'dev')
+                    session.lastLiveInputAt = Date.now(); // the quiet gap starts once the input is applied
+                setTimeout(() => void this.emitFrames(session, [side], true), 80);
             }
         };
-        session.liveInputQueue = (session.liveInputQueue ?? Promise.resolve())
+        const run = (q) => (q ?? Promise.resolve())
             .then(() => Promise.race([apply(), new Promise((r) => setTimeout(r, 5000))]))
-            .catch((e) => console.error('Live input failed:', e.message));
+            .catch((e) => console.error(`Live input (${side}) failed:`, e.message));
+        if (side === 'prod')
+            session.prodLiveInputQueue = run(session.prodLiveInputQueue);
+        else
+            session.liveInputQueue = run(session.liveInputQueue);
+    }
+    /**
+     * Live-view browser controls: type a URL (goto), Back, Forward or Reload in either pane. Runs on that side's input
+     * queue, so it keeps its order with clicks and typing.
+     *
+     * DEV: allowed whenever the session is open (not while Start is aligning PROD). While comparing, a full-document
+     * DEV navigation is mirrored to PROD as a `navigate` step (PROD goes to the equivalent PROD URL and is compared).
+     * A same-document one (SPA history, hash) is already reported by the recorder's popstate hook, so it is not sent
+     * twice. PROD: same rules as direct PROD input (ready / paused only, never mirrored). URLs pass validateTargetUrl,
+     * and PROD's network guard still applies.
+     */
+    liveNavigate(sessionId, sideRaw, opRaw, urlRaw) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.isRunning || session.stopRequested)
+            return Promise.resolve({ ok: false, message: 'No active session' });
+        const side = sideRaw === 'prod' ? 'prod' : 'dev';
+        const op = opRaw === 'back' || opRaw === 'forward' || opRaw === 'reload' || opRaw === 'goto' ? opRaw : null;
+        if (!op)
+            return Promise.resolve({ ok: false, message: 'Unknown navigation' });
+        const label = side === 'prod' ? 'PROD' : 'DEV';
+        const allowed = () => !session.starting && (side === 'dev' ? !session.suppressCapture : session.phase === 'ready' || session.phase === 'paused');
+        const refused = () => side === 'prod'
+            ? 'PROD can be navigated only while the session is Ready or Paused (press Pause first).'
+            : 'DEV cannot be navigated right now (Start or auto-login is running).';
+        if (!allowed())
+            return Promise.resolve({ ok: false, message: refused() });
+        let target;
+        if (op === 'goto') {
+            let raw = typeof urlRaw === 'string' ? urlRaw.trim() : '';
+            if (raw && !/^[a-z][a-z0-9+.-]*:/i.test(raw))
+                raw = `https://${raw}`; // "app.example.com/x" like a browser
+            const check = validateTargetUrl(raw);
+            if (!check.ok)
+                return Promise.resolve({ ok: false, message: `${label} URL rejected: ${check.error}` });
+            target = check.url;
+        }
+        const apply = async () => {
+            if (!session.isRunning || session.stopRequested)
+                return { ok: false, message: 'No active session' };
+            if (!allowed())
+                return { ok: false, message: refused() };
+            const page = side === 'prod' ? session.prodPage : session.devPage;
+            const before = page.url();
+            const opts = { waitUntil: 'domcontentloaded', timeout: 30000 };
+            // Identifies the document: it changes on a full load (including a back/forward-cache restore), not on a
+            // same-document (SPA history / hash) change, which the recorder's popstate hook already reports.
+            const docId = () => page.evaluate(() => performance.timeOrigin).catch(() => NaN);
+            const beforeDoc = await docId();
+            let response;
+            try {
+                if (op === 'goto')
+                    response = await page.goto(target, opts);
+                else if (op === 'back')
+                    response = await page.goBack(opts);
+                else if (op === 'forward')
+                    response = await page.goForward(opts);
+                else
+                    response = await page.reload(opts);
+            }
+            catch (err) {
+                const message = `${label} ${op} failed: ${String(err?.message || err).split('\n')[0]}`;
+                this.log(sessionId, message, 'Executed', 'Error');
+                setTimeout(() => void this.emitFrames(session, [side], true), 80);
+                return { ok: false, message };
+            }
+            if ((op === 'back' || op === 'forward') && !response && page.url() === before) {
+                // Right after another load, Chrome can apply the history move a moment after goBack/goForward returned
+                await page.waitForURL((u) => u.href !== before, { timeout: 3000, waitUntil: 'commit' }).catch(() => { });
+            }
+            const after = page.url();
+            const afterDoc = after === before && !response ? beforeDoc : await docId();
+            const newDocument = Boolean(response) || (Number.isFinite(beforeDoc) && Number.isFinite(afterDoc) && afterDoc !== beforeDoc);
+            if ((op === 'back' || op === 'forward') && !response && after === before) {
+                return { ok: false, message: `${label}: no ${op === 'back' ? 'previous' : 'next'} page` };
+            }
+            this.log(sessionId, `${label} ${op === 'goto' ? 'address bar' : op}: ${urlForLog(after)}`, 'Executed', 'Info');
+            if (side === 'dev') {
+                session.lastLiveInputAt = Date.now();
+                // A full-document load is invisible to the recorder: mirror it (same-document changes come via popstate)
+                if (newDocument && session.phase === 'running')
+                    void this.enqueueAction(sessionId, { type: 'navigate', url: after });
+            }
+            setTimeout(() => void this.emitFrames(session, [side], true), 80);
+            return { ok: true, message: `${label} at ${urlForLog(after)}`, url: urlForAddressBar(after) };
+        };
+        const prev = (side === 'prod' ? session.prodLiveInputQueue : session.liveInputQueue) ?? Promise.resolve();
+        const result = prev.then(apply, apply);
+        const settled = result.then(() => undefined, (e) => console.error(`Live navigation (${side}) failed:`, e.message));
+        if (side === 'prod')
+            session.prodLiveInputQueue = settled;
+        else
+            session.liveInputQueue = settled;
+        return result.catch((e) => ({ ok: false, message: `${label} ${op} failed: ${e.message}` }));
     }
     stopFrameStream(sessionId) {
         const session = this.sessions.get(sessionId);
-        if (session?.frameTimer)
+        if (session?.frameTimer) {
             clearInterval(session.frameTimer);
-        if (session)
             session.frameTimer = undefined;
+        }
+        if (session?.casts) {
+            for (const cast of [session.casts.dev, session.casts.prod]) {
+                if (!cast)
+                    continue;
+                cast.stopped = true;
+                if (cast.flushTimer)
+                    clearTimeout(cast.flushTimer);
+                cast.cdp
+                    .send('Page.stopScreencast')
+                    .catch(() => { })
+                    .finally(() => cast.cdp.detach().catch(() => { }));
+            }
+            session.casts = undefined;
+        }
+        if (session) {
+            session.frameBusy = false;
+            if (session.frameAgain) {
+                session.frameAgain.clear();
+                session.frameAgain = undefined;
+            }
+        }
     }
     async closeSession(sessionId, reason) {
         const session = this.sessions.get(sessionId);
@@ -2540,6 +3858,83 @@ class QAComparisonEngine {
     }
     getSession(sessionId) {
         return this.sessions.get(sessionId);
+    }
+    /**
+     * Snapshot of why a pane may look empty: URL, visible text, console/page errors, recent failed
+     * network calls, and iframe count. Used to debug blank DEV shells (e.g. appalpha SD-WAN).
+     */
+    async diagnoseSession(sessionId) {
+        const session = this.sessions.get(sessionId);
+        if (!session || !session.isRunning)
+            return { ok: false, error: 'No active session' };
+        const snap = async (side) => {
+            const page = side === 'dev' ? session.devPage : session.prodPage;
+            const net = session.netLog[side] || [];
+            const rt = session.runtimeLog[side] || [];
+            let url = '';
+            let title = '';
+            let bodyText = '';
+            let bodyHtmlLen = 0;
+            let iframeCount = 0;
+            let rootChildCount = 0;
+            let errors = [];
+            try {
+                url = page.url();
+                title = await page.title().catch(() => '');
+                const info = await page
+                    .evaluate(() => {
+                    const root = document.querySelector('#root, #app, [data-reactroot], main') || document.body;
+                    return {
+                        bodyText: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 800),
+                        bodyHtmlLen: (document.body?.innerHTML || '').length,
+                        iframeCount: document.querySelectorAll('iframe').length,
+                        rootChildCount: root ? root.children.length : 0,
+                        rootTag: root ? root.tagName : '',
+                    };
+                })
+                    .catch(() => ({
+                    bodyText: '',
+                    bodyHtmlLen: 0,
+                    iframeCount: 0,
+                    rootChildCount: 0,
+                    rootTag: '',
+                }));
+                bodyText = info.bodyText;
+                bodyHtmlLen = info.bodyHtmlLen;
+                iframeCount = info.iframeCount;
+                rootChildCount = info.rootChildCount;
+                errors = rt
+                    .filter((e) => e.kind === 'console-error' || e.kind === 'page-error' || e.kind === 'request-failed')
+                    .slice(-20)
+                    .map((e) => `${e.kind}: ${e.text}`);
+            }
+            catch (e) {
+                errors.push(String(e?.message || e));
+            }
+            const failedNet = net
+                .filter((e) => e.failure || (e.status != null && e.status >= 400))
+                .slice(-30)
+                .map((e) => ({
+                method: e.method,
+                path: e.path,
+                status: e.status,
+                failure: e.failure,
+            }));
+            return {
+                url,
+                title,
+                bodyText,
+                bodyHtmlLen,
+                iframeCount,
+                rootChildCount,
+                errors,
+                failedNet,
+                blankLooking: bodyHtmlLen < 5000 && bodyText.length < 80,
+            };
+        };
+        const [dev, prod] = await Promise.all([snap('dev'), snap('prod')]);
+        this.log(sessionId, `Diagnose: DEV blank=${dev.blankLooking} html=${dev.bodyHtmlLen} text=${dev.bodyText.length} | PROD blank=${prod.blankLooking} html=${prod.bodyHtmlLen} text=${prod.bodyText.length}`, 'Info', 'Info');
+        return { ok: true, dev, prod };
     }
     getLastSnapshot() {
         return this.lastSnapshot;

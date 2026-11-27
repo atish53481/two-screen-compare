@@ -42,7 +42,7 @@ export const DEFAULT_CAPTURE_SETTINGS: CaptureSettings = {
   fullPage: false,
   maskSelectors: [],
   scopeSelector: '',
-  settleMs: 350,
+  settleMs: 150,
   layoutTolerancePx: 2,
 };
 

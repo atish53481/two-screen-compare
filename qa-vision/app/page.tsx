@@ -5,12 +5,13 @@ import { io as connectSocket, type Socket } from 'socket.io-client';
 import { Play, Pause, Square, RefreshCw, Download, Settings, AlertTriangle, CheckCircle, XCircle, Eye, Power, Plus, Trash2, Edit } from 'lucide-react';
 import { format } from 'date-fns';
 import type { ComparisonProfile } from '../lib/types';
-import LiveView, { type Frame, type LiveInput } from './components/LiveView';
+import LiveView, { createFrameStore, type LiveInput, type LiveNavOp, type LiveNavResult } from './components/LiveView';
 import Timeline from './components/Timeline';
 import FindingsPanel from './components/FindingsPanel';
 import EvidenceViewer from './components/EvidenceViewer';
 import HistoryTab from './components/HistoryTab';
 import ProfileSettings from './components/ProfileSettings';
+import ScreenshotComparison from './components/ScreenshotComparison';
 import { downloadReport, EXPORT_FORMATS, jsonHeaders, type ExportFormat, type Finding } from './components/types';
 
 
@@ -56,8 +57,9 @@ const QA_VISION = () => {
   const [mismatches, setMismatches] = useState<Mismatch[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [selectedMismatch, setSelectedMismatch] = useState<Mismatch | null>(null);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'profiles' | 'logs' | 'history' | 'report'>('profiles');
-  const [frames, setFrames] = useState<{ dev?: Frame; prod?: Frame }>({});
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'profiles' | 'logs' | 'history' | 'report' | 'screenshot'>('profiles');
+  // Live frames bypass React state: re-rendering the whole dashboard per frame made both panes lag
+  const [frames] = useState(createFrameStore);
   const [outOfSync, setOutOfSync] = useState(false);
   const [selectedStep, setSelectedStep] = useState<string | null>(null);
   // Evidence/report source: kept after Stop so findings stay inspectable; viewRun = stored run opened read-only
@@ -68,10 +70,22 @@ const QA_VISION = () => {
   const sessionRef = React.useRef<string | null>(null);
   const viewRunRef = React.useRef(false);
   const socketRef = React.useRef<Socket | null>(null);
-  // Live view: DEV pane input goes to the DEV browser of this tab's own session
-  const sendLiveInput = React.useCallback((input: LiveInput) => {
-    if (sessionRef.current) socketRef.current?.emit('live-input', { sessionId: sessionRef.current, ...input });
+  // Live view: pane input goes to that side's browser of this tab's own session (PROD only while ready/paused)
+  const sendLiveInput = React.useCallback((input: LiveInput, side: 'dev' | 'prod') => {
+    if (sessionRef.current) socketRef.current?.emit('live-input', { sessionId: sessionRef.current, side, ...input });
   }, []);
+  // Live view browser controls (address bar, back, forward, reload); the engine answers through the socket ack
+  const sendLiveNav = React.useCallback(
+    (side: 'dev' | 'prod', op: LiveNavOp, url?: string): Promise<LiveNavResult> =>
+      new Promise((resolve) => {
+        const socket = socketRef.current;
+        if (!sessionRef.current || !socket?.connected) return resolve({ ok: false, message: 'Not connected to the QA Vision server' });
+        socket.timeout(35000).emit('live-nav', { sessionId: sessionRef.current, side, op, url }, (err: unknown, res?: LiveNavResult) =>
+          resolve(err || !res ? { ok: false, message: 'Navigation timed out' } : res)
+        );
+      }),
+    []
+  );
   const [status, setStatus] = useState('QA Vision Master Ready — Load or create a comparison profile');
   const [lastReportMeta, setLastReportMeta] = useState<{
     id: string;
@@ -118,10 +132,20 @@ const QA_VISION = () => {
     socket.on('status', (data: any) => {
       if (!mine(data) || !sessionRef.current) return;
       if (data?.phase === 'ready' || data?.phase === 'running' || data?.phase === 'paused') setPhase(data.phase);
+      // Engine-initiated changes (e.g. auto-pause for a one-time code) explain themselves here
+      if (typeof data?.notice === 'string' && data.notice) setStatus(data.notice);
     });
     socket.on('frame', (data: any) => {
       if (!sessionRef.current || data?.sessionId !== sessionRef.current || (data.side !== 'dev' && data.side !== 'prod')) return;
-      setFrames(prev => ({ ...prev, [data.side]: { data: String(data.data), url: String(data.url || ''), focus: typeof data.focus === 'string' ? data.focus : undefined } }));
+      const vw = Number(data.vw);
+      const vh = Number(data.vh);
+      frames.set(data.side, {
+        data: String(data.data),
+        url: String(data.url || ''),
+        focus: typeof data.focus === 'string' ? data.focus : undefined,
+        vw: Number.isFinite(vw) && vw > 0 ? vw : undefined,
+        vh: Number.isFinite(vh) && vh > 0 ? vh : undefined,
+      });
     });
     return () => {
       socketRef.current = null;
@@ -202,13 +226,18 @@ const QA_VISION = () => {
   // Real synchronized session with recorder
   const launchSession = async () => {
     if (isRunning || isStopping || !currentProfile) return;
+    await createSession();
+  };
 
+  // The launch itself, without the idle-state guard (Restart calls it right after its own Stop)
+  const createSession = async () => {
+    if (!currentProfile) return;
     setStatus('🚀 Launching Playwright DEV + PROD browsers and installing recorder...');
     setLogs([]);
     setMismatches([]);
     setSelectedMismatch(null);
     setViewRun(null);
-    setFrames({});
+    frames.clear();
     setOutOfSync(false);
     setSelectedStep(null);
     addLog('Launching real session with recorder', 'Launching', 'Launching', 'info');
@@ -329,7 +358,11 @@ const QA_VISION = () => {
 
   const stopComparison = async () => {
     if (!isRunning || isStopping) return;
+    await stopSession();
+  };
 
+  // Stop, without the running-state guard (shared by Stop and Restart)
+  const stopSession = async () => {
     reqToken.current++; // invalidate any in-flight start/pause response
     busyRef.current = false;
     setIsBusy(false);
@@ -355,9 +388,22 @@ const QA_VISION = () => {
     setIsStopping(false);
     setPhase('ready');
     setSessionId(null);
-    setFrames({});
+    frames.clear();
     setHistoryKey(k => k + 1);
     setStatus('✅ Session stopped. Results below are kept — click Export PDF Report for the consolidated report.');
+  };
+
+  // Restart: stop this session (its run is archived to History) and launch a fresh one with the same profile
+  const [isRestarting, setIsRestarting] = useState(false);
+  const restartSession = async () => {
+    if (!isRunning || isStopping || isRestarting) return;
+    setIsRestarting(true);
+    try {
+      await stopSession();
+      await createSession();
+    } finally {
+      setIsRestarting(false);
+    }
   };
 
   const [isResyncing, setIsResyncing] = useState(false);
@@ -401,6 +447,7 @@ const QA_VISION = () => {
       return;
     }
 
+    setActiveTab('dashboard');
     await launchSession();
   };
 
@@ -623,7 +670,7 @@ const QA_VISION = () => {
         </div>
 
         <div className="flex items-center gap-3">
-          {!isRunning && !isStopping && (
+          {!isRunning && !isStopping && !isRestarting && (
             <button
               onClick={launchEnvironments}
               className="flex items-center gap-2 px-5 py-2 rounded-lg font-medium transition-all bg-violet-600 hover:bg-violet-500 text-white"
@@ -722,8 +769,19 @@ const QA_VISION = () => {
                   )}
                 </>
               ) : (
-                <div className="w-full py-4 px-6 bg-zinc-800/60 border border-zinc-700 rounded-2xl text-center text-zinc-400 text-sm font-medium">
-                  Session idle — Launch Environments opens Playwright DEV + PROD windows (not Chrome tabs)
+                <div className="space-y-3">
+                  <button
+                    type="button"
+                    onClick={launchEnvironments}
+                    disabled={isStopping || isRestarting}
+                    className="w-full flex items-center justify-center gap-2 py-4 rounded-2xl font-semibold transition-all bg-violet-600 hover:bg-violet-500 text-white disabled:opacity-50"
+                  >
+                    <Power className="h-5 w-5" />
+                    {isRestarting ? 'RESTARTING…' : '⏻ LAUNCH ENVIRONMENTS'}
+                  </button>
+                  <p className="text-xs text-zinc-500 text-center leading-relaxed">
+                    Opens both apps in the Live Comparison panes. Then log in on each side and press Start Comparison.
+                  </p>
                 </div>
               )}
             </div>
@@ -809,6 +867,7 @@ const QA_VISION = () => {
               {[
                 { id: 'profiles', label: 'Profiles' },
                 { id: 'dashboard', label: 'Live Comparison' },
+                { id: 'screenshot', label: 'Two Screen Comparison' },
                 { id: 'logs', label: 'Execution Log' },
                 { id: 'history', label: 'History' },
                 { id: 'report', label: 'Reports' },
@@ -846,12 +905,29 @@ const QA_VISION = () => {
                   isPaused={isPaused}
                   outOfSync={outOfSync}
                   onInput={sendLiveInput}
+                  onNav={sendLiveNav}
+                  controls={{
+                    phase,
+                    busy: isBusy,
+                    stopping: isStopping,
+                    resyncing: isResyncing,
+                    restarting: isRestarting,
+                    message: status,
+                    onLaunch: launchEnvironments,
+                    onStart: startComparison,
+                    onTogglePause: pauseComparison,
+                    onResync: resync,
+                    onStop: stopComparison,
+                    onRestart: restartSession,
+                  }}
                 />
               )}
               <Timeline logs={logs} findings={mismatches} selectedStep={selectedStep} onSelectStep={setSelectedStep} />
               <FindingsPanel findings={mismatches} selectedId={selectedMismatch?.id || null} stepFilter={selectedStep} onSelect={setSelectedMismatch} />
             </div>
           )}
+
+          {activeTab === 'screenshot' && <ScreenshotComparison />}
 
           {activeTab === 'history' && (
             <HistoryTab

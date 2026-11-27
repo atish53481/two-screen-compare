@@ -44,8 +44,10 @@ async function waitUp(url, ms) {
 }
 
 const started = [];
-function start(cmd, args, cwd, env = process.env) {
-  const child = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: process.platform !== 'win32', env });
+function start(cmd, args, cwd, env = process.env, logFile) {
+  // Set QA_VISION_UI_SERVER_LOG=<file> to keep the QA Vision server's output for debugging a failed run
+  const out = logFile ? fs.openSync(logFile, 'w') : 'ignore';
+  const child = spawn(cmd, args, { cwd, shell: true, stdio: ['ignore', out, out], detached: process.platform !== 'win32', env });
   started.push(child);
   return child;
 }
@@ -98,7 +100,7 @@ const postJson = (p, body) =>
     }
   }
   console.log('Starting QA Vision server.js…');
-  start('node', ['server.js'], root, { ...process.env, QA_VISION_DATA_DIR: dataDir, QA_VISION_HEADLESS: '1', QA_VISION_PORT: String(PORT), QA_VISION_DIST_DIR: '.next-ui' });
+  start('node', ['server.js'], root, { ...process.env, QA_VISION_DATA_DIR: dataDir, QA_VISION_HEADLESS: '1', QA_VISION_PORT: String(PORT), QA_VISION_DIST_DIR: '.next-ui' }, process.env.QA_VISION_UI_SERVER_LOG);
   const ready = (await waitUp(DEV_URL, 90000)) && (await waitUp(PROD_URL, 90000)) && (await waitUp(BASE, 180000));
   if (!ready) {
     console.error('Target apps or QA Vision server not reachable');
@@ -173,7 +175,7 @@ const postJson = (p, body) =>
       await page.waitForSelector('[data-testid="live-frame-prod"]', { timeout: 5000 });
       const w = await page.$eval('[data-testid="live-frame-dev"]', (i) => i.naturalWidth);
       assert(w > 0, 'DEV frame did not decode');
-      assert((await page.textContent('[data-testid="live-url-dev"]')).includes('localhost'), 'URL bar empty');
+      assert((await page.inputValue('[data-testid="live-url-dev"]')).includes('localhost'), 'URL bar empty');
       assert(Date.now() - t < 5000, 'frames took too long');
       assert((await page.textContent('[data-testid="live-hint"]')).includes('click, scroll and type'), 'live-view hint missing');
     });
@@ -225,6 +227,79 @@ const postJson = (p, body) =>
       assert(prodBefore, 'no PROD frame');
     });
 
+    // Click the first <input> of a target app inside the given Live-view pane (same app layout, 1280x800 viewport)
+    const clickFirstInput = async (side, url) => {
+      const probe = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      await probe.goto(url);
+      const box = await probe.locator('input').first().boundingBox();
+      await probe.close();
+      assert(box, `input not found on ${side}`);
+      const img = page.locator(`[data-testid="live-frame-${side}"]`);
+      const natural = await img.evaluate((i) => ({ w: i.naturalWidth, h: i.naturalHeight }));
+      const shown = await img.boundingBox();
+      await page.mouse.click(
+        shown.x + ((box.x + box.width / 2) / natural.w) * shown.width,
+        shown.y + ((box.y + box.height / 2) / natural.h) * shown.height
+      );
+    };
+    const prodPaneInteractive = async () => (await page.getAttribute('[data-testid="live-frame-prod"]', 'tabindex')) === '0';
+
+    await test('PROD pane is interactive while READY: click + typing reach PROD only, nothing is compared', async () => {
+      assert(await prodPaneInteractive(), 'PROD pane not interactive while READY');
+      const frameOf = (side) => page.getAttribute(`[data-testid="live-frame-${side}"]`, 'src');
+      await sleep(1200);
+      const prodBefore = await frameOf('prod');
+      await clickFirstInput('prod', PROD_URL);
+      await page.keyboard.press('Control+a');
+      await page.keyboard.type('PPPPPPPPPPPPPPPPPPPP');
+      let changed = false;
+      for (let t = Date.now(); Date.now() - t < 6000 && !changed; ) {
+        await sleep(300);
+        changed = (await frameOf('prod')) !== prodBefore;
+      }
+      assert(changed, 'PROD frame did not change after click + typing in the PROD pane');
+      await page.waitForFunction(() => /input/.test(document.querySelector('[data-testid="live-focus-prod"]')?.textContent || ''), null, { timeout: 6000 });
+      assert(!(await page.textContent('[data-testid="live-focus-prod"]')).includes('PPPP'), 'PROD focus label leaked a typed value');
+      await sleep(1000);
+      assert((await page.locator('[data-testid="finding-row"]').count()) === 0, 'PROD-pane input produced findings');
+    });
+
+    // Address bar / Back / Forward helpers for the Live-view panes
+    const urlBar = (side) => page.locator(`[data-testid="live-url-${side}"]`);
+    const waitUrl = (side, re, timeout = 15000) =>
+      page.waitForFunction(
+        ([s, src]) => new RegExp(src).test(document.querySelector(`[data-testid="live-url-${s}"]`)?.value || ''),
+        [side, re.source],
+        { timeout }
+      );
+    const typeAddress = async (side, url) => {
+      // The pane ignores Enter while its previous navigation is still awaiting the engine's answer (no double
+      // sends); the frame URL can update before that answer, so wait for the controls to be idle again.
+      await page.waitForFunction((s) => !document.querySelector(`[data-testid="live-reload-${s}"]`)?.disabled, side, { timeout: 30000 });
+      await urlBar(side).click();
+      await page.keyboard.press('Control+a');
+      await page.keyboard.type(url);
+      await page.keyboard.press('Enter');
+    };
+
+    await test('READY: both panes have an editable address bar with Back/Forward; bad URLs are refused', async () => {
+      for (const [side, base] of [['dev', DEV_URL], ['prod', PROD_URL]]) {
+        await typeAddress(side, `${base}/qa-nav-check`);
+        await waitUrl(side, /\/qa-nav-check$/);
+        await page.locator(`[data-testid="live-back-${side}"]`).click();
+        await waitUrl(side, /:\d+\/?$/);
+        await page.locator(`[data-testid="live-forward-${side}"]`).click();
+        await waitUrl(side, /\/qa-nav-check$/);
+        await page.locator(`[data-testid="live-back-${side}"]`).click();
+        await waitUrl(side, /:\d+\/?$/);
+      }
+      await typeAddress('prod', 'ftp://example.com/x');
+      await page.locator('[data-testid="live-nav-error-prod"]').waitFor({ timeout: 15000 });
+      assert(/http\/https/.test(await page.textContent('[data-testid="live-nav-error-prod"]')), 'no reason shown for a rejected URL');
+      await page.keyboard.press('Escape');
+      assert((await page.locator('[data-testid="finding-row"]').count()) === 0, 'navigation in READY produced findings');
+    });
+
     await test('socket from a foreign Origin is refused; the dashboard origin connects', async () => {
       const { io: ioc } = require('socket.io-client');
       const tryConnect = (origin) =>
@@ -272,9 +347,18 @@ const postJson = (p, body) =>
       assert((await responded).status() === 200, 'start did not return 200');
       await btn(/PAUSE/).waitFor({ timeout: 10000 });
       assert((await btn(/START COMPARISON/).count()) === 0, 'START COMPARISON still shown');
-      assert(await btn(/Resync/).isVisible(), 'Resync missing while running');
+      assert(await btn(/Resync/).first().isVisible(), 'Resync missing while running');
       const second = await postJson('/api/session', { action: 'start', sessionId });
       assert(second.status === 409, `second start -> ${second.status}`);
+    });
+
+    await test('while COMPARING the PROD pane is view-only; the Live tab shows Pause/Resync/Stop/Restart', async () => {
+      assert(!(await prodPaneInteractive()), 'PROD pane interactive while comparing');
+      assert((await page.textContent('[data-testid="live-hint"]')).includes('Pause to control'), 'hint does not explain PROD control');
+      for (const id of ['live-pause', 'live-resync', 'live-stop', 'live-restart']) {
+        assert(await page.locator(`[data-testid="${id}"]`).isVisible(), `${id} missing while running`);
+      }
+      assert((await page.locator('[data-testid="live-start"]').count()) === 0, 'Start shown while running');
     });
 
     // The baseline comparison runs at Start; wait for findings to arrive
@@ -311,6 +395,17 @@ const postJson = (p, body) =>
       assert(added >= 1 && added <= 2, `typing one word made ${added} fill steps (expected 1-2, not one per keystroke)`);
     });
 
+    await test('while COMPARING, PROD navigation is locked and DEV address bar / Back are mirrored to PROD', async () => {
+      assert(await page.locator('[data-testid="live-back-prod"]').isDisabled(), 'PROD Back enabled while comparing');
+      assert(await page.locator('[data-testid="live-url-prod"]').evaluate((el) => el.readOnly), 'PROD address editable while comparing');
+      await typeAddress('dev', `${DEV_URL}/qa-nav-mirror`);
+      await waitUrl('dev', /\/qa-nav-mirror$/);
+      await waitUrl('prod', /\/qa-nav-mirror$/, 30000);
+      await page.locator('[data-testid="live-back-dev"]').click();
+      await waitUrl('dev', /:\d+\/?$/);
+      await waitUrl('prod', /:\d+\/?$/, 30000);
+    });
+
     await test('PAUSE shows START AGAIN; START AGAIN shows PAUSE again', async () => {
       await btn(/PAUSE/).click();
       await btn(/START AGAIN/).waitFor({ timeout: 10000 });
@@ -321,6 +416,16 @@ const postJson = (p, body) =>
       await btn(/PAUSE/).waitFor({ timeout: 30000 });
     });
 
+    await test('Live-tab Pause makes PROD drivable; Live-tab Start again re-locks it and keeps comparing', async () => {
+      await page.locator('[data-testid="live-pause"]').click();
+      await page.locator('[data-testid="live-resume"]').waitFor({ timeout: 10000 });
+      assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'paused', 'sidebar did not follow Live-tab pause');
+      await page.waitForFunction(() => document.querySelector('[data-testid="live-frame-prod"]')?.getAttribute('tabindex') === '0', null, { timeout: 5000 });
+      await page.locator('[data-testid="live-resume"]').click();
+      await page.locator('[data-testid="live-pause"]').waitFor({ timeout: 30000 });
+      assert(!(await prodPaneInteractive()), 'PROD pane still interactive after Start again');
+      assert((await page.locator('[data-testid="phase-banner"]').getAttribute('data-phase')) === 'running', 'not running after Start again');
+    });
     await test('reload while RUNNING: findings and logs repopulate, PAUSE/STOP shown, same sessionId', async () => {
       const findingsBefore = await page.locator('[data-testid="finding-row"]').count();
       const live = await liveSessions();
@@ -407,6 +512,8 @@ const postJson = (p, body) =>
       assert((await row.count()) === 1, 'expected row not listed with toggle on');
       // Persist: stop the session, then open the stored run read-only
       await page.getByRole('button', { name: /STOP/ }).first().click();
+      // Stop closes both browsers (~0.5 s): wait until it is done, or the next checks race a closing session
+      await page.getByRole('button', { name: /LAUNCH ENVIRONMENTS/ }).first().waitFor({ timeout: 30000 });
       await page.getByRole('button', { name: 'History' }).click();
       await page.waitForSelector('[data-testid="history-run"]', { timeout: 20000 });
       await page.locator('[data-testid="history-open"]').first().click();
@@ -420,6 +527,28 @@ const postJson = (p, body) =>
       assert((await liveSessions()).length === 0, 'session still listed after Stop');
       await reload();
       assert((await btn(/LAUNCH ENVIRONMENTS/).count()) > 0, 'Launch not offered when idle after reload');
+    });
+
+    await test('Live tab: Launch, Restart (new session, old one gone), then Stop leaves nothing running', async () => {
+      await page.getByRole('button', { name: 'Live Comparison' }).click();
+      await page.locator('[data-testid="live-launch"]').click();
+      await page.locator('[data-testid="live-start"]').waitFor({ timeout: 60000 });
+      const first = (await liveSessions()).map((s) => s.sessionId);
+      assert(first.length === 1, `expected 1 session after launch, got ${first.length}`);
+      await page.locator('[data-testid="live-restart"]').click();
+      await page.waitForFunction(() => /Restarting/.test(document.querySelector('[data-testid="live-controls"]')?.textContent || ''), null, { timeout: 5000 });
+      // The old session's Start stays on screen during the restart: wait for the restart itself to finish
+      await page.waitForFunction(
+        () => !/Restarting/.test(document.querySelector('[data-testid="live-controls"]')?.textContent || '') && !!document.querySelector('[data-testid="live-start"]'),
+        null,
+        { timeout: 60000 }
+      );
+      const second = (await liveSessions()).map((s) => s.sessionId);
+      assert(second.length === 1 && second[0] !== first[0], `restart did not replace the session: ${first} -> ${second}`);
+      await page.waitForSelector('[data-testid="live-frame-prod"]', { timeout: 10000 });
+      await page.locator('[data-testid="live-stop"]').click();
+      await page.locator('[data-testid="live-launch"]').waitFor({ timeout: 30000 });
+      assert((await liveSessions()).length === 0, 'session still listed after Live-tab Stop');
     });
 
     await test('history exports HTML (content-type text/html)', async () => {

@@ -9,7 +9,7 @@ const DEFAULTS = {
   fullPage: false,
   maskSelectors: [],
   scopeSelector: '',
-  settleMs: 350,
+  settleMs: 150, // default lowered from 350 in lib/engine/findings.ts (faster settle; waitForSettled caps per compare mode)
   layoutTolerancePx: 2,
 };
 
@@ -32,5 +32,5 @@ test('clamps settleMs, tolerance, ratio and drops empty selectors', () => {
 test('non-numeric values fall back to defaults', () => {
   const r = normalizeCaptureSettings({ pixelThreshold: NaN, settleMs: 'x' });
   assert.equal(r.pixelThreshold, 0.1);
-  assert.equal(r.settleMs, 350);
+  assert.equal(r.settleMs, 150);
 });

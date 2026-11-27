@@ -1,9 +1,14 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ATTR_ALLOWLIST = exports.STYLE_PROPS = exports.SENSITIVE_FIELD_RE = void 0;
+exports.ATTR_ALLOWLIST = exports.STYLE_PROPS = exports.ONE_TIME_CODE_RE = exports.SENSITIVE_FIELD_RE = void 0;
 exports.extractPageSnapshot = extractPageSnapshot;
 /** Fields whose values must never leave the page (shared with extractPageContent). */
 exports.SENSITIVE_FIELD_RE = /pass|pwd|secret|token|otp|cvv|cvc|card.?num|cc-|ssn|pin\b/i;
+/**
+ * Fields that take a one-time code (2-step verification, SMS/email/authenticator codes). Matched against the
+ * field's name, id, autocomplete, aria-label, placeholder and label. A code is single-use, so it is never replayed.
+ */
+exports.ONE_TIME_CODE_RE = /\b(otp|totp|mfa|2fa)|one.?time|two.?factor|2.?step|passcode|verification.?code|security.?code|authenticat\w*.?code|sms.?code|enter.?(the.?|your.?)?code\b/i;
 exports.STYLE_PROPS = [
     'font-family', 'font-size', 'font-weight', 'line-height', 'letter-spacing', 'text-align',
     'text-decoration-line', 'color', 'background-color', 'border-top-color', 'border-top-width',

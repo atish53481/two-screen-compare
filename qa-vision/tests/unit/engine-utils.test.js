@@ -1,7 +1,7 @@
 // Unit tests for the engine's pure helpers (no browsers needed).   npm run test:unit
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { validateTargetUrl, mapDevUrlToProd, compileIgnoreRules } = require('../../playwright.js');
+const { validateTargetUrl, mapDevUrlToProd, onSharedOutsideHost, compileIgnoreRules } = require('../../playwright.js');
 
 test('validateTargetUrl accepts http/https and normalizes', () => {
   assert.deepEqual(validateTargetUrl('http://localhost:3002'), { ok: true, url: 'http://localhost:3002/' });
@@ -53,10 +53,81 @@ test('mapDevUrlToProd maps path, query and hash onto the PROD base', () => {
   );
 });
 
-test('mapDevUrlToProd refuses URLs outside the DEV base (never sends PROD elsewhere)', () => {
+test('mapDevUrlToProd keeps exact path (no forced trailing slash) and carries clientId from base', () => {
+  assert.equal(
+    mapDevUrlToProd(
+      'https://appalpha.bruin.com/sdwan-dashboard',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937',
+      'https://app.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://app.bruin.com/sdwan-dashboard?clientId=86937'
+  );
+  assert.equal(
+    mapDevUrlToProd(
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937',
+      'https://app.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://app.bruin.com/sdwan-dashboard?clientId=86937'
+  );
+});
+
+test('mapDevUrlToProd maps same-origin SSO callbacks and refuses unrelated outside paths', () => {
+  assert.equal(
+    mapDevUrlToProd(
+      'https://appalpha.bruin.com/signin-kinde?code=abc',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937',
+      'https://app.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://app.bruin.com/signin-kinde?code=abc&clientId=86937'
+  );
   assert.equal(mapDevUrlToProd('https://evil.com/', 'http://localhost:3002', 'http://localhost:3003'), null);
   assert.equal(mapDevUrlToProd('https://example.com/devtools', 'https://example.com/dev', 'https://example.com/prod'), null);
   assert.equal(mapDevUrlToProd('garbage', 'http://localhost:3002', 'http://localhost:3003'), null);
+});
+
+test('mergeBaseQuery fills missing profile query params on the same origin', () => {
+  const { mergeBaseQuery } = require('../../playwright.js');
+  assert.equal(
+    mergeBaseQuery(
+      'https://appalpha.bruin.com/sdwan-dashboard',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937'
+  );
+  assert.equal(
+    mergeBaseQuery(
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937&x=1',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937&x=1'
+  );
+  assert.equal(
+    mergeBaseQuery('https://other.com/x', 'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937'),
+    'https://other.com/x'
+  );
+});
+
+test('mergeBaseQuery replaces clientId=0 placeholder with profile clientId', () => {
+  const { mergeBaseQuery } = require('../../playwright.js');
+  assert.equal(
+    mergeBaseQuery(
+      'https://appalpha.bruin.com/piab-dashboard?clientId=0',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://appalpha.bruin.com/piab-dashboard?clientId=86937'
+  );
+});
+
+test('mapDevUrlToProd maps sibling SPA routes when bases share the same path', () => {
+  assert.equal(
+    mapDevUrlToProd(
+      'https://appalpha.bruin.com/piab-dashboard?clientId=86937',
+      'https://appalpha.bruin.com/sdwan-dashboard?clientId=86937',
+      'https://app.bruin.com/sdwan-dashboard?clientId=86937'
+    ),
+    'https://app.bruin.com/piab-dashboard?clientId=86937'
+  );
 });
 
 test('ignore rules: timestamp / session-id / numbers normalize values', () => {
@@ -76,4 +147,32 @@ test('ignore rules: regex normalizes, text excludes, no rules = inactive', () =>
   assert.equal(r.exclude({ component: 'Login', devValue: 'a', prodValue: 'b' }), null);
   assert.equal(compileIgnoreRules([]).active, false);
   assert.doesNotThrow(() => compileIgnoreRules(['regex:(unclosed']));
+});
+
+test('onSharedOutsideHost: both apps on the same SSO host count as aligned', () => {
+  const dev = 'https://appalpha.bruin.com/dashboard';
+  const prod = 'https://app.bruin.com/dashboard';
+  assert.equal(
+    onSharedOutsideHost('https://auth.bruin.com/auth/cx/login?psid=a1', 'https://auth.bruin.com/auth/cx/login?psid=b2', dev, prod),
+    true
+  );
+  // Different outside hosts, PROD still on its base, or DEV inside its base: not shared
+  assert.equal(onSharedOutsideHost('https://auth.bruin.com/x', 'https://login.other.com/x', dev, prod), false);
+  assert.equal(onSharedOutsideHost('https://auth.bruin.com/x', 'https://app.bruin.com/dashboard', dev, prod), false);
+  assert.equal(onSharedOutsideHost('https://appalpha.bruin.com/dashboard/a', 'https://appalpha.bruin.com/dashboard/a', dev, prod), false);
+  assert.equal(onSharedOutsideHost('about:blank', 'about:blank', dev, prod), false);
+});
+
+test('urlForAddressBar keeps the full URL (query + fragment) and masks only credential values', () => {
+  const { urlForAddressBar } = require('../../playwright.js');
+  const authorize =
+    'https://login.example.com/oauth2/authorize?client_id=abc-123&redirect_uri=https%3A%2F%2Fapp.example.com%2Fcb&response_type=code&scope=openid%20profile&state=xyz';
+  assert.equal(urlForAddressBar(authorize), authorize);
+  assert.equal(urlForAddressBar('https://app.example.com/cb?code=SECRET&state=xyz'), 'https://app.example.com/cb?code=***&state=xyz');
+  assert.equal(
+    urlForAddressBar('https://app.example.com/#access_token=TOK&token_type=Bearer&expires_in=3600'),
+    'https://app.example.com/#access_token=***&token_type=Bearer&expires_in=3600'
+  );
+  assert.equal(urlForAddressBar('https://user:pw@app.example.com/x?a=1#section-2'), 'https://app.example.com/x?a=1#section-2');
+  assert.equal(urlForAddressBar('not a url'), '(invalid url)');
 });

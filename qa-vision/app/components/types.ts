@@ -59,6 +59,22 @@ export const SEVERITY_STYLE: Record<string, string> = {
 export const EXPORT_FORMATS = ['pdf', 'html', 'json', 'xlsx', 'csv'] as const;
 export type ExportFormat = (typeof EXPORT_FORMATS)[number];
 
+/** Two Screen Comparison tab types live with the engine (dependency-free module, type-only import). */
+export type {
+  ScreenshotFinding,
+  ScreenshotComparisonResult,
+  ShotBBox,
+  ShotCategory,
+  ShotIgnoreRegion,
+  ShotReviewStatus,
+  ShotSeverity,
+  ShotSensitivity,
+  ShotAlignment,
+  ShotScope,
+  ShotFindingStatus,
+  ShotTextOptions,
+} from '@/lib/engine/screenshot-types';
+
 /** POST /api/report for a session or a stored run and hand the file to the browser. */
 export async function downloadReport(format: ExportFormat, ref: { sessionId?: string; runId?: string }): Promise<string> {
   const res = await fetch('/api/report', { method: 'POST', headers: jsonHeaders, body: JSON.stringify({ format, ...ref }) });

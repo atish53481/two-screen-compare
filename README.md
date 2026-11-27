@@ -15,6 +15,7 @@ You click and type in a DEV browser window. QA Vision captures each action, find
 - [What works today](#what-works-today)
 - [PROD safety](#prod-safety)
 - [Ignore rules](#ignore-rules)
+- [Two Screen Comparison (screenshots)](#two-screen-comparison-screenshots)
 - [Configuration (environment variables)](#configuration-environment-variables)
 - [Tests](#tests)
 - [Project structure](#project-structure)
@@ -148,6 +149,41 @@ Nothing is hidden silently. Each comparison logs how many differences the rules 
 
 ---
 
+## Two Screen Comparison (screenshots)
+
+A separate dashboard tab that compares **two screenshots** instead of two live sites: a DEV screenshot (new changes) and a PROD screenshot (known-good reference). No URLs, logins, browsers or replay are involved, and the live comparison is untouched.
+
+It is **data-first**: by default it compares the visible business data (numbers, amounts, dates, statuses, IDs, table cells, labels) and reports the exact DEV and PROD values. Images/diagrams and visual styling are only checked when you select them.
+
+1. Open **Two Screen Comparison**. Click a panel (it gets a colored border) and press **Ctrl+V**, drop an image on it, or use **Upload**. PNG, JPG or WebP, up to 10 MB and 16.7 megapixels each.
+2. Under **What do you want to compare?** pick any combination (at least one):
+
+   | Option | Default | Priority | Reports |
+   |---|---|---|---|
+   | Data & Text | ✔ | P1 | Changed numbers, amounts, percentages, dates/times, IDs, statuses, labels; missing/extra records and fields |
+   | Images & Diagrams | | P2 | Missing/extra/replaced images, charts, icons (with text read inside the region) |
+   | CSS & Visual Styling | | P3 | Colors, text rendering/size/weight (visual estimates) |
+   | Alignment & Layout | | P3 | Shifted, resized, clipped or extra areas |
+   | Form Elements & States | | P3 | Checked/selected, greyed-out/disabled look, missing controls (visual estimates) |
+
+   Unselected categories are not run and are shown as **Not checked**, never as passed.
+3. Optional **Comparison settings**: normalized or strict text matching, numeric tolerance, minimum OCR confidence, case sensitivity, **ignored fields** (text or `/regex/`, e.g. `Last updated`), **ignore regions** (drag a box on the DEV image), page name, labels, notes on expected differences, pixel sensitivity.
+4. Different sizes: with only Data & Text selected, text is matched by content and no alignment is needed. With a visual check selected, pick **Align top-left** or **Scale PROD to DEV** first.
+5. **Compare Screenshots.** Results: a per-category summary (P1 → P3), confirmed mismatches vs **Uncertain / needs review** items, findings with codes (`DATA-001`, `IMG-001`, `CSS-001`…), field name, exact DEV and PROD values, numbered boxes on both screenshots, overlay/slider/diff map (when pixels were compared), filters, and review buttons (expected / false positive / confirmed defect).
+6. **Download Report** (self-contained HTML), **JSON** (includes `spec_findings` in the specification's snake_case schema: `id`, `category`, `severity`, `confidence`, `page_section`, `field`, `prod_value`, `dev_value`, `dev_bbox`, `prod_bbox`, `status`, …), **annotated PNG**, or **Print / PDF**.
+
+How it works (`lib/engine/screenshot-compare.ts`, route `app/api/screenshot-compare`):
+- **Text reading** (`screenshot-ocr.ts`): local Tesseract OCR (`tesseract.js` + `@tesseract.js-data/eng`, WASM, in this server process; screenshots never leave it). Preprocessing for UI screenshots: 2× upscale, local inversion of dark headers/buttons, removal of table rules, Sauvola binarization, plus a second pass on the inverted image for light-on-grey text. Each word keeps its box and confidence.
+- **Data comparison** (`screenshot-data.ts`): words → rows and cells, `Label: value` split, field names from labels/column headers; rows matched by **content and row keys** (e.g. an invoice ID), not position, so a different sort order or scroll offset does not pair unrelated records; safe normalization (`1,250` = `1250`, `$1,250.00` = `$1250`, `Nov 3, 2026` = `2026-11-03`, case/spacing) unless strict. Readings below the confidence threshold, a number read as letters, or a largely unreadable screenshot give **Uncertain / needs review**, never a claimed mismatch or "missing".
+- **Pixel checks** (only for the visual scopes, or to vouch for text): pixelmatch with anti-aliasing excluded → changed regions → classification (missing/extra element, color, greyed-out state, shift, text size/weight, other visual). One wrong value is one data finding: pixel/CSS regions on the same value are dropped; a pixel change where OCR reads the same text on both sides is styling, not data. Repetitive styling findings (a font change touching every label) are grouped into one.
+- Nothing is stored: images exist only for the request.
+
+**Optional AI explanation.** With `QA_VISION_AI_PROVIDER` configured (and, for `openai-compatible`, `QA_VISION_AI_VISION=1` to declare the model image-capable, for example a grok-4 family model), the tab offers a consent checkbox. Only crops around detected regions are sent; the model's explanation and text readings are shown as advisory and redacted, and it cannot add or move findings. Without a provider, or on any failure, results are deterministic only and say so.
+
+**Limitations:** OCR is English-only and can misread small, stylized, low-contrast or blurry text (such text is flagged uncertain, e.g. white text on a light-grey disabled button). Row/field matching is heuristic (content + layout); unusual layouts may pair items differently — check the boxes. Chart plotted values are not read from pixels. Colors are sampled pixels; font size/weight and enabled/disabled states are visual estimates; nothing about DOM, CSS, APIs or databases is inferred. Day/month order in numeric dates (`03/11/2026`) is ambiguous and compared as text. A comparison takes about 2–4 s (OCR of both screenshots). PDF export uses the browser's print dialog. Set `QA_VISION_OCR=off` to disable OCR (Data & Text then locates text changes without reading them and says it is incomplete). Sample images: `qa-vision/public/test-screenshots/` (pixel cases, `node scripts/make-test-screenshots.js`) and `qa-vision/public/test-screenshots/data/` (real-text dashboards for every data-first case, `node scripts/make-data-screenshots.js`).
+
+---
+
 ## Configuration (environment variables)
 
 All variables are optional and server-side only. `qa-vision/.env.example` holds placeholders; never commit real values.
@@ -161,6 +197,9 @@ All variables are optional and server-side only. `qa-vision/.env.example` holds 
 | `ANTHROPIC_API_KEY` | API key for the `anthropic` provider |
 | `QA_VISION_AI_BASE_URL`, `QA_VISION_AI_API_KEY` | Endpoint and key for the `openai-compatible` provider (for example Grok) |
 | `QA_VISION_AI_MODEL` | Model override. Anthropic default: `claude-opus-5-5` |
+| `QA_VISION_AI_VISION` | `1` declares the `openai-compatible` model image-capable, enabling the optional AI step in Two Screen Comparison |
+| `QA_VISION_OCR` | `off` disables local OCR in Two Screen Comparison (Data & Text then flags text changes as uncertain, values not read) |
+| `QA_VISION_TESSDATA` | Folder holding `eng.traineddata(.gz)` if not the default `node_modules/@tesseract.js-data/eng/4.0.0_best_int` |
 | `QA_VISION_PORT` | Dashboard port for `server.js`. Default 3001 |
 | `QA_VISION_HOST` | Interface `server.js` binds to. Default `127.0.0.1` (loopback only). Requests are accepted when the Host header is `localhost`, `127.0.0.1` or `[::1]` (always), or equals this value when set; anything else gets 403. Set it to the address other machines use to reach you (not `0.0.0.0`), and only on a trusted network |
 | `QA_VISION_DIST_DIR` | Next.js `distDir` override. `test:ui` sets `.next-ui` so it never clobbers a running dashboard's build |
@@ -181,6 +220,7 @@ Run from `qa-vision/` (or `npm test` at the repo root):
 npm run test:unit   # pure modules, no browsers
 npm run test:e2e    # real headless Chromium against the sample apps
 npm run test:ui     # dashboard UI test on its own server (port 3101)
+npm run test:ui:screenshot  # Two Screen Comparison tab in headless Chromium, against a running dashboard (QA_VISION_URL, default :3001)
 npm test            # unit + e2e
 ```
 
@@ -207,6 +247,10 @@ npm test            # unit + e2e
 | `tests/e2e/expected-highlight.e2e.js` | Expected differences and element highlighting |
 | `tests/e2e/ai-race.e2e.js` | Background AI result merges into the stored run, runs once |
 | `tests/ui/dashboard.ui.js` | Live frames, filters, evidence viewer, mark expected, history export, profile duplicate, evidence traversal and password-leak checks |
+| `tests/unit/screenshot-data.test.js` | Two Screen data logic on synthetic OCR words: normalization, strict/tolerance, row matching by content (sort order), missing/extra records, uncertain/unreadable handling, ignored fields/regions, different resolution, OCR-noise suppression |
+| `tests/unit/screenshot-data-ocr.test.js` | Two Screen acceptance cases with real OCR on browser-rendered screenshots: matching, mismatched data with exact values and boxes, no duplicate pixel findings, missing record, sort order, restyled (no data mismatch), 2× resolution, low quality, ignored timestamp, chart and form-state scopes |
+| `tests/unit/screenshot-compare.test.js`, `pixel-diff.test.js` | Two Screen pixel classification and scope selection (default scope, only selected scopes report, empty scope rejected, priority order and codes) |
+| `tests/ui/screenshot-tab.ui.js` | Two Screen tab in the browser: default scope, paste/drop, findings/boxes/zoom, exports, alignment, ignore region/field, data-first values, "Not checked" categories, restyled, 2× resolution |
 
 ---
 
